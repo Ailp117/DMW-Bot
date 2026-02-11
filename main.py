@@ -1,14 +1,12 @@
-# main.py
 import logging
 import discord
 from discord import app_commands
 
 from config import DISCORD_TOKEN
-from db import ensure_schema, get_session
+from db import ensure_schema, get_session, try_acquire_singleton_lock
 from helpers import get_options
 from models import Raid
-from raidlist import refresh_raidlists_for_all_guilds, refresh_raidlist_for_guild
-from raidlist_updater import RaidlistUpdater
+from raidlist import refresh_raidlists_for_all_guilds
 from views_raid import RaidVoteView
 from commands_admin import register_admin_commands
 from commands_raid import register_raid_commands
@@ -26,52 +24,60 @@ class RaidBot(discord.Client):
     def __init__(self):
         super().__init__(intents=INTENTS)
         self.tree = app_commands.CommandTree(self)
-        self.raidlist_updater: RaidlistUpdater | None = None
 
     async def setup_hook(self):
         await ensure_schema()
 
-        # ✅ Debounced raidlist updater
-        async def _update(guild_id: int):
-            await refresh_raidlist_for_guild(self, guild_id)
-
-        self.raidlist_updater = RaidlistUpdater(
-            update_fn=_update,
-            debounce_seconds=1.5,
-            cooldown_seconds=0.8,
-        )
+        # Prevent multiple instances from running
+        got_lock = await try_acquire_singleton_lock()
+        if not got_lock:
+            log.warning("Another bot instance is already running (singleton lock busy). Exiting.")
+            raise SystemExit(0)
 
         register_admin_commands(self.tree)
         register_raid_commands(self.tree, self)
         register_purge_commands(self.tree)
 
-        @self.tree.command(name="settings", description="Öffnet das Settings-Menü (alle Einstellungen in einem Popup).")
+        @self.tree.command(
+            name="settings",
+            description="Öffnet das Settings-Menü (alle Einstellungen in einem Popup).",
+        )
         @app_commands.checks.has_permissions(manage_guild=True)
         async def settings_cmd(interaction: discord.Interaction):
             if not interaction.guild:
-                return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+                return await interaction.response.send_message(
+                    "Nur im Server nutzbar.", ephemeral=True
+                )
+
             async with await get_session() as session:
                 row = await get_guild_settings(session, interaction.guild.id)
+
             view = SettingsView(interaction.guild.id)
-            await interaction.response.send_message(embed=settings_embed(row, interaction.guild), view=view, ephemeral=True)
+            await interaction.response.send_message(
+                embed=settings_embed(row, interaction.guild),
+                view=view,
+                ephemeral=True,
+            )
 
         await self.tree.sync()
         await self._restore_open_raid_views()
-
-        # ✅ Startup raidlist refresh (immediate per guild, but protected by updater cooldown)
         await refresh_raidlists_for_all_guilds(self)
 
     async def _restore_open_raid_views(self):
         from sqlalchemy import select
 
         async with await get_session() as session:
-            res = await session.execute(select(Raid).where(Raid.status == "open", Raid.message_id.is_not(None)))
+            res = await session.execute(
+                select(Raid).where(Raid.status == "open", Raid.message_id.is_not(None))
+            )
             raids = res.scalars().all()
+
             for raid in raids:
                 try:
                     days, times = await get_options(session, raid.id)
                     if not days or not times:
                         continue
+
                     view = RaidVoteView(raid.id, days, times)
                     self.add_view(view, message_id=raid.message_id)
                 except Exception as e:
