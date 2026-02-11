@@ -1,3 +1,4 @@
+# main.py
 import logging
 import discord
 from discord import app_commands
@@ -6,7 +7,8 @@ from config import DISCORD_TOKEN
 from db import ensure_schema, get_session
 from helpers import get_options
 from models import Raid
-from raidlist import refresh_raidlists_for_all_guilds
+from raidlist import refresh_raidlists_for_all_guilds, refresh_raidlist_for_guild
+from raidlist_updater import RaidlistUpdater
 from views_raid import RaidVoteView
 from commands_admin import register_admin_commands
 from commands_raid import register_raid_commands
@@ -19,13 +21,25 @@ log = logging.getLogger("dmw-raid-bot")
 
 INTENTS = discord.Intents.default()
 
+
 class RaidBot(discord.Client):
     def __init__(self):
         super().__init__(intents=INTENTS)
         self.tree = app_commands.CommandTree(self)
+        self.raidlist_updater: RaidlistUpdater | None = None
 
     async def setup_hook(self):
         await ensure_schema()
+
+        # ✅ Debounced raidlist updater
+        async def _update(guild_id: int):
+            await refresh_raidlist_for_guild(self, guild_id)
+
+        self.raidlist_updater = RaidlistUpdater(
+            update_fn=_update,
+            debounce_seconds=1.5,
+            cooldown_seconds=0.8,
+        )
 
         register_admin_commands(self.tree)
         register_raid_commands(self.tree, self)
@@ -43,10 +57,13 @@ class RaidBot(discord.Client):
 
         await self.tree.sync()
         await self._restore_open_raid_views()
+
+        # ✅ Startup raidlist refresh (immediate per guild, but protected by updater cooldown)
         await refresh_raidlists_for_all_guilds(self)
 
     async def _restore_open_raid_views(self):
         from sqlalchemy import select
+
         async with await get_session() as session:
             res = await session.execute(select(Raid).where(Raid.status == "open", Raid.message_id.is_not(None)))
             raids = res.scalars().all()
@@ -59,6 +76,7 @@ class RaidBot(discord.Client):
                     self.add_view(view, message_id=raid.message_id)
                 except Exception as e:
                     log.warning("Restore view failed for raid_id=%s: %s", raid.id, e)
+
 
 client = RaidBot()
 
