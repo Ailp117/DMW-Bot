@@ -3,6 +3,7 @@ from discord import app_commands
 from sqlalchemy import select
 
 from db import session_scope
+from helpers import get_active_dungeons
 from models import Dungeon
 from views_raid import RaidCreateModal
 from raidlist import force_raidlist_refresh
@@ -42,11 +43,9 @@ def register_raid_commands(tree: app_commands.CommandTree):
         q = (current or "").lower().strip()
 
         async with session_scope() as session:
-            rows = (await session.execute(
-                select(Dungeon)
-                .where(Dungeon.is_active.is_(True))
-                .order_by(Dungeon.sort_order.asc(), Dungeon.name.asc())
-            )).scalars().all()
+            # keep this query centralized in helpers to avoid integer-vs-boolean
+            # regressions in PostgreSQL filters (e.g. `is_active == 1`).
+            rows = await get_active_dungeons(session)
 
         if q:
             rows = [r for r in rows if q in (r.name or "").lower()]
