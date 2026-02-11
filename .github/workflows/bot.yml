@@ -1,0 +1,37 @@
+name: DMW Bot (private 24/7-ish)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Startet alle 5 Stunden neu (reduziert Risiko, dass ein Runner abbricht)
+    - cron: "0 */5 * * *"
+
+concurrency:
+  group: dmw-bot
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python main.py
