@@ -55,21 +55,5 @@ class RaidlistUpdater:
     async def _debounced_run(self, guild_id: int, start_gen: int) -> None:
         await asyncio.sleep(self.debounce)
 
-        if self._generation[guild_id] != start_gen:
-            newest = self._generation[guild_id]
-            self._task[guild_id] = asyncio.create_task(self._debounced_run(guild_id, newest))
-            return
-
-        await self._run_locked(guild_id)
-
-    async def _run_locked(self, guild_id: int) -> None:
-        async with self._lock[guild_id]:
-            now = time.monotonic()
-            since = now - self._last_edit_ts[guild_id]
-            if since < self.cooldown:
-                await asyncio.sleep(self.cooldown - since)
-
-            if not self._dirty[guild_id]:
-                return
-
-            self._dirty[guild_id]_]()_
+        # If something changed during debounce: restart debounce with newest generation
+        if self._generation[guild]()_
