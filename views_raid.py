@@ -12,33 +12,6 @@ from roles import ensure_temp_role, cleanup_temp_role
 from raidlist import schedule_raidlist_refresh
 
 
-class RaidCreateModal(discord.ui.Modal, title="Raid erstellen"):
-    days = discord.ui.TextInput(label="Tage (Komma/Zeilen)", required=True, max_length=400)
-    times = discord.ui.TextInput(label="Uhrzeiten (Komma/Zeilen)", required=True, max_length=400)
-    min_players = discord.ui.TextInput(label="Min Spieler pro Slot (0=aus)", required=True, max_length=3)
-
-    def __init__(self, dungeon_name: str):
-        super().__init__()
-        self.dungeon_name = dungeon_name
-        self.result = None  # (days,times,min_players)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            mp = int(str(self.min_players.value).strip())
-            if mp < 0:
-                raise ValueError()
-        except ValueError:
-            return await interaction.response.send_message("❌ Min Spieler muss Zahl >= 0 sein.", ephemeral=True)
-
-        d = normalize_list(str(self.days.value))
-        t = normalize_list(str(self.times.value))
-        if not d or not t:
-            return await interaction.response.send_message("❌ Bitte mind. 1 Tag und 1 Uhrzeit.", ephemeral=True)
-
-        self.result = (d, t, mp)
-        await interaction.response.defer(ephemeral=True)
-
-
 def planner_embed(raid: Raid, counts: dict[str, dict[str, int]]) -> discord.Embed:
     e = discord.Embed(title=f"🗓️ Raid Planer: {raid.dungeon}", description=f"Raid ID: `{raid.id}`")
     e.add_field(name="Min Spieler pro Slot", value=str(raid.min_players), inline=True)
@@ -65,28 +38,110 @@ def slot_text(raid: Raid, day_label: str, time_label: str, role: discord.Role | 
     )
 
 
+class RaidCreateModal(discord.ui.Modal, title="Raid erstellen"):
+    days = discord.ui.TextInput(label="Tage (Komma/Zeilen)", required=True, max_length=400)
+    times = discord.ui.TextInput(label="Uhrzeiten (Komma/Zeilen)", required=True, max_length=400)
+    min_players = discord.ui.TextInput(label="Min Spieler pro Slot (0=aus)", required=True, max_length=3)
+
+    def __init__(self, dungeon_name: str):
+        super().__init__()
+        self.dungeon_name = dungeon_name
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+
+        # ✅ acknowledge modal submit quickly
+        await interaction.response.defer(ephemeral=True)
+
+        # parse inputs
+        try:
+            mp = int(str(self.min_players.value).strip())
+            if mp < 0:
+                raise ValueError()
+        except ValueError:
+            return await interaction.followup.send("❌ Min Spieler muss Zahl >= 0 sein.", ephemeral=True)
+
+        days = normalize_list(str(self.days.value))
+        times = normalize_list(str(self.times.value))
+        if not days or not times:
+            return await interaction.followup.send("❌ Bitte mind. 1 Tag und 1 Uhrzeit angeben.", ephemeral=True)
+
+        # create raid + post planner message
+        async with session_scope() as session:
+            s = await get_settings(session, interaction.guild.id)
+            if not s.planner_channel_id or not s.participants_channel_id:
+                return await interaction.followup.send(
+                    "❌ Settings fehlen. Bitte `/settings` konfigurieren.",
+                    ephemeral=True,
+                )
+
+            raid = await create_raid(
+                session=session,
+                guild_id=interaction.guild.id,
+                planner_channel_id=int(s.planner_channel_id),
+                creator_id=interaction.user.id,
+                dungeon=self.dungeon_name,
+                days=days,
+                times=times,
+                min_players=mp,
+            )
+
+            counts = {"day": {}, "time": {}}
+            embed = planner_embed(raid, counts)
+            view = RaidVoteView(raid.id, days, times)
+
+            # send message in planner channel
+            ch = interaction.client.get_channel(int(s.planner_channel_id))
+            if ch is None:
+                try:
+                    ch = await interaction.client.fetch_channel(int(s.planner_channel_id))
+                except (discord.NotFound, discord.Forbidden):
+                    return await interaction.followup.send("❌ Planner Channel nicht erreichbar.", ephemeral=True)
+
+            if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+                return await interaction.followup.send("❌ Planner Channel ist kein Text-Channel.", ephemeral=True)
+
+            msg = await ch.send(embed=embed, view=view)
+            raid.message_id = msg.id  # ✅ store for raidlist jump url + persistence
+
+        # refresh raidlist (debounced)
+        await schedule_raidlist_refresh(interaction.client, interaction.guild.id)
+
+        await interaction.followup.send(
+            f"✅ Raid erstellt: **{self.dungeon_name}** (ID `{raid.id}`)\n"
+            f"➡️ Im Planner Channel gepostet: {msg.jump_url}",
+            ephemeral=True,
+        )
+
+
 class FinishButton(Button):
     def __init__(self, raid_id: int):
         super().__init__(style=discord.ButtonStyle.danger, label="Raid beenden", custom_id=f"raid:{raid_id}:finish")
         self.raid_id = raid_id
 
     async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+
         await interaction.response.defer(ephemeral=True)
 
         async with session_scope() as session:
             raid = await get_raid(session, self.raid_id)
             if not raid:
                 return await interaction.followup.send("Raid existiert nicht mehr.", ephemeral=True)
+
             if interaction.user.id != raid.creator_id:
                 return await interaction.followup.send("Nur der Ersteller kann beenden.", ephemeral=True)
 
+            # cleanup role + delete raid (cascade)
             await cleanup_temp_role(session, interaction.guild, raid)
-            await delete_raid_cascade(session, self.raid_id)
+            await delete_raid_cascade(session, raid.id)
 
-        # disable UI
+        # disable view
         if self.view:
-            for c in self.view.children:
-                c.disabled = True
+            for item in self.view.children:
+                item.disabled = True
 
         await interaction.edit_original_response(embed=discord.Embed(title="✅ Raid beendet"), view=self.view)
         await schedule_raidlist_refresh(interaction.client, interaction.guild.id)
@@ -125,18 +180,22 @@ class RaidVoteView(View):
             if not raid:
                 for c in self.children:
                     c.disabled = True
-                return await interaction.edit_original_response(embed=discord.Embed(title="Raid nicht mehr aktiv."), view=self)
+                return await interaction.edit_original_response(
+                    embed=discord.Embed(title="Raid nicht mehr aktiv."),
+                    view=self
+                )
 
             counts = await vote_counts(session, self.raid_id)
             embed = planner_embed(raid, counts)
 
-            # slots + role
             s = await get_settings(session, raid.guild_id)
 
+            # role
             role = None
             if raid.min_players > 0:
                 role = await ensure_temp_role(session, interaction.guild, raid)
 
+            # slots
             if raid.min_players > 0 and s.participants_channel_id:
                 ch = interaction.client.get_channel(int(s.participants_channel_id))
                 if isinstance(ch, (discord.TextChannel, discord.Thread)):
@@ -149,6 +208,7 @@ class RaidVoteView(View):
 
                             txt = slot_text(raid, d, t, role, users)
                             row = await get_posted_slot(session, self.raid_id, d, t)
+
                             if not row:
                                 msg = await ch.send(txt, allowed_mentions=discord.AllowedMentions(users=True, roles=True))
                                 await upsert_posted_slot(session, self.raid_id, d, t, ch.id, msg.id)
