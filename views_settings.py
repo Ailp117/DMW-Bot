@@ -1,10 +1,11 @@
+# views_settings.py
 import discord
 from discord.ui import View
-from sqlalchemy.ext.asyncio import AsyncSession
 from db import get_session
 from models import GuildSettings
-from raidlist import refresh_raidlist_for_guild
+from raidlist import force_raidlist_refresh
 from helpers import get_guild_settings
+
 
 def settings_embed(settings: GuildSettings | None, guild: discord.Guild) -> discord.Embed:
     def ch_mention(cid: int | None) -> str:
@@ -22,6 +23,7 @@ def settings_embed(settings: GuildSettings | None, guild: discord.Guild) -> disc
         e.add_field(name="Status", value="Noch keine Settings vorhanden.", inline=False)
     e.set_footer(text="Speichern nicht vergessen.")
     return e
+
 
 class SettingsView(View):
     def __init__(self, guild_id: int):
@@ -109,7 +111,9 @@ class SettingsView(View):
 
         await interaction.edit_original_response(embed=settings_embed(row2, interaction.guild), view=self)
         await interaction.followup.send("✅ Gespeichert.", ephemeral=True)
-        await refresh_raidlist_for_guild(interaction.client, self.guild_id)
+
+        # ✅ immediate refresh after settings save
+        await force_raidlist_refresh(interaction.client, self.guild_id)
 
     @discord.ui.button(label="❌ Abbrechen", style=discord.ButtonStyle.secondary)
     async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
