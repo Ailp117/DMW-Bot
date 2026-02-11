@@ -1,9 +1,9 @@
+# views_raid.py
 import discord
 from typing import Optional
 from discord.ui import View, Select, Button
-from sqlalchemy import select
 from db import get_session
-from models import Raid, Dungeon
+from models import Raid
 from helpers import (
     get_raid,
     get_options,
@@ -19,9 +19,22 @@ from helpers import (
     delete_raid_completely,
     short_list,
 )
-from roles import ensure_temp_role_for_raid, compute_desired_role_users_for_raid, sync_role_membership, cleanup_temp_role
+from roles import (
+    ensure_temp_role_for_raid,
+    compute_desired_role_users_for_raid,
+    sync_role_membership,
+    cleanup_temp_role,
+)
+from raidlist import schedule_raidlist_refresh
 
-def build_slot_text(raid: Raid, day_label: str, time_label: str, role: Optional[discord.Role], slot_user_ids: list[int]) -> str:
+
+def build_slot_text(
+    raid: Raid,
+    day_label: str,
+    time_label: str,
+    role: Optional[discord.Role],
+    slot_user_ids: list[int],
+) -> str:
     role_line = role.mention if role else "⚠️ (Rolle konnte nicht erstellt werden – fehlende Rechte?)"
     mentions = [f"<@{uid}>" for uid in slot_user_ids]
     return (
@@ -33,6 +46,7 @@ def build_slot_text(raid: Raid, day_label: str, time_label: str, role: Optional[
         f"{role_line}\n\n"
         f"**Liste:**\n{short_list(mentions)}"
     )
+
 
 async def delete_participant_list_messages_for_raid(client: discord.Client, session, raid_id: int):
     rows = await get_all_posted_slots(session, raid_id)
@@ -47,6 +61,7 @@ async def delete_participant_list_messages_for_raid(client: discord.Client, sess
             await msg.delete()
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
+
 
 class RaidCreateModal(discord.ui.Modal, title="Raid Optionen"):
     days = discord.ui.TextInput(label="Tage (Komma/Zeilen getrennt)", placeholder="z.B. Mo, Di, Mi", required=True, max_length=400)
@@ -68,6 +83,7 @@ class RaidCreateModal(discord.ui.Modal, title="Raid Optionen"):
 
         self.result = (str(self.days.value), str(self.times.value), mp)
         await interaction.response.defer(ephemeral=True)
+
 
 class RaidFinishButton(Button):
     def __init__(self, raid_id: int):
@@ -95,6 +111,9 @@ class RaidFinishButton(Button):
             await cleanup_temp_role(session, interaction.guild, raid)
             await delete_raid_completely(session, self.raid_id)
 
+        # ✅ debounced raidlist update after finishing raid
+        await schedule_raidlist_refresh(interaction.client, interaction.guild.id)
+
         if self.view:
             for item in self.view.children:
                 item.disabled = True
@@ -104,6 +123,7 @@ class RaidFinishButton(Button):
             description=f"✅ Raid abgeschlossen.\nTeilnehmerlisten wurden gelöscht.\nAlle Raid-Daten wurden gelöscht.\n**Dungeon:** {dungeon_name}",
         )
         await interaction.edit_original_response(embed=embed, view=self.view)
+
 
 class RaidVoteView(View):
     def __init__(self, raid_id: int, days: list[str], times: list[str]):
@@ -145,7 +165,8 @@ class RaidVoteView(View):
                 for item in self.children:
                     item.disabled = True
                 embed = discord.Embed(title="DMW Raid Planer", description="✅ Raid ist nicht mehr aktiv (Daten gelöscht).")
-                return await interaction.edit_original_response(embed=embed, view=self)
+                await interaction.edit_original_response(embed=embed, view=self)
+                return
 
             summary = await build_summary(session, self.raid_id)
             embed = await build_embed_for_raid(raid, summary)
@@ -190,20 +211,3 @@ class RaidVoteView(View):
                                     await msg.edit(content=text_msg, allowed_mentions=discord.AllowedMentions(roles=True, users=True))
                                 except (discord.NotFound, discord.Forbidden):
                                     msg = await ch.send(text_msg, allowed_mentions=discord.AllowedMentions(roles=True, users=True))
-                                    await upsert_posted_slot_message(session, self.raid_id, d, t, ch.id, msg.id)
-
-        await interaction.edit_original_response(embed=embed, view=self)
-
-    async def on_day_select(self, interaction: discord.Interaction):
-        values = interaction.data.get("values", [])
-        async with await get_session() as session:
-            for v in values:
-                await toggle_vote(session, self.raid_id, "day", v, interaction.user.id)
-        await self._refresh_message(interaction)
-
-    async def on_time_select(self, interaction: discord.Interaction):
-        values = interaction.data.get("values", [])
-        async with await get_session() as session:
-            for v in values:
-                await toggle_vote(session, self.raid_id, "time", v, interaction.user.id)
-        await self._refresh_message(interaction)
