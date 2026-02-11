@@ -25,7 +25,7 @@ class RaidlistUpdater:
         *,
         debounce_seconds: float = 1.5,
         cooldown_seconds: float = 0.8,
-    ):
+    ) -> None:
         self.update_fn = update_fn
         self.debounce = float(debounce_seconds)
         self.cooldown = float(cooldown_seconds)
@@ -56,4 +56,37 @@ class RaidlistUpdater:
         await asyncio.sleep(self.debounce)
 
         # If something changed during debounce: restart debounce with newest generation
-        if self._generation[guild]()_
+        if self._generation[guild_id] != start_gen:
+            newest = self._generation[guild_id]
+            self._task[guild_id] = asyncio.create_task(self._debounced_run(guild_id, newest))
+            return
+
+        await self._run_locked(guild_id)
+
+    async def _run_locked(self, guild_id: int) -> None:
+        async with self._lock[guild_id]:
+            # Cooldown to avoid too frequent edits
+            now = time.monotonic()
+            since = now - self._last_edit_ts[guild_id]
+            if since < self.cooldown:
+                await asyncio.sleep(self.cooldown - since)
+
+            if not self._dirty[guild_id]:
+                return
+
+            # Clear dirty before update; if new changes come in during update, dirty will be set again
+            self._dirty[guild_id] = False
+            before_gen = self._generation[guild_id]
+
+            try:
+                await self.update_fn(guild_id)
+                self._last_edit_ts[guild_id] = time.monotonic()
+            except Exception:
+                # Ensure retry on next mark_dirty
+                self._dirty[guild_id] = True
+                raise
+
+            # If changes happened during update, schedule one follow-up
+            if self._generation[guild_id] != before_gen:
+                newest = self._generation[guild_id]
+                self._task[guild_id] = asyncio.create_task(self._debounced_run(guild_id, newest))
