@@ -32,5 +32,6 @@ jobs:
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GUILD_ID: ${{ secrets.GUILD_ID }}
         run: |
           python main.py
