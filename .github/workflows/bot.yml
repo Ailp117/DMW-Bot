@@ -3,7 +3,6 @@ name: DMW Bot (private 24/7-ish)
 on:
   workflow_dispatch:
   schedule:
-    # Startet alle 5 Stunden neu (reduziert Risiko, dass ein Runner abbricht)
     - cron: "0 */5 * * *"
 
 concurrency:
@@ -29,22 +28,22 @@ jobs:
         run: |
           pip install -r requirements.txt
 
+      - name: Debug raidlist_updater.py actually used
+        run: |
+          echo "=== WHERE AM I ==="
+          pwd
+          echo "=== LIST FILES ==="
+          ls -la
+          echo "=== FIND raidlist_updater.py ==="
+          find . -name "raidlist_updater.py" -print
+          echo "=== PRINT raidlist_updater.py (lines 45-90) ==="
+          nl -ba raidlist_updater.py | sed -n '45,90p'
+          echo "=== PY COMPILE ==="
+          python -m py_compile raidlist_updater.py
+
       - name: Run bot
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-        - name: Debug raidlist_updater.py actually used
-   run: |
-    echo "=== WHERE AM I ==="
-    pwd
-    echo "=== LIST FILES ==="
-    ls -la
-    echo "=== FIND raidlist_updater.py ==="
-    find . -name "raidlist_updater.py" -print
-    echo "=== PRINT raidlist_updater.py (lines 45-90) ==="
-    nl -ba raidlist_updater.py | sed -n '45,90p'
-    echo "=== PY COMPILE ==="
-    python -m py_compile raidlist_updater.py
-
           python main.py
