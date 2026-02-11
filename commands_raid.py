@@ -26,7 +26,7 @@ def register_raid_commands(tree: app_commands.CommandTree, client: discord.Clien
 
         # dungeon exists & active
         async with await get_session() as session:
-            d = (await session.execute(select(Dungeon).where(Dungeon.name == dungeon, Dungeon.is_active == 1))).scalar_one_or_none()
+            d = (await session.execute(select(Dungeon).where(Dungeon.name == dungeon, Dungeon.is_active == True))).scalar_one_or_none()
         if not d:
             return await interaction.followup.send("❌ Dungeon nicht gefunden / nicht aktiv.", ephemeral=True)
 
@@ -40,7 +40,7 @@ def register_raid_commands(tree: app_commands.CommandTree, client: discord.Clien
     async def dungeon_ac(interaction: discord.Interaction, current: str):
         q = (current or "").lower().strip()
         async with await get_session() as session:
-            rows = (await session.execute(select(Dungeon).where(Dungeon.is_active == 1))).scalars().all()
+            rows = (await session.execute(select(Dungeon).where(Dungeon.is_active == True))).scalars().all()
         if q:
             rows = [r for r in rows if q in r.name.lower()]
         return [app_commands.Choice(name=r.name, value=r.name) for r in rows[:25]]
