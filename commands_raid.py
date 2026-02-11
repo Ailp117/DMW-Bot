@@ -1,3 +1,4 @@
+# commands_raid.py
 import discord
 from discord import app_commands
 from sqlalchemy import select
@@ -14,7 +15,8 @@ from helpers import (
     raid_jump_url,
 )
 from views_raid import RaidCreateModal, RaidVoteView
-from raidlist import refresh_raidlist_for_guild
+from raidlist import schedule_raidlist_refresh, force_raidlist_refresh
+
 
 def register_raid_commands(tree: app_commands.CommandTree, client: discord.Client):
     @tree.command(name="raidplan", description="Erstellt einen Raid Plan (Planer wird im konfigurierten Planer-Channel gepostet).")
@@ -73,7 +75,10 @@ def register_raid_commands(tree: app_commands.CommandTree, client: discord.Clien
             await set_raid_message_id(session, raid.id, msg.id)
 
         client.add_view(raid_view, message_id=msg.id)
-        await refresh_raidlist_for_guild(interaction.client, interaction.guild.id)
+
+        # ✅ debounced raidlist update (fast, no spam)
+        await schedule_raidlist_refresh(interaction.client, interaction.guild.id)
+
         await send_temp(interaction, f"✅ Raid erstellt: {raid_jump_url(raid)}")
 
     @raidplan.autocomplete("dungeon")
@@ -94,5 +99,6 @@ def register_raid_commands(tree: app_commands.CommandTree, client: discord.Clien
     async def raidlist(interaction: discord.Interaction):
         if not interaction.guild:
             return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
-        await refresh_raidlist_for_guild(interaction.client, interaction.guild.id)
+
+        await force_raidlist_refresh(interaction.client, interaction.guild.id)
         await send_temp(interaction, "✅ Raidlist aktualisiert.")
