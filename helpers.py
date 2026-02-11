@@ -197,7 +197,7 @@ async def upsert_posted_slot_message(session: AsyncSession, raid_id: int, day_la
     await session.commit()
 
 async def get_all_posted_slots(session: AsyncSession, raid_id: int) -> list[RaidPostedSlot]:
-    from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from models import Raid, RaidOption
 from helpers import split_csv  # falls split_csv in helpers.py ist, sonst diese Zeile löschen
@@ -239,7 +239,3 @@ async def create_raid(
     await session.commit()
     await session.refresh(raid)
     return raid
-
-    res = await session.execute(select(RaidPostedSlot).where(RaidPostedSlot.raid_id == raid_id))
-    return res.scalars().all()
-
