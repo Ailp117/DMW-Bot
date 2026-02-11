@@ -197,5 +197,49 @@ async def upsert_posted_slot_message(session: AsyncSession, raid_id: int, day_la
     await session.commit()
 
 async def get_all_posted_slots(session: AsyncSession, raid_id: int) -> list[RaidPostedSlot]:
+    from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from models import Raid, RaidOption
+from helpers import split_csv  # falls split_csv in helpers.py ist, sonst diese Zeile löschen
+
+async def create_raid(
+    session: AsyncSession,
+    guild_id: int,
+    planner_channel_id: int,
+    creator_id: int,
+    dungeon: str,
+    days_csv: str,
+    times_csv: str,
+    min_players: int,
+) -> Raid:
+    """
+    Erstellt einen neuen Raid + Optionen (Tage/Uhrzeiten) in der DB.
+    """
+    raid = Raid(
+        guild_id=guild_id,
+        channel_id=planner_channel_id,
+        creator_id=creator_id,
+        dungeon=dungeon,
+        status="open",
+        min_players=min_players,
+        participants_posted=False,
+    )
+    session.add(raid)
+    await session.flush()  # damit raid.id verfügbar ist
+
+    days = split_csv(days_csv)
+    times = split_csv(times_csv)
+
+    # Optionen speichern
+    for d in days:
+        session.add(RaidOption(raid_id=raid.id, kind="day", label=d))
+    for t in times:
+        session.add(RaidOption(raid_id=raid.id, kind="time", label=t))
+
+    await session.commit()
+    await session.refresh(raid)
+    return raid
+
     res = await session.execute(select(RaidPostedSlot).where(RaidPostedSlot.raid_id == raid_id))
     return res.scalars().all()
+
