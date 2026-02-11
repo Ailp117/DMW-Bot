@@ -1,7 +1,16 @@
 from __future__ import annotations
 
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy import BigInteger, Integer, String, Text, DateTime, ForeignKey, func, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    Integer,
+    String,
+    DateTime,
+    ForeignKey,
+    func,
+    UniqueConstraint,
+    Boolean,   # ✅ added
+)
 
 
 class Base(DeclarativeBase):
@@ -70,7 +79,11 @@ class GuildSettings(Base):
 
 class Dungeon(Base):
     __tablename__ = "dungeons"
+
     short_code: Mapped[str] = mapped_column(String(32), primary_key=True)
     name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
-    is_active: Mapped[bool] = mapped_column(Integer, default=1)  # 1/0
+
+    # ✅ FIX 1: BOOLEAN statt Integer (Supabase/Postgres erwartet boolean)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
