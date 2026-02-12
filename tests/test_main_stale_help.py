@@ -17,6 +17,15 @@ class MainStaleAndHelpSourceTests(unittest.TestCase):
         self.assertIn('`/raidplan`', self.src)
         self.assertIn('`/purgebot`', self.src)
 
+    def test_restart_command_registered(self):
+        self.assertIn('@self.tree.command(name="restart"', self.src)
+        self.assertIn('asyncio.create_task(self._restart_process())', self.src)
+
+    def test_command_sync_uses_database_guild_ids(self):
+        self.assertIn('async def _get_configured_guild_ids', self.src)
+        self.assertIn('select(GuildSettings.guild_id)', self.src)
+        self.assertIn('await self._sync_commands_for_known_guilds()', self.src)
+
     def test_stale_cleanup_worker_present(self):
         self.assertIn('STALE_RAID_HOURS = 7 * 24', self.src)
         self.assertIn('async def cleanup_stale_raids_once', self.src)
