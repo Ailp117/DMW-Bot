@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import re
 from collections import deque
 from datetime import datetime, timedelta
@@ -30,7 +31,19 @@ from roles import cleanup_temp_role
 from views_raid import RaidVoteView, cleanup_posted_slot_messages
 from leveling import calculate_level_from_xp
 
-logging.basicConfig(level=logging.INFO)
+def setup_logging() -> None:
+    level_name = os.getenv("LOG_LEVEL", "DEBUG").upper()
+    log_level = getattr(logging, level_name, logging.DEBUG)
+
+    logging.basicConfig(
+        level=log_level,
+        format="[%(asctime)s] %(levelname)s [%(name)s|%(module)s.%(funcName)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
+
+
+setup_logging()
 log = logging.getLogger("dmw-raid-bot")
 
 NANOMON_IMAGE_URL = "https://wikimon.net/images/thumb/c/cc/Nanomon_New_Century.png/200px-Nanomon_New_Century.png"
@@ -106,7 +119,10 @@ class RaidBot(discord.Client):
 
         handler = _DiscordQueueHandler(level=logging.INFO)
         handler.setFormatter(
-            logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
+            logging.Formatter(
+                "[%(asctime)s] %(levelname)s [%(name)s|%(module)s.%(funcName)s] %(message)s",
+                "%Y-%m-%d %H:%M:%S",
+            )
         )
         return handler
 
