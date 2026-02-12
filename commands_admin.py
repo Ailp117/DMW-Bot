@@ -33,8 +33,8 @@ def register_admin_commands(tree: app_commands.CommandTree):
             )).scalars().all()
 
         count = 0
-        for r in raids:
-            async with session_scope() as session:
+        async with session_scope() as session:
+            for r in raids:
                 raid = await session.get(Raid, r.id)
                 if not raid:
                     continue
