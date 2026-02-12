@@ -116,7 +116,7 @@ class RaidCreateModal(discord.ui.Modal, title="Raid erstellen"):
         )
 
 
-async def cleanup_posted_slot_messages(session, client: discord.Client, raid_id: int) -> None:
+async def cleanup_posted_slot_messages(session, interaction: discord.Interaction, raid_id: int) -> None:
     rows = (await session.execute(
         select(RaidPostedSlot).where(RaidPostedSlot.raid_id == raid_id)
     )).scalars().all()
@@ -125,10 +125,10 @@ async def cleanup_posted_slot_messages(session, client: discord.Client, raid_id:
         if row.channel_id is None or row.message_id is None:
             continue
 
-        ch = client.get_channel(int(row.channel_id))
+        ch = interaction.client.get_channel(int(row.channel_id))
         if ch is None:
             try:
-                ch = await client.fetch_channel(int(row.channel_id))
+                ch = await interaction.client.fetch_channel(int(row.channel_id))
             except (discord.NotFound, discord.Forbidden):
                 continue
 
@@ -163,7 +163,7 @@ class FinishButton(Button):
                 return await interaction.followup.send("Nur der Ersteller kann beenden.", ephemeral=True)
 
             # cleanup participant list messages + role + delete raid (cascade)
-            await cleanup_posted_slot_messages(session, interaction.client, raid.id)
+            await cleanup_posted_slot_messages(session, interaction, raid.id)
             await cleanup_temp_role(session, interaction.guild, raid)
             await delete_raid_cascade(session, raid.id)
 
