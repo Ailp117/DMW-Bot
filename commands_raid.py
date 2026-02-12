@@ -43,8 +43,6 @@ def register_raid_commands(tree: app_commands.CommandTree):
         q = (current or "").lower().strip()
 
         async with session_scope() as session:
-            # keep this query centralized in helpers to avoid integer-vs-boolean
-            # regressions in PostgreSQL filters (e.g. `is_active == 1`).
             rows = await get_active_dungeons(session)
 
         if q:
