@@ -7,7 +7,7 @@ import discord
 from discord import app_commands
 from sqlalchemy import select
 
-from config import DISCORD_TOKEN, GUILD_ID
+from config import DISCORD_TOKEN, GUILD_ID, ENABLE_MESSAGE_CONTENT_INTENT
 from ensure_schema import ensure_schema
 from db import try_acquire_singleton_lock, session_scope
 from raidlist_updater import RaidlistUpdater
@@ -84,6 +84,8 @@ class RaidBot(discord.Client):
         register_admin_commands(self.tree)
         register_raid_commands(self.tree)
         register_purge_commands(self.tree)
+
+        await self.restore_persistent_raid_views()
 
         @self.tree.command(name="settings", description="Settings öffnen")
         @app_commands.checks.has_permissions(manage_guild=True)
