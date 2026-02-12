@@ -18,9 +18,10 @@ from helpers import get_settings, delete_raid_cascade, get_options
 from commands_admin import register_admin_commands
 from commands_raid import register_raid_commands
 from commands_purge import register_purge_commands
-from models import Raid
+from models import Raid, UserLevel
 from roles import cleanup_temp_role
 from views_raid import RaidVoteView, cleanup_posted_slot_messages
+from leveling import calculate_level_from_xp
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dmw-raid-bot")
@@ -231,6 +232,24 @@ class RaidBot(discord.Client):
 
         if message.author.bot:
             return
+
+        if message.guild is not None:
+            gained_xp = 10
+            async with session_scope() as session:
+                user_level = await session.get(UserLevel, (message.guild.id, message.author.id))
+                if user_level is None:
+                    user_level = UserLevel(guild_id=message.guild.id, user_id=message.author.id, xp=0, level=0)
+                    session.add(user_level)
+
+                previous_level = user_level.level
+                user_level.xp += gained_xp
+                user_level.level = calculate_level_from_xp(user_level.xp)
+
+                if user_level.level > previous_level:
+                    await message.channel.send(
+                        f"🎉 {message.author.mention} ist auf **Level {user_level.level}** aufgestiegen! "
+                        f"(XP: {user_level.xp})"
+                    )
 
         if contains_nanomon_keyword(message.content):
             await message.reply(NANOMON_IMAGE_URL, mention_author=False)
