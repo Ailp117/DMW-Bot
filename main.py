@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import re
+import shlex
+import sys
 from collections import deque
 from datetime import datetime, timedelta
 
@@ -11,7 +13,6 @@ from sqlalchemy import select
 
 from config import (
     DISCORD_TOKEN,
-    GUILD_ID,
     ENABLE_MESSAGE_CONTENT_INTENT,
     LOG_GUILD_ID,
     LOG_CHANNEL_ID,
@@ -26,7 +27,7 @@ from helpers import get_settings, delete_raid_cascade, get_options
 from commands_admin import register_admin_commands
 from commands_raid import register_raid_commands
 from commands_purge import register_purge_commands
-from models import Raid, UserLevel
+from models import Raid, UserLevel, GuildSettings
 from roles import cleanup_temp_role
 from views_raid import RaidVoteView, cleanup_posted_slot_messages
 from leveling import calculate_level_from_xp
@@ -105,6 +106,54 @@ class RaidBot(discord.Client):
         self.pending_log_buffer: deque[str] = deque(maxlen=250)
         self._discord_log_handler = self._build_discord_log_handler()
         log.addHandler(self._discord_log_handler)
+
+    async def _get_configured_guild_ids(self) -> list[int]:
+        async with session_scope() as session:
+            guild_ids = (await session.execute(select(GuildSettings.guild_id))).scalars().all()
+        return sorted({int(gid) for gid in guild_ids if gid})
+
+    async def _sync_commands_for_known_guilds(self) -> None:
+        guild_ids = await self._get_configured_guild_ids()
+        connected_guild_ids = {guild.id for guild in self.guilds}
+        target_ids = sorted(set(guild_ids).union(connected_guild_ids))
+
+        if not target_ids:
+            await self.tree.sync()
+            log.warning("No known guild IDs in database yet -> global sync (can take up to ~1h).")
+            return
+
+        synced_count = 0
+        for guild_id in target_ids:
+            try:
+                await self.tree.sync(guild=discord.Object(id=guild_id))
+                synced_count += 1
+            except Exception:
+                log.exception("Failed to sync commands to guild %s", guild_id)
+
+        log.info("Synced commands to %s guild(s): %s", synced_count, ", ".join(str(gid) for gid in target_ids))
+
+    async def _restart_process(self) -> None:
+        log.warning("Restart requested. Restarting bot process now.")
+        await self.close()
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+
+    async def _execute_console_command(self, message: discord.Message) -> bool:
+        raw = (message.content or "").strip()
+        if not raw:
+            return False
+
+        parts = shlex.split(raw)
+        if not parts:
+            return False
+
+        command = parts[0].lstrip("/").lower()
+        if command == "restart":
+            await message.channel.send("♻️ Neustart wird ausgeführt …")
+            asyncio.create_task(self._restart_process())
+            return True
+
+        await message.channel.send(f"⚠️ Unbekannter Console-Befehl: `{command}`")
+        return False
 
     def _build_discord_log_handler(self) -> logging.Handler:
         bot = self
@@ -258,12 +307,13 @@ class RaidBot(discord.Client):
             )
             await interaction.response.send_message(text, ephemeral=True)
 
-        if GUILD_ID:
-            await self.tree.sync(guild=discord.Object(id=GUILD_ID))
-            log.info("Synced commands to guild %s", GUILD_ID)
-        else:
-            await self.tree.sync()
-            log.warning("GUILD_ID not set -> global sync (can take up to ~1h).")
+        @self.tree.command(name="restart", description="Startet den Bot-Prozess neu")
+        @app_commands.checks.has_permissions(administrator=True)
+        async def restart_cmd(interaction: discord.Interaction):
+            await interaction.response.send_message("♻️ Neustart wird ausgeführt …", ephemeral=True)
+            asyncio.create_task(self._restart_process())
+
+        await self._sync_commands_for_known_guilds()
 
         if self.stale_raid_task is None or self.stale_raid_task.done():
             self.stale_raid_task = asyncio.create_task(self._stale_raid_worker())
@@ -391,6 +441,17 @@ class RaidBot(discord.Client):
 
         if message.author.bot:
             return
+
+        if (
+            self.log_channel is not None
+            and message.guild is not None
+            and message.channel.id == self.log_channel.id
+            and isinstance(message.author, discord.Member)
+            and message.author.guild_permissions.administrator
+        ):
+            executed = await self._execute_console_command(message)
+            if executed:
+                return
 
         if message.guild is not None:
             gained_xp = 10
