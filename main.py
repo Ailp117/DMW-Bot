@@ -28,12 +28,18 @@ log = logging.getLogger("dmw-raid-bot")
 
 NANOMON_IMAGE_URL = "https://wikimon.net/images/thumb/c/cc/Nanomon_New_Century.png/200px-Nanomon_New_Century.png"
 NANOMON_PATTERN = re.compile(r"\bnanomon\b")
+APPROVED_GIF_URL = "https://media1.tenor.com/m/l8waltLHrxcAAAAC/approved.gif"
+APPROVED_PATTERN = re.compile(r"\bapproved\b")
 STALE_RAID_HOURS = 7 * 24
 STALE_RAID_CHECK_SECONDS = 15 * 60
 
 
 def contains_nanomon_keyword(content: str) -> bool:
     return bool(NANOMON_PATTERN.search((content or "").casefold()))
+
+
+def contains_approved_keyword(content: str) -> bool:
+    return bool(APPROVED_PATTERN.search((content or "").casefold()))
 
 
 
@@ -253,6 +259,9 @@ class RaidBot(discord.Client):
 
         if contains_nanomon_keyword(message.content):
             await message.reply(NANOMON_IMAGE_URL, mention_author=False)
+
+        if contains_approved_keyword(message.content):
+            await message.reply(APPROVED_GIF_URL, mention_author=False)
 
     async def on_ready(self):
         log.info("Logged in as %s", self.user)
