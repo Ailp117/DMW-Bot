@@ -28,7 +28,7 @@ log = logging.getLogger("dmw-raid-bot")
 
 NANOMON_IMAGE_URL = "https://wikimon.net/images/thumb/c/cc/Nanomon_New_Century.png/200px-Nanomon_New_Century.png"
 NANOMON_PATTERN = re.compile(r"\bnanomon\b")
-APPROVED_GIF_URL = "https://media1.tenor.com/m/l8waltLHrxcAAAAC/approved.gif"
+APPROVED_GIF_URL = "https://c.tenor.com/l8waltLHrxcAAAAC/tenor.gif"
 APPROVED_PATTERN = re.compile(r"\bapproved\b")
 STALE_RAID_HOURS = 7 * 24
 STALE_RAID_CHECK_SECONDS = 15 * 60
