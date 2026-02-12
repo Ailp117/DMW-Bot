@@ -1,8 +1,9 @@
 import discord
 from discord.ui import View, Select, Button
+from sqlalchemy import select
 
 from db import session_scope
-from models import Raid
+from models import Raid, RaidPostedSlot
 from helpers import (
     normalize_list, get_settings, create_raid, get_raid, get_options,
     toggle_vote, vote_counts, slot_users, get_posted_slot, upsert_posted_slot,
@@ -115,6 +116,33 @@ class RaidCreateModal(discord.ui.Modal, title="Raid erstellen"):
         )
 
 
+async def cleanup_posted_slot_messages(session, interaction: discord.Interaction, raid_id: int) -> None:
+    rows = (await session.execute(
+        select(RaidPostedSlot).where(RaidPostedSlot.raid_id == raid_id)
+    )).scalars().all()
+
+    for row in rows:
+        if row.channel_id is None or row.message_id is None:
+            continue
+
+        ch = interaction.client.get_channel(int(row.channel_id))
+        if ch is None:
+            try:
+                ch = await interaction.client.fetch_channel(int(row.channel_id))
+            except (discord.NotFound, discord.Forbidden):
+                continue
+
+        if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+            continue
+
+        try:
+            msg = await ch.fetch_message(int(row.message_id))
+            await msg.delete()
+        except (discord.NotFound, discord.Forbidden):
+            continue
+
+
+
 class FinishButton(Button):
     def __init__(self, raid_id: int):
         super().__init__(style=discord.ButtonStyle.danger, label="Raid beenden", custom_id=f"raid:{raid_id}:finish")
@@ -134,7 +162,8 @@ class FinishButton(Button):
             if interaction.user.id != raid.creator_id:
                 return await interaction.followup.send("Nur der Ersteller kann beenden.", ephemeral=True)
 
-            # cleanup role + delete raid (cascade)
+            # cleanup participant list messages + role + delete raid (cascade)
+            await cleanup_posted_slot_messages(session, interaction, raid.id)
             await cleanup_temp_role(session, interaction.guild, raid)
             await delete_raid_cascade(session, raid.id)
 
@@ -174,7 +203,7 @@ class RaidVoteView(View):
         self.add_item(self.time_select)
         self.add_item(FinishButton(raid_id))
 
-    async def _refresh(self, interaction: discord.Interaction):
+    async def refresh_view(self, interaction: discord.Interaction):
         async with session_scope() as session:
             raid = await get_raid(session, self.raid_id)
             if not raid:
@@ -229,7 +258,7 @@ class RaidVoteView(View):
         async with session_scope() as session:
             for v in values:
                 await toggle_vote(session, self.raid_id, "day", v, interaction.user.id)
-        await self._refresh(interaction)
+        await self.refresh_view(interaction)
 
     async def on_time_select(self, interaction: discord.Interaction):
         await interaction.response.defer()
@@ -237,4 +266,4 @@ class RaidVoteView(View):
         async with session_scope() as session:
             for v in values:
                 await toggle_vote(session, self.raid_id, "time", v, interaction.user.id)
-        await self._refresh(interaction)
+        await self.refresh_view(interaction)
