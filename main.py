@@ -1,13 +1,20 @@
 import asyncio
 import logging
 import re
+from collections import deque
 from datetime import datetime, timedelta
 
 import discord
 from discord import app_commands
 from sqlalchemy import select
 
-from config import DISCORD_TOKEN, GUILD_ID, ENABLE_MESSAGE_CONTENT_INTENT
+from config import (
+    DISCORD_TOKEN,
+    GUILD_ID,
+    ENABLE_MESSAGE_CONTENT_INTENT,
+    LOG_GUILD_ID,
+    LOG_CHANNEL_ID,
+)
 from ensure_schema import ensure_schema
 from db import try_acquire_singleton_lock, session_scope
 from raidlist_updater import RaidlistUpdater
@@ -28,7 +35,7 @@ log = logging.getLogger("dmw-raid-bot")
 
 NANOMON_IMAGE_URL = "https://wikimon.net/images/thumb/c/cc/Nanomon_New_Century.png/200px-Nanomon_New_Century.png"
 NANOMON_PATTERN = re.compile(r"\bnanomon\b")
-APPROVED_GIF_URL = "https://c.tenor.com/l8waltLHrxcAAAAC/tenor.gif"
+APPROVED_GIF_URL = "https://media1.tenor.com/m/l8waltLHrxcAAAAC/approved.gif"
 APPROVED_PATTERN = re.compile(r"\bapproved\b")
 STALE_RAID_HOURS = 7 * 24
 STALE_RAID_CHECK_SECONDS = 15 * 60
@@ -79,6 +86,75 @@ class RaidBot(discord.Client):
         self.stale_raid_task: asyncio.Task | None = None
         self.voice_xp_task: asyncio.Task | None = None
         self.voice_xp_last_award: dict[tuple[int, int], datetime] = {}
+        self.log_channel: discord.TextChannel | None = None
+        self.log_forwarder_task: asyncio.Task | None = None
+        self.log_forward_queue: asyncio.Queue[str] = asyncio.Queue()
+        self.pending_log_buffer: deque[str] = deque(maxlen=250)
+        self._discord_log_handler = self._build_discord_log_handler()
+        log.addHandler(self._discord_log_handler)
+
+    def _build_discord_log_handler(self) -> logging.Handler:
+        bot = self
+
+        class _DiscordQueueHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                try:
+                    msg = self.format(record)
+                    bot.enqueue_discord_log(msg)
+                except Exception:
+                    self.handleError(record)
+
+        handler = _DiscordQueueHandler(level=logging.INFO)
+        handler.setFormatter(
+            logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
+        )
+        return handler
+
+    def enqueue_discord_log(self, message: str) -> None:
+        if not message:
+            return
+
+        if len(message) > 1800:
+            message = f"{message[:1797]}..."
+
+        if self.is_ready() and self.log_forwarder_task and not self.log_forwarder_task.done():
+            self.loop.call_soon_threadsafe(self.log_forward_queue.put_nowait, message)
+            return
+
+        self.pending_log_buffer.append(message)
+
+    async def _resolve_log_channel(self) -> discord.TextChannel | None:
+        guild = self.get_guild(LOG_GUILD_ID)
+        if guild is None:
+            log.warning("Log guild %s not found", LOG_GUILD_ID)
+            return None
+
+        channel = guild.get_channel(LOG_CHANNEL_ID)
+        if not isinstance(channel, discord.TextChannel):
+            log.warning("Log channel %s not found or not a text channel", LOG_CHANNEL_ID)
+            return None
+
+        perms = channel.permissions_for(guild.me) if guild.me else None
+        if perms and not perms.send_messages:
+            log.warning("Missing send_messages permission in log channel %s", LOG_CHANNEL_ID)
+            return None
+
+        return channel
+
+    async def _log_forwarder_worker(self):
+        await self.wait_until_ready()
+
+        while not self.is_closed():
+            message = await self.log_forward_queue.get()
+            channel = self.log_channel
+            if channel is None:
+                continue
+
+            try:
+                await channel.send(f"```\n{message}\n```")
+            except Exception:
+                # Keep stderr logging only here to avoid recursive handler loops.
+                print(f"[discord-log-forwarder] failed to send log message: {message}")
 
     async def setup_hook(self):
         await ensure_schema()
@@ -325,15 +401,29 @@ class RaidBot(discord.Client):
             await message.reply(APPROVED_GIF_URL, mention_author=False)
 
     async def on_ready(self):
+        if self.log_channel is None:
+            self.log_channel = await self._resolve_log_channel()
+
+        if self.log_forwarder_task is None or self.log_forwarder_task.done():
+            self.log_forwarder_task = asyncio.create_task(self._log_forwarder_worker())
+
+        if self.log_channel is not None:
+            while self.pending_log_buffer:
+                self.log_forward_queue.put_nowait(self.pending_log_buffer.popleft())
+            self.log_forward_queue.put_nowait("Discord live logging initialisiert.")
+
         log.info("Logged in as %s", self.user)
         if self.guilds:
             await force_raidlist_refresh(self, self.guilds[0].id)
 
     async def close(self):
+        log.removeHandler(self._discord_log_handler)
         if self.stale_raid_task and not self.stale_raid_task.done():
             self.stale_raid_task.cancel()
         if self.voice_xp_task and not self.voice_xp_task.done():
             self.voice_xp_task.cancel()
+        if self.log_forwarder_task and not self.log_forwarder_task.done():
+            self.log_forwarder_task.cancel()
         await super().close()
 
 client = RaidBot()

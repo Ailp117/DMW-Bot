@@ -16,3 +16,7 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0") or "0")
 DB_ECHO = os.getenv("DB_ECHO", "0") == "1"
 
 ENABLE_MESSAGE_CONTENT_INTENT = _env_bool("ENABLE_MESSAGE_CONTENT_INTENT", default=True)
+
+# Discord channel for live operational logs
+LOG_GUILD_ID = int(os.getenv("LOG_GUILD_ID", "1471638702316060836") or "0")
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "1471639446641315931") or "0")
