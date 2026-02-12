@@ -19,7 +19,7 @@ class ViewsRaidRegressionTests(unittest.TestCase):
         self.fail('RaidVoteView class not found')
 
     def test_finish_button_cleans_up_posted_slot_messages(self):
-        self.assertIn('await cleanup_posted_slot_messages(session, interaction.client, raid.id)', self.src)
+        self.assertIn('await cleanup_posted_slot_messages(session, interaction, raid.id)', self.src)
 
 
 if __name__ == '__main__':
