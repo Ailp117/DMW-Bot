@@ -18,9 +18,9 @@ from helpers import get_settings, delete_raid_cascade
 from commands_admin import register_admin_commands
 from commands_raid import register_raid_commands
 from commands_purge import register_purge_commands
-from models import Raid, RaidOption
+from models import Raid
 from roles import cleanup_temp_role
-from views_raid import cleanup_posted_slot_messages, RaidVoteView
+from views_raid import cleanup_posted_slot_messages
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dmw-raid-bot")
@@ -60,7 +60,7 @@ def _perm_status(channel: discord.TextChannel | None, me: discord.Member | None)
     )
 
 INTENTS = discord.Intents.default()
-INTENTS.message_content = ENABLE_MESSAGE_CONTENT_INTENT
+INTENTS.message_content = True
 
 class RaidBot(discord.Client):
     def __init__(self):
@@ -68,30 +68,6 @@ class RaidBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.raidlist_updater: RaidlistUpdater | None = None
         self.stale_raid_task: asyncio.Task | None = None
-
-
-    async def restore_persistent_raid_views(self) -> int:
-        restored = 0
-        async with session_scope() as session:
-            raids = (await session.execute(
-                select(Raid).where(Raid.status == "open")
-            )).scalars().all()
-
-            for raid in raids:
-                rows = (await session.execute(
-                    select(RaidOption).where(RaidOption.raid_id == raid.id)
-                )).scalars().all()
-                days = [r.label for r in rows if r.kind == "day"]
-                times = [r.label for r in rows if r.kind == "time"]
-                if not days or not times:
-                    continue
-
-                self.add_view(RaidVoteView(raid.id, days, times))
-                restored += 1
-
-        if restored:
-            log.info("Restored %s persistent raid views", restored)
-        return restored
 
     async def setup_hook(self):
         await ensure_schema()
@@ -109,11 +85,7 @@ class RaidBot(discord.Client):
         register_raid_commands(self.tree)
         register_purge_commands(self.tree)
 
-        restore_views = getattr(self, "restore_persistent_raid_views", None)
-        if callable(restore_views):
-            await restore_views()
-        else:
-            log.warning("Persistent raid view restore is unavailable; continuing without restore.")
+        await self.restore_persistent_raid_views()
 
         @self.tree.command(name="settings", description="Settings öffnen")
         @app_commands.checks.has_permissions(manage_guild=True)
@@ -231,9 +203,6 @@ class RaidBot(discord.Client):
             await asyncio.sleep(STALE_RAID_CHECK_SECONDS)
 
     async def on_message(self, message: discord.Message):
-        if not ENABLE_MESSAGE_CONTENT_INTENT:
-            return
-
         if message.author.bot:
             return
 
