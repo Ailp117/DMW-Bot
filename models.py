@@ -153,6 +153,7 @@ Index("ix_posted_slots_raid_day_time", RaidPostedSlot.raid_id, RaidPostedSlot.da
 # === user_levels ===
 # guild_id bigint NOT NULL (PK part)
 # user_id bigint NOT NULL (PK part)
+# username text NULL
 # xp integer NOT NULL
 # level integer NOT NULL
 # updated_at timestamptz NOT NULL
@@ -161,6 +162,7 @@ class UserLevel(Base):
 
     guild_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    username: Mapped[str | None] = mapped_column(Text, nullable=True)
     xp: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     level: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())

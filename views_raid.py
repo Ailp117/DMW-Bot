@@ -6,7 +6,7 @@ from db import session_scope
 from models import Raid, RaidPostedSlot
 from helpers import (
     normalize_list, get_settings, create_raid, get_raid, get_options,
-    toggle_vote, vote_counts, slot_users, get_posted_slot, upsert_posted_slot,
+    toggle_vote, vote_counts, vote_user_sets, posted_slot_map, upsert_posted_slot,
     delete_raid_cascade, short_list
 )
 from roles import ensure_temp_role, cleanup_temp_role
@@ -229,18 +229,27 @@ class RaidVoteView(View):
                 ch = interaction.client.get_channel(int(s.participants_channel_id))
                 if isinstance(ch, (discord.TextChannel, discord.Thread)):
                     days, times = await get_options(session, self.raid_id)
+                    day_users, time_users = await vote_user_sets(session, self.raid_id)
+                    slot_rows = await posted_slot_map(session, self.raid_id)
                     for d in days:
                         for t in times:
-                            users = await slot_users(session, self.raid_id, d, t)
+                            users = sorted(day_users.get(d, set()).intersection(time_users.get(t, set())))
                             if len(users) < raid.min_players:
                                 continue
 
                             txt = slot_text(raid, d, t, role, users)
-                            row = await get_posted_slot(session, self.raid_id, d, t)
+                            row = slot_rows.get((d, t))
 
                             if not row:
                                 msg = await ch.send(txt, allowed_mentions=discord.AllowedMentions(users=True, roles=True))
                                 await upsert_posted_slot(session, self.raid_id, d, t, ch.id, msg.id)
+                                slot_rows[(d, t)] = RaidPostedSlot(
+                                    raid_id=self.raid_id,
+                                    day_label=d,
+                                    time_label=t,
+                                    channel_id=ch.id,
+                                    message_id=msg.id,
+                                )
                             else:
                                 try:
                                     msg = await ch.fetch_message(int(row.message_id))
@@ -248,6 +257,13 @@ class RaidVoteView(View):
                                 except (discord.NotFound, discord.Forbidden):
                                     msg = await ch.send(txt, allowed_mentions=discord.AllowedMentions(users=True, roles=True))
                                     await upsert_posted_slot(session, self.raid_id, d, t, ch.id, msg.id)
+                                    slot_rows[(d, t)] = RaidPostedSlot(
+                                        raid_id=self.raid_id,
+                                        day_label=d,
+                                        time_label=t,
+                                        channel_id=ch.id,
+                                        message_id=msg.id,
+                                    )
 
         await interaction.edit_original_response(embed=embed, view=self)
         await schedule_raidlist_refresh(interaction.client, interaction.guild.id)

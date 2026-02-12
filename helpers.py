@@ -79,6 +79,24 @@ async def vote_counts(session: AsyncSession, raid_id: int) -> dict[str, dict[str
         out[v.kind][v.option_label] = out[v.kind].get(v.option_label, 0) + 1
     return out
 
+async def vote_user_sets(session: AsyncSession, raid_id: int) -> tuple[dict[str, set[int]], dict[str, set[int]]]:
+    rows = (await session.execute(select(RaidVote).where(RaidVote.raid_id == raid_id))).scalars().all()
+    day_users: dict[str, set[int]] = {}
+    time_users: dict[str, set[int]] = {}
+
+    for vote in rows:
+        target = day_users if vote.kind == "day" else time_users
+        users = target.setdefault(vote.option_label, set())
+        users.add(int(vote.user_id))
+
+    return day_users, time_users
+
+async def posted_slot_map(session: AsyncSession, raid_id: int) -> dict[tuple[str, str], RaidPostedSlot]:
+    rows = (await session.execute(
+        select(RaidPostedSlot).where(RaidPostedSlot.raid_id == raid_id)
+    )).scalars().all()
+    return {(row.day_label, row.time_label): row for row in rows}
+
 async def slot_users(session: AsyncSession, raid_id: int, day_label: str, time_label: str) -> list[int]:
     day = set((await session.execute(
         select(RaidVote.user_id).where(
