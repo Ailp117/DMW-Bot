@@ -65,6 +65,20 @@ def contains_approved_keyword(content: str) -> bool:
     return bool(APPROVED_PATTERN.search((content or "").casefold()))
 
 
+def _member_username_in_guild(member: discord.abc.User) -> str | None:
+    display_name = getattr(member, "display_name", None)
+    if isinstance(display_name, str) and display_name.strip():
+        return display_name.strip()
+
+    global_name = getattr(member, "global_name", None)
+    if isinstance(global_name, str) and global_name.strip():
+        return global_name.strip()
+
+    username = getattr(member, "name", None)
+    if isinstance(username, str) and username.strip():
+        return username.strip()
+
+    return None
 
 
 def _channel_status(guild: discord.Guild, channel_id: int | None) -> str:
@@ -413,9 +427,16 @@ class RaidBot(discord.Client):
 
                         user_level = await session.get(UserLevel, (guild.id, member.id))
                         if user_level is None:
-                            user_level = UserLevel(guild_id=guild.id, user_id=member.id, xp=0, level=0)
+                            user_level = UserLevel(
+                                guild_id=guild.id,
+                                user_id=member.id,
+                                username=_member_username_in_guild(member),
+                                xp=0,
+                                level=0,
+                            )
                             session.add(user_level)
 
+                        user_level.username = _member_username_in_guild(member)
                         user_level.xp += 1
                         user_level.level = calculate_level_from_xp(user_level.xp)
                         self.voice_xp_last_award[key] = now
@@ -458,9 +479,16 @@ class RaidBot(discord.Client):
             async with session_scope() as session:
                 user_level = await session.get(UserLevel, (message.guild.id, message.author.id))
                 if user_level is None:
-                    user_level = UserLevel(guild_id=message.guild.id, user_id=message.author.id, xp=0, level=0)
+                    user_level = UserLevel(
+                        guild_id=message.guild.id,
+                        user_id=message.author.id,
+                        username=_member_username_in_guild(message.author),
+                        xp=0,
+                        level=0,
+                    )
                     session.add(user_level)
 
+                user_level.username = _member_username_in_guild(message.author)
                 previous_level = user_level.level
                 user_level.xp += gained_xp
                 user_level.level = calculate_level_from_xp(user_level.xp)
