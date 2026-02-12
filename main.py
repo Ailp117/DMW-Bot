@@ -13,14 +13,14 @@ from db import try_acquire_singleton_lock, session_scope
 from raidlist_updater import RaidlistUpdater
 from raidlist import refresh_raidlist_for_guild, force_raidlist_refresh, schedule_raidlist_refresh
 from views_settings import SettingsView, settings_embed
-from helpers import get_settings, delete_raid_cascade
+from helpers import get_settings, delete_raid_cascade, get_options
 
 from commands_admin import register_admin_commands
 from commands_raid import register_raid_commands
 from commands_purge import register_purge_commands
 from models import Raid
 from roles import cleanup_temp_role
-from views_raid import cleanup_posted_slot_messages
+from views_raid import RaidVoteView, cleanup_posted_slot_messages
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("dmw-raid-bot")
@@ -60,7 +60,7 @@ def _perm_status(channel: discord.TextChannel | None, me: discord.Member | None)
     )
 
 INTENTS = discord.Intents.default()
-INTENTS.message_content = True
+INTENTS.message_content = ENABLE_MESSAGE_CONTENT_INTENT
 
 class RaidBot(discord.Client):
     def __init__(self):
@@ -163,6 +163,29 @@ class RaidBot(discord.Client):
         if self.stale_raid_task is None or self.stale_raid_task.done():
             self.stale_raid_task = asyncio.create_task(self._stale_raid_worker())
 
+    async def restore_persistent_raid_views(self) -> None:
+        """Re-register persistent raid planner views after bot restart."""
+        restored = 0
+
+        async with session_scope() as session:
+            open_raids = (await session.execute(
+                select(Raid).where(Raid.status == "open")
+            )).scalars().all()
+
+            for raid in open_raids:
+                if not raid.message_id:
+                    continue
+
+                days, times = await get_options(session, raid.id)
+                if not days or not times:
+                    continue
+
+                self.add_view(RaidVoteView(raid.id, days, times))
+                restored += 1
+
+        if restored:
+            log.info("Restored %s persistent raid views", restored)
+
 
 
     async def cleanup_stale_raids_once(self) -> int:
@@ -203,6 +226,9 @@ class RaidBot(discord.Client):
             await asyncio.sleep(STALE_RAID_CHECK_SECONDS)
 
     async def on_message(self, message: discord.Message):
+        if not ENABLE_MESSAGE_CONTENT_INTENT:
+            return
+
         if message.author.bot:
             return
 
