@@ -86,8 +86,12 @@ async def _mirror_raidlist_debug_embed(client: discord.Client, guild: discord.Gu
     debug_hash = _hash_embed(debug_embed)
     cache_key = _debug_cache_key_for_raidlist(guild.id)
     cached = await _load_debug_cache_entry(cache_key)
-    if cached is not None and cached.payload_hash == debug_hash:
-        return
+    if cached is not None and cached.payload_hash == debug_hash and cached.message_id:
+        try:
+            await channel.fetch_message(int(cached.message_id))
+            return
+        except (discord.NotFound, discord.Forbidden):
+            pass
 
     if cached is not None and cached.message_id:
         try:

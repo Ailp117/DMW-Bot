@@ -16,6 +16,15 @@ from roles import ensure_temp_role, cleanup_temp_role
 from raidlist import schedule_raidlist_refresh
 
 
+
+
+def _memberlist_threshold(min_players: int) -> int:
+    return min_players if min_players > 0 else 1
+
+
+def _memberlist_target_label(min_players: int) -> str:
+    return str(min_players) if min_players > 0 else "1+"
+
 def planner_embed(raid: Raid, counts: dict[str, dict[str, int]]) -> discord.Embed:
     e = discord.Embed(title=f"🗓️ Raid Planer: {raid.dungeon}", description=f"Raid ID: `{raid.display_id}`")
     e.add_field(name="Min Spieler pro Slot", value=str(raid.min_players), inline=True)
@@ -36,8 +45,8 @@ def slot_text(raid: Raid, day_label: str, time_label: str, role: discord.Role | 
         f"🆔 Raid: `{raid.display_id}`\n"
         f"📅 Tag: **{day_label}**\n"
         f"🕒 Zeit: **{time_label}**\n"
-        f"👥 Teilnehmer: **{len(user_ids)} / {raid.min_players}**\n"
-        f"{role.mention if role else '⚠️ Rolle nicht verfügbar'}\n\n"
+        f"👥 Teilnehmer: **{len(user_ids)} / {_memberlist_target_label(raid.min_players)}**\n"
+        f"{role.mention if role else ''}\n\n"
         f"{short_list(mentions)}"
     )
 
@@ -77,14 +86,21 @@ async def _upsert_debug_cache_entry(
         row.payload_hash = payload_hash
 
 
-async def _mirror_memberlist_debug(interaction: discord.Interaction, raid, slot_lines: list[str]) -> None:
-    if interaction.guild is None or interaction.guild.id == LOG_GUILD_ID or not MEMBERLIST_DEBUG_CHANNEL_ID:
+async def _mirror_memberlist_debug_for_guild(
+    client: discord.Client,
+    guild: discord.Guild,
+    raid: Raid,
+    slot_lines: list[str],
+    *,
+    force_refresh: bool = False,
+) -> None:
+    if guild.id == LOG_GUILD_ID or not MEMBERLIST_DEBUG_CHANNEL_ID:
         return
 
-    channel = interaction.client.get_channel(MEMBERLIST_DEBUG_CHANNEL_ID)
+    channel = client.get_channel(MEMBERLIST_DEBUG_CHANNEL_ID)
     if channel is None:
         try:
-            channel = await interaction.client.fetch_channel(MEMBERLIST_DEBUG_CHANNEL_ID)
+            channel = await client.fetch_channel(MEMBERLIST_DEBUG_CHANNEL_ID)
         except (discord.NotFound, discord.Forbidden):
             return
 
@@ -97,18 +113,27 @@ async def _mirror_memberlist_debug(interaction: discord.Interaction, raid, slot_
         content = "Keine erfüllten Member-Slots für diesen Raid."
 
     header = (
-        f"🧪 Memberlist Debug | Guild `{interaction.guild.id}` ({interaction.guild.name})\n"
+        f"🧪 Memberlist Debug | Guild `{guild.id}` ({guild.name})\n"
         f"Raid `{raid.display_id}` (DB `{raid.id}`) | Dungeon **{raid.dungeon}**"
     )
     payload = f"{header}\n{content}"
     if len(payload) > 1900:
         payload = payload[:1897] + "..."
 
-    cache_key = _debug_cache_key_for_memberlist(interaction.guild.id, raid.id)
+    cache_key = _debug_cache_key_for_memberlist(guild.id, raid.id)
     payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     cached = await _load_debug_cache_entry(cache_key)
-    if cached is not None and cached.payload_hash == payload_hash:
-        return
+    if (
+        not force_refresh
+        and cached is not None
+        and cached.payload_hash == payload_hash
+        and cached.message_id
+    ):
+        try:
+            await channel.fetch_message(int(cached.message_id))
+            return
+        except (discord.NotFound, discord.Forbidden):
+            pass
 
     if cached is not None and cached.message_id:
         try:
@@ -116,7 +141,7 @@ async def _mirror_memberlist_debug(interaction: discord.Interaction, raid, slot_
             await msg.edit(content=payload)
             await _upsert_debug_cache_entry(
                 cache_key,
-                guild_id=interaction.guild.id,
+                guild_id=guild.id,
                 raid_id=raid.id,
                 message_id=msg.id,
                 payload_hash=payload_hash,
@@ -128,16 +153,116 @@ async def _mirror_memberlist_debug(interaction: discord.Interaction, raid, slot_
     msg = await channel.send(payload)
     await _upsert_debug_cache_entry(
         cache_key,
-        guild_id=interaction.guild.id,
+        guild_id=guild.id,
         raid_id=raid.id,
         message_id=msg.id,
         payload_hash=payload_hash,
     )
 
+
+async def _mirror_memberlist_debug(interaction: discord.Interaction, raid: Raid, slot_lines: list[str]) -> None:
+    if interaction.guild is None:
+        return
+    await _mirror_memberlist_debug_for_guild(interaction.client, interaction.guild, raid, slot_lines)
+
+
+async def sync_memberlists_for_raid(
+    client: discord.Client,
+    guild: discord.Guild,
+    raid_id: int,
+    *,
+    ensure_debug_mirror: bool = False,
+) -> None:
+    async with session_scope() as session:
+        raid = await get_raid(session, raid_id)
+        if not raid or raid.status != "open" or raid.guild_id != guild.id:
+            return
+
+        settings = await get_settings(session, raid.guild_id)
+        if not settings.participants_channel_id:
+            return
+
+        role = await ensure_temp_role(session, guild, raid) if raid.min_players > 0 else None
+        threshold = _memberlist_threshold(raid.min_players)
+
+        target_channel = client.get_channel(int(settings.participants_channel_id))
+        if target_channel is None:
+            try:
+                target_channel = await client.fetch_channel(int(settings.participants_channel_id))
+            except (discord.NotFound, discord.Forbidden):
+                return
+
+        if not isinstance(target_channel, (discord.TextChannel, discord.Thread)):
+            return
+
+        days, times = await get_options(session, raid_id)
+        day_users, time_users = await vote_user_sets(session, raid_id)
+        slot_rows = await posted_slot_map(session, raid_id)
+
+        debug_slot_lines: list[str] = []
+        active_slot_keys: set[tuple[str, str]] = set()
+
+        for d in days:
+            for t in times:
+                users = sorted(day_users.get(d, set()).intersection(time_users.get(t, set())))
+                if len(users) < threshold:
+                    continue
+
+                active_slot_keys.add((d, t))
+                txt = slot_text(raid, d, t, role, users)
+                debug_slot_lines.append(f"• {d} {t}: {', '.join(f'<@{u}>' for u in users)}")
+                row = slot_rows.get((d, t))
+
+                if row:
+                    try:
+                        msg = await target_channel.fetch_message(int(row.message_id))
+                        await msg.edit(content=txt, allowed_mentions=discord.AllowedMentions(users=True, roles=True))
+                        continue
+                    except (discord.NotFound, discord.Forbidden):
+                        pass
+
+                msg = await target_channel.send(txt, allowed_mentions=discord.AllowedMentions(users=True, roles=True))
+                await upsert_posted_slot(session, raid_id, d, t, target_channel.id, msg.id)
+                slot_rows[(d, t)] = RaidPostedSlot(
+                    raid_id=raid_id,
+                    day_label=d,
+                    time_label=t,
+                    channel_id=target_channel.id,
+                    message_id=msg.id,
+                )
+
+        for key, row in list(slot_rows.items()):
+            if key in active_slot_keys:
+                continue
+
+            cleanup_channel = client.get_channel(int(row.channel_id))
+            if cleanup_channel is None:
+                try:
+                    cleanup_channel = await client.fetch_channel(int(row.channel_id))
+                except (discord.NotFound, discord.Forbidden):
+                    cleanup_channel = None
+
+            if cleanup_channel is not None and hasattr(cleanup_channel, "fetch_message"):
+                try:
+                    old_msg = await cleanup_channel.fetch_message(int(row.message_id))
+                    await old_msg.delete()
+                except (discord.NotFound, discord.Forbidden):
+                    pass
+
+            await session.delete(row)
+
+        await _mirror_memberlist_debug_for_guild(
+            client,
+            guild,
+            raid,
+            debug_slot_lines,
+            force_refresh=ensure_debug_mirror,
+        )
+
 class RaidCreateModal(discord.ui.Modal, title="Raid erstellen"):
     days = discord.ui.TextInput(label="Tage (Komma/Zeilen)", required=True, max_length=400)
     times = discord.ui.TextInput(label="Uhrzeiten (Komma/Zeilen)", required=True, max_length=400)
-    min_players = discord.ui.TextInput(label="Min Spieler pro Slot (0=aus)", required=True, max_length=3)
+    min_players = discord.ui.TextInput(label="Min Spieler pro Slot (0=ab 1 Teilnehmer)", required=True, max_length=3)
 
     def __init__(self, dungeon_name: str):
         super().__init__()
@@ -314,55 +439,8 @@ class RaidVoteView(View):
 
             s = await get_settings(session, raid.guild_id)
 
-            # role
-            role = None
-            if raid.min_players > 0:
-                role = await ensure_temp_role(session, interaction.guild, raid)
-
-            # slots
-            if raid.min_players > 0 and s.participants_channel_id:
-                ch = interaction.client.get_channel(int(s.participants_channel_id))
-                if isinstance(ch, (discord.TextChannel, discord.Thread)):
-                    days, times = await get_options(session, self.raid_id)
-                    day_users, time_users = await vote_user_sets(session, self.raid_id)
-                    slot_rows = await posted_slot_map(session, self.raid_id)
-                    debug_slot_lines: list[str] = []
-                    for d in days:
-                        for t in times:
-                            users = sorted(day_users.get(d, set()).intersection(time_users.get(t, set())))
-                            if len(users) < raid.min_players:
-                                continue
-
-                            txt = slot_text(raid, d, t, role, users)
-                            debug_slot_lines.append(f"• {d} {t}: {', '.join(f'<@{u}>' for u in users)}")
-                            row = slot_rows.get((d, t))
-
-                            if not row:
-                                msg = await ch.send(txt, allowed_mentions=discord.AllowedMentions(users=True, roles=True))
-                                await upsert_posted_slot(session, self.raid_id, d, t, ch.id, msg.id)
-                                slot_rows[(d, t)] = RaidPostedSlot(
-                                    raid_id=self.raid_id,
-                                    day_label=d,
-                                    time_label=t,
-                                    channel_id=ch.id,
-                                    message_id=msg.id,
-                                )
-                            else:
-                                try:
-                                    msg = await ch.fetch_message(int(row.message_id))
-                                    await msg.edit(content=txt, allowed_mentions=discord.AllowedMentions(users=True, roles=True))
-                                except (discord.NotFound, discord.Forbidden):
-                                    msg = await ch.send(txt, allowed_mentions=discord.AllowedMentions(users=True, roles=True))
-                                    await upsert_posted_slot(session, self.raid_id, d, t, ch.id, msg.id)
-                                    slot_rows[(d, t)] = RaidPostedSlot(
-                                        raid_id=self.raid_id,
-                                        day_label=d,
-                                        time_label=t,
-                                        channel_id=ch.id,
-                                        message_id=msg.id,
-                                    )
-
-                    await _mirror_memberlist_debug(interaction, raid, debug_slot_lines)
+            if s.participants_channel_id:
+                await sync_memberlists_for_raid(interaction.client, interaction.guild, self.raid_id)
 
         await interaction.edit_original_response(embed=embed, view=self)
         await schedule_raidlist_refresh(interaction.client, interaction.guild.id)
