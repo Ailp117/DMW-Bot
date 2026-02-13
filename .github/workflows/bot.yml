@@ -206,11 +206,19 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'workflow_dispatch' }}
     steps:
+      - name: Validate actions variable token
+        if: ${{ secrets.ACTIONS_VARIABLES_TOKEN == '' }}
+        run: |
+          echo "ACTIONS_VARIABLES_TOKEN is required to update BOT_RUNTIME_WATCHDOG." >&2
+          echo "Create a fine-grained PAT with repository permission 'Variables: Read and write' and store it as ACTIONS_VARIABLES_TOKEN." >&2
+          exit 1
+
       - name: Set runtime watchdog variable
         uses: actions/github-script@v7
         env:
           START_RUNTIME: ${{ github.event.inputs.start_runtime || 'true' }}
         with:
+          github-token: ${{ secrets.ACTIONS_VARIABLES_TOKEN }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
@@ -223,6 +231,11 @@ jobs:
             } catch (error) {
               if (error.status === 404) {
                 await github.rest.actions.createRepoVariable({ owner, repo, name, value });
+              } else if (error.status === 403) {
+                core.setFailed(
+                  "Token cannot write repository variables. Ensure ACTIONS_VARIABLES_TOKEN has repository permission 'Variables: Read and write'.",
+                );
+                return;
               } else {
                 throw error;
               }
