@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict
+from datetime import date, datetime, time
+import hashlib
+import json
 
 from sqlalchemy import delete, select
 
@@ -37,6 +41,48 @@ class RepositoryPersistence:
     def __init__(self, config: BotConfig) -> None:
         self.session_manager = SessionManager(config)
         self._lock = asyncio.Lock()
+        self._last_flush_fingerprint: str | None = None
+
+    @staticmethod
+    def _normalize_fingerprint_value(value: object) -> object:
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, date):
+            return value.isoformat()
+        if isinstance(value, time):
+            return value.isoformat()
+        return value
+
+    def _snapshot_fingerprint(self, repo: InMemoryRepository) -> str:
+        def _rows_signature(rows: list[object]) -> list[dict[str, object]]:
+            normalized_rows: list[dict[str, object]] = []
+            for row in rows:
+                data = asdict(row)
+                normalized_rows.append(
+                    {
+                        key: self._normalize_fingerprint_value(value)
+                        for key, value in sorted(data.items(), key=lambda item: item[0])
+                    }
+                )
+            normalized_rows.sort(
+                key=lambda payload: json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            )
+            return normalized_rows
+
+        payload = {
+            "dungeons": _rows_signature(list(repo.dungeons.values())),
+            "settings": _rows_signature(list(repo.settings.values())),
+            "raids": _rows_signature(list(repo.raids.values())),
+            "raid_options": _rows_signature(list(repo.raid_options.values())),
+            "raid_votes": _rows_signature(list(repo.raid_votes.values())),
+            "raid_posted_slots": _rows_signature(list(repo.raid_posted_slots.values())),
+            "raid_templates": _rows_signature(list(repo.raid_templates.values())),
+            "raid_attendance": _rows_signature(list(repo.raid_attendance.values())),
+            "user_levels": _rows_signature(list(repo.user_levels.values())),
+            "debug_cache": _rows_signature(list(repo.debug_cache.values())),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     async def load(self, repo: InMemoryRepository) -> None:
         async with self._lock:
@@ -159,9 +205,14 @@ class RepositoryPersistence:
                 )
 
             repo.recalculate_counters()
+            self._last_flush_fingerprint = self._snapshot_fingerprint(repo)
 
     async def flush(self, repo: InMemoryRepository) -> None:
         async with self._lock:
+            fingerprint = self._snapshot_fingerprint(repo)
+            if fingerprint == self._last_flush_fingerprint:
+                return
+
             async with self.session_manager.session_scope() as session:
                 # Delete dependent rows first.
                 await session.execute(delete(RaidVote))
@@ -319,3 +370,4 @@ class RepositoryPersistence:
                         for row in repo.debug_cache.values()
                     ]
                 )
+            self._last_flush_fingerprint = fingerprint

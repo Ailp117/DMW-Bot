@@ -83,6 +83,7 @@ FEATURE_LEVELUP_COOLDOWN_SHIFT = 24
 FEATURE_INTERVAL_MASK = 0xFFFF
 BOT_MESSAGE_KIND = "bot_message"
 BOT_MESSAGE_CACHE_PREFIX = "botmsg"
+BOT_MESSAGE_INDEX_MAX_PER_CHANNEL = 400
 PRIVILEGED_ONLY_HELP_COMMANDS = frozenset(
     {
         "restart",
@@ -120,6 +121,17 @@ class GuildFeatureSettings:
 
 def _on_off(value: bool) -> str:
     return "an" if value else "aus"
+
+
+def _extract_slash_command_name(content: str | None) -> str | None:
+    raw = (content or "").strip()
+    if not raw.startswith("/"):
+        return None
+    command_part = raw[1:].strip()
+    if not command_part:
+        return None
+    first = command_part.split(maxsplit=1)[0].strip().lower()
+    return first or None
 
 
 def _is_response_error(exc: Exception) -> bool:
@@ -812,6 +824,7 @@ class RewriteDiscordBot(discord.Client):
         self._views_restored = False
         self._commands_synced = False
         self._runtime_restored = False
+        self._slash_command_names: set[str] = set()
 
         self._ack_lock = asyncio.Lock()
         self._state_lock = asyncio.Lock()
@@ -831,6 +844,7 @@ class RewriteDiscordBot(discord.Client):
             self._state_loaded = True
         if not self._commands_registered:
             self._register_commands()
+            self._slash_command_names = {cmd.name.lower() for cmd in self.tree.get_commands()}
             self._commands_registered = True
         if not self._views_restored:
             self._restore_persistent_vote_views()
@@ -962,10 +976,11 @@ class RewriteDiscordBot(discord.Client):
             if handled:
                 return
 
-        if message.guild is not None:
-            feature_settings = self._get_guild_feature_settings(message.guild.id)
+        guild_feature_settings = self._get_guild_feature_settings(message.guild.id) if message.guild is not None else None
+        if guild_feature_settings is not None:
             now = datetime.now(UTC)
-            if feature_settings.leveling_enabled:
+            is_command_message = self._is_registered_command_message(getattr(message, "content", None))
+            if guild_feature_settings.leveling_enabled and not is_command_message:
                 async with self._state_lock:
                     result = self.leveling_service.update_message_xp(
                         self.repo,
@@ -974,13 +989,13 @@ class RewriteDiscordBot(discord.Client):
                         username=_member_name(message.author),
                         now=now,
                         min_award_interval=timedelta(
-                            seconds=max(1, int(feature_settings.message_xp_interval_seconds))
+                            seconds=max(1, int(guild_feature_settings.message_xp_interval_seconds))
                         ),
                     )
                     if result.xp_awarded:
                         self._level_state_dirty = True
                 if (
-                    feature_settings.levelup_messages_enabled
+                    guild_feature_settings.levelup_messages_enabled
                     and result.xp_awarded
                     and result.current_level > result.previous_level
                 ):
@@ -990,7 +1005,7 @@ class RewriteDiscordBot(discord.Client):
                         level=result.current_level,
                         now=now,
                         min_announce_interval=timedelta(
-                            seconds=max(1, int(feature_settings.levelup_message_cooldown_seconds))
+                            seconds=max(1, int(guild_feature_settings.levelup_message_cooldown_seconds))
                         ),
                     )
                     if should_announce:
@@ -1004,8 +1019,6 @@ class RewriteDiscordBot(discord.Client):
                             )
                         except Exception:
                             log.exception("Failed to send level-up message")
-
-        guild_feature_settings = self._get_guild_feature_settings(message.guild.id) if message.guild is not None else None
         if (
             guild_feature_settings is not None
             and guild_feature_settings.nanomon_reply_enabled
@@ -1480,6 +1493,16 @@ class RewriteDiscordBot(discord.Client):
         except (TypeError, ValueError):
             return 0
 
+    def _is_registered_command_message(self, content: str | None) -> bool:
+        command_name = _extract_slash_command_name(content)
+        if command_name is None:
+            return False
+
+        if self._slash_command_names:
+            return command_name in self._slash_command_names
+
+        return any(command_name == cmd.name.lower() for cmd in self.tree.get_commands())
+
     @staticmethod
     def _bot_message_cache_key(guild_id: int, channel_id: int, bot_user_id: int, message_id: int) -> str:
         return (
@@ -1520,6 +1543,14 @@ class RewriteDiscordBot(discord.Client):
             message_id=message_id,
             payload_hash=payload_hash,
         )
+
+        # Keep only the newest bot-message index rows per channel to avoid unbounded DB churn.
+        indexed_rows = self.repo.list_debug_cache(kind=BOT_MESSAGE_KIND, guild_id=guild_id, raid_id=channel_id)
+        if len(indexed_rows) <= BOT_MESSAGE_INDEX_MAX_PER_CHANNEL:
+            return
+        oldest_first = sorted(indexed_rows, key=lambda row: int(row.message_id))
+        for stale_row in oldest_first[: max(0, len(oldest_first) - BOT_MESSAGE_INDEX_MAX_PER_CHANNEL)]:
+            self.repo.delete_debug_cache(stale_row.cache_key)
 
     async def _send_channel_message(self, channel: Any, **kwargs: Any) -> Any | None:
         posted = await _safe_send_channel_message(channel, **kwargs)

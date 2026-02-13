@@ -35,6 +35,22 @@ def test_track_bot_message_stores_message_with_bot_user_id(repo):
     assert row.payload_hash == sha256_text("403:555")
 
 
+def test_track_bot_message_prunes_old_index_rows_per_channel(repo, monkeypatch):
+    monkeypatch.setattr(runtime_mod, "BOT_MESSAGE_INDEX_MAX_PER_CHANNEL", 3)
+    bot = _make_bot(repo, bot_user_id=403)
+    guild = SimpleNamespace(id=1)
+    channel = SimpleNamespace(id=77, guild=guild)
+    author = SimpleNamespace(id=403)
+
+    for message_id in (101, 102, 103, 104, 105):
+        message = SimpleNamespace(id=message_id, guild=guild, channel=channel, author=author)
+        RewriteDiscordBot._track_bot_message(bot, message)
+
+    rows = repo.list_debug_cache(kind=BOT_MESSAGE_KIND, guild_id=1, raid_id=77)
+    kept_ids = sorted(int(row.message_id) for row in rows)
+    assert kept_ids == [103, 104, 105]
+
+
 @pytest.mark.asyncio
 async def test_delete_bot_messages_uses_index_and_clears_refs(repo, monkeypatch):
     bot = _make_bot(repo, bot_user_id=99)
