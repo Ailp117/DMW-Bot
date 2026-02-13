@@ -3,7 +3,7 @@ import re
 from sqlalchemy import select, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import GuildSettings, Raid, RaidOption, RaidVote, RaidPostedSlot, Dungeon
+from models import GuildSettings, Raid, RaidOption, RaidVote, RaidPostedSlot, Dungeon, UserLevel
 
 def normalize_list(text: str) -> list[str]:
     parts = re.split(r"[,;\n]+", (text or "").strip())
@@ -136,6 +136,18 @@ async def upsert_posted_slot(session: AsyncSession, raid_id: int, day_label: str
             channel_id=channel_id,
             message_id=message_id,
         ))
+
+
+async def purge_guild_data(session: AsyncSession, guild_id: int) -> dict[str, int]:
+    deleted_raids = await session.execute(delete(Raid).where(Raid.guild_id == guild_id))
+    deleted_user_levels = await session.execute(delete(UserLevel).where(UserLevel.guild_id == guild_id))
+    deleted_settings = await session.execute(delete(GuildSettings).where(GuildSettings.guild_id == guild_id))
+
+    return {
+        "raids": deleted_raids.rowcount or 0,
+        "user_levels": deleted_user_levels.rowcount or 0,
+        "guild_settings": deleted_settings.rowcount or 0,
+    }
 
 async def delete_raid_cascade(session: AsyncSession, raid_id: int) -> None:
     r = await session.get(Raid, raid_id)
