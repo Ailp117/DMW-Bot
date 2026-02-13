@@ -14,6 +14,7 @@ EXPECTED_SLASH_COMMANDS = {
     "help2",
     "restart",
     "raidplan",
+    "raid_finish",
     "raidlist",
     "dungeonlist",
     "cancel_all_raids",

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from dataclasses import asdict
-from datetime import datetime
+from datetime import UTC, datetime
 import importlib.machinery
 import importlib.util
 import logging
@@ -740,7 +740,7 @@ class RewriteDiscordBot(discord.Client):
         if getattr(after, "channel", None) is None:
             self.leveling_service.on_voice_disconnect(guild.id, member.id)
         elif getattr(before, "channel", None) is None:
-            self.leveling_service.on_voice_connect(guild.id, member.id, datetime.utcnow())
+            self.leveling_service.on_voice_connect(guild.id, member.id, datetime.now(UTC))
 
     async def _execute_console_command(self, message) -> bool:
         raw = (getattr(message, "content", "") or "").strip()
@@ -831,7 +831,7 @@ class RewriteDiscordBot(discord.Client):
         unexpected = sorted(name for name in reg_set if name not in EXPECTED_SLASH_COMMANDS)
         if unexpected:
             log.warning("Unexpected extra commands registered: %s", ", ".join(unexpected))
-        self.last_self_test_ok_at = datetime.utcnow()
+        self.last_self_test_ok_at = datetime.now(UTC)
         self.last_self_test_error = None
 
     async def _self_test_worker(self) -> None:
@@ -879,7 +879,7 @@ class RewriteDiscordBot(discord.Client):
         await self.wait_until_ready()
         while not self.is_closed():
             changed = False
-            now = datetime.utcnow()
+            now = datetime.now(UTC)
             async with self._state_lock:
                 for guild in self.guilds:
                     for voice_channel in guild.voice_channels:
@@ -904,8 +904,12 @@ class RewriteDiscordBot(discord.Client):
         stale_ids: list[int] = []
         for raid in self.repo.list_open_raids():
             created_at = raid.created_at
-            now = datetime.now(created_at.tzinfo) if created_at.tzinfo is not None else datetime.utcnow()
-            age_seconds = (now - raid.created_at).total_seconds()
+            if created_at.tzinfo is None:
+                created_utc = created_at.replace(tzinfo=UTC)
+            else:
+                created_utc = created_at.astimezone(UTC)
+            now = datetime.now(UTC)
+            age_seconds = (now - created_utc).total_seconds()
             if age_seconds >= cutoff_hours * 3600:
                 stale_ids.append(raid.id)
 
