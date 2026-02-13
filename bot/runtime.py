@@ -16,7 +16,7 @@ from typing import Any
 
 from bot.config import load_config
 from bot.logging import setup_logging
-from db.repository import InMemoryRepository, RaidPostedSlotRecord, RaidRecord
+from db.repository import InMemoryRepository, RaidPostedSlotRecord, RaidRecord, UserLevelRecord
 from db.schema_guard import ensure_required_schema, validate_required_tables
 from services.admin_service import cancel_all_open_raids, list_active_dungeons
 from services.backup_service import export_rows_to_sql
@@ -84,6 +84,8 @@ FEATURE_INTERVAL_MASK = 0xFFFF
 BOT_MESSAGE_KIND = "bot_message"
 BOT_MESSAGE_CACHE_PREFIX = "botmsg"
 BOT_MESSAGE_INDEX_MAX_PER_CHANNEL = 400
+USERNAME_SYNC_WORKER_SLEEP_SECONDS = 10 * 60
+USERNAME_SYNC_RESCAN_SECONDS = 12 * 60 * 60
 PRIVILEGED_ONLY_HELP_COMMANDS = frozenset(
     {
         "restart",
@@ -832,6 +834,7 @@ class RewriteDiscordBot(discord.Client):
         self._guild_feature_settings: dict[int, GuildFeatureSettings] = {}
         self._acked_interactions: set[int] = set()
         self._raidlist_hash_by_guild: dict[int, str] = {}
+        self._username_sync_next_run_by_guild: dict[int, float] = {}
         self._level_state_dirty = False
         self._last_level_persist_monotonic = time.monotonic()
         self._discord_log_handler = self._build_discord_log_handler()
@@ -941,6 +944,7 @@ class RewriteDiscordBot(discord.Client):
         self.task_registry.start_once("stale_raid_worker", self._stale_raid_worker)
         self.task_registry.start_once("voice_xp_worker", self._voice_xp_worker)
         self.task_registry.start_once("level_persist_worker", self._level_persist_worker)
+        self.task_registry.start_once("username_sync_worker", self._username_sync_worker)
         self.task_registry.start_once("self_test_worker", self._self_test_worker)
         self.task_registry.start_once("backup_worker", self._backup_worker)
         self.task_registry.start_once("log_forwarder_worker", self._log_forwarder_worker)
@@ -948,8 +952,14 @@ class RewriteDiscordBot(discord.Client):
     async def on_guild_join(self, guild) -> None:
         async with self._state_lock:
             self.repo.ensure_settings(guild.id, guild.name)
+            self._username_sync_next_run_by_guild[int(guild.id)] = 0.0
             await self._force_raidlist_refresh(guild.id)
             await self._persist()
+
+        try:
+            await self._sync_guild_usernames(guild, force=True)
+        except Exception:
+            log.exception("Initial username sync failed for joined guild %s", getattr(guild, "id", None))
 
         try:
             await self.tree.sync(guild=discord.Object(id=guild.id))
@@ -959,8 +969,47 @@ class RewriteDiscordBot(discord.Client):
     async def on_guild_remove(self, guild) -> None:
         async with self._state_lock:
             self._guild_feature_settings.pop(int(guild.id), None)
+            self._username_sync_next_run_by_guild.pop(int(guild.id), None)
             self.repo.purge_guild_data(guild.id)
             await self._persist()
+
+    async def on_member_join(self, member) -> None:
+        if getattr(member, "bot", False):
+            return
+        guild_id = int(getattr(getattr(member, "guild", None), "id", 0) or 0)
+        user_id = int(getattr(member, "id", 0) or 0)
+        username = _member_name(member)
+        if guild_id <= 0 or user_id <= 0 or not username:
+            return
+
+        changed = False
+        async with self._state_lock:
+            changed = self._upsert_member_username(guild_id=guild_id, user_id=user_id, username=username)
+            if changed:
+                self._level_state_dirty = True
+        if changed:
+            log.info("Username sync join guild_id=%s user_id=%s", guild_id, user_id)
+
+    async def on_member_update(self, before, after) -> None:
+        if getattr(after, "bot", False):
+            return
+        before_name = _member_name(before)
+        after_name = _member_name(after)
+        if not after_name or before_name == after_name:
+            return
+
+        guild_id = int(getattr(getattr(after, "guild", None), "id", 0) or 0)
+        user_id = int(getattr(after, "id", 0) or 0)
+        if guild_id <= 0 or user_id <= 0:
+            return
+
+        changed = False
+        async with self._state_lock:
+            changed = self._upsert_member_username(guild_id=guild_id, user_id=user_id, username=after_name)
+            if changed:
+                self._level_state_dirty = True
+        if changed:
+            log.info("Username sync update guild_id=%s user_id=%s", guild_id, user_id)
 
     async def on_message(self, message) -> None:
         if message.author.bot:
@@ -1235,6 +1284,26 @@ class RewriteDiscordBot(discord.Client):
             async with self._state_lock:
                 await self._flush_level_state_if_due()
 
+    async def _username_sync_worker(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            total_scanned = 0
+            total_changed = 0
+            for guild in list(self.guilds):
+                scanned, changed = await self._sync_guild_usernames(guild)
+                total_scanned += scanned
+                total_changed += changed
+                await asyncio.sleep(0)
+
+            if total_changed > 0:
+                log.info(
+                    "Username sync updated rows=%s scanned_members=%s guilds=%s",
+                    total_changed,
+                    total_scanned,
+                    len(self.guilds),
+                )
+            await asyncio.sleep(USERNAME_SYNC_WORKER_SLEEP_SECONDS)
+
     async def _cleanup_stale_raids_once(self) -> int:
         cutoff_hours = STALE_RAID_HOURS
 
@@ -1503,6 +1572,85 @@ class RewriteDiscordBot(discord.Client):
 
         return any(command_name == cmd.name.lower() for cmd in self.tree.get_commands())
 
+    def _upsert_member_username(self, *, guild_id: int, user_id: int, username: str) -> bool:
+        normalized = (username or "").strip()
+        if not normalized:
+            return False
+
+        key = (int(guild_id), int(user_id))
+        row = self.repo.user_levels.get(key)
+        if row is None:
+            self.repo.user_levels[key] = UserLevelRecord(
+                guild_id=int(guild_id),
+                user_id=int(user_id),
+                xp=0,
+                level=0,
+                username=normalized,
+            )
+            return True
+
+        if (row.username or "") == normalized:
+            return False
+        row.username = normalized
+        return True
+
+    async def _collect_guild_member_usernames(self, guild: Any) -> dict[int, str]:
+        users: dict[int, str] = {}
+        for member in list(getattr(guild, "members", []) or []):
+            if getattr(member, "bot", False):
+                continue
+            username = _member_name(member)
+            user_id = int(getattr(member, "id", 0) or 0)
+            if user_id <= 0 or not username:
+                continue
+            users[user_id] = username
+
+        expected_count = int(getattr(guild, "member_count", 0) or 0)
+        if expected_count > 0 and len(users) >= expected_count:
+            return users
+
+        fetch_members = getattr(guild, "fetch_members", None)
+        if not callable(fetch_members):
+            return users
+
+        try:
+            async for member in fetch_members(limit=None):
+                if getattr(member, "bot", False):
+                    continue
+                username = _member_name(member)
+                user_id = int(getattr(member, "id", 0) or 0)
+                if user_id <= 0 or not username:
+                    continue
+                users[user_id] = username
+        except Exception:
+            log.debug("Guild member fetch failed for guild_id=%s", getattr(guild, "id", None), exc_info=True)
+
+        return users
+
+    async def _sync_guild_usernames(self, guild: Any, *, force: bool = False) -> tuple[int, int]:
+        guild_id = int(getattr(guild, "id", 0) or 0)
+        if guild_id <= 0:
+            return (0, 0)
+
+        now_mono = time.monotonic()
+        next_due = self._username_sync_next_run_by_guild.get(guild_id, 0.0)
+        if not force and now_mono < next_due:
+            return (0, 0)
+
+        usernames = await self._collect_guild_member_usernames(guild)
+        self._username_sync_next_run_by_guild[guild_id] = now_mono + USERNAME_SYNC_RESCAN_SECONDS
+        if not usernames:
+            return (0, 0)
+
+        changed = 0
+        async with self._state_lock:
+            for user_id, username in usernames.items():
+                if self._upsert_member_username(guild_id=guild_id, user_id=user_id, username=username):
+                    changed += 1
+            if changed > 0:
+                self._level_state_dirty = True
+        return (len(usernames), changed)
+
     @staticmethod
     def _bot_message_cache_key(guild_id: int, channel_id: int, bot_user_id: int, message_id: int) -> str:
         return (
@@ -1680,32 +1828,32 @@ class RewriteDiscordBot(discord.Client):
         complete_voters = day_voters.intersection(time_voters)
 
         day_lines = [
-            f"- {label}: {count}"
+            f"• **{label}** — `{count}`"
             for label, count in sorted(counts["day"].items(), key=lambda item: (-item[1], item[0].lower()))
         ]
         time_lines = [
-            f"- {label}: {count}"
+            f"• **{label}** — `{count}`"
             for label, count in sorted(counts["time"].items(), key=lambda item: (-item[1], item[0].lower()))
         ]
         embed = discord.Embed(
-            title=f"Raid Planer: {raid.dungeon}",
-            description=f"Raid ID `{raid.display_id}`",
+            title=f"🗓️ Raid Planer: {raid.dungeon}",
+            description=f"Raid ID: `{raid.display_id}`",
             color=discord.Color.blurple(),
         )
         embed.add_field(name="Min Spieler pro Slot", value=str(raid.min_players), inline=True)
-        embed.add_field(name="Tage Votes", value="\n".join(day_lines) if day_lines else "-", inline=False)
-        embed.add_field(name="Uhrzeiten Votes", value="\n".join(time_lines) if time_lines else "-", inline=False)
+        embed.add_field(name="📅 Tage Votes", value="\n".join(day_lines) if day_lines else "—", inline=False)
+        embed.add_field(name="🕒 Uhrzeiten Votes", value="\n".join(time_lines) if time_lines else "—", inline=False)
         embed.add_field(
-            name="Bereits abgestimmt (Tag + Zeit)",
+            name="✅ Vollständig abgestimmt (Tag + Zeit)",
             value=self._plain_user_list_for_embed(raid.guild_id, complete_voters),
             inline=False,
         )
-        embed.set_footer(text="Namensliste ohne @-Mention. Schwellwert triggert Teilnehmerlisten.")
+        embed.set_footer(text="Wähle Tag und Uhrzeit. Namensliste ohne @-Mention.")
         return embed
 
     def _plain_user_list_for_embed(self, guild_id: int, user_ids: set[int], *, limit: int = 30) -> str:
         if not user_ids:
-            return "-"
+            return "—"
 
         guild = self.get_guild(guild_id)
         labels: list[str] = []
@@ -1715,10 +1863,14 @@ class RewriteDiscordBot(discord.Client):
                 member = guild.get_member(int(user_id))
                 if member is not None:
                     label = _member_name(member)
+            if not label:
+                row = self.repo.user_levels.get((int(guild_id), int(user_id)))
+                if row is not None:
+                    label = (row.username or "").strip() or None
             labels.append(label or f"User {user_id}")
 
         unique_labels = sorted(set(labels), key=lambda value: value.casefold())
-        lines = [f"- {label}" for label in unique_labels]
+        lines = [f"• {label}" for label in unique_labels]
         text = "\n".join(lines[:limit])
         if len(lines) > limit:
             text += f"\n... +{len(lines) - limit} weitere"

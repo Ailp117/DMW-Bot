@@ -152,10 +152,11 @@ def planner_counts(repo: InMemoryRepository, raid_id: int) -> dict[str, dict[str
 def slot_text(raid: RaidRecord, day: str, time_label: str, users: list[int]) -> str:
     mentions = [f"<@{user_id}>" for user_id in users]
     return (
-        f"Participants for {raid.dungeon}\n"
-        f"Raid {raid.display_id}\n"
-        f"Day {day} Time {time_label}\n"
-        f"Count {len(users)} / {memberlist_target_label(raid.min_players)}\n"
+        f"✅ **Teilnehmerliste — {raid.dungeon}**\n"
+        f"🆔 Raid: `{raid.display_id}`\n"
+        f"📅 Tag: **{day}**\n"
+        f"🕒 Zeit: **{time_label}**\n"
+        f"👥 Teilnehmer: **{len(users)} / {memberlist_target_label(raid.min_players)}**\n"
         f"{short_list(mentions)}"
     )
 
