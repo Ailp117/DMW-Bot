@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import discord
 import raidlist
 import views_raid
 
@@ -35,7 +36,7 @@ class _FakeChannel:
 
     async def fetch_message(self, message_id):
         if message_id not in self.messages:
-            raise Exception("not found")
+            raise discord.NotFound(response=SimpleNamespace(status=404, reason="not found"), message="not found")
         return self.messages[message_id]
 
 
@@ -105,6 +106,33 @@ class DebugChannelTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(channel.sent), 1)
 
+
+    async def test_raidlist_debug_recreates_message_if_cached_message_was_deleted(self):
+        channel = _FakeChannel()
+        client = _FakeClient(channel)
+        guild = SimpleNamespace(id=777777, name="Guild")
+        cache_store = {}
+
+        @asynccontextmanager
+        async def _fake_session_scope():
+            yield _FakeSession(cache_store)
+
+        class _Field:
+            def __init__(self):
+                self.name = "n"
+                self.value = "v"
+                self.inline = False
+
+        embed = SimpleNamespace(fields=[_Field()])
+
+        with patch.object(raidlist, "session_scope", _fake_session_scope):
+            await raidlist._mirror_raidlist_debug_embed(client, guild, embed)
+            first_message_id = channel.sent[0]["id"]
+            channel.messages.pop(first_message_id, None)
+            await raidlist._mirror_raidlist_debug_embed(client, guild, embed)
+
+        self.assertEqual(len(channel.sent), 2)
+
     async def test_memberlist_debug_avoids_reposting_when_payload_unchanged(self):
         channel = _FakeChannel()
         client = _FakeClient(channel)
@@ -122,6 +150,47 @@ class DebugChannelTests(unittest.IsolatedAsyncioTestCase):
             await views_raid._mirror_memberlist_debug(interaction, raid, ["line"])
 
         self.assertEqual(len(channel.sent), 1)
+
+    async def test_memberlist_debug_recreates_message_if_cached_message_was_deleted(self):
+        channel = _FakeChannel()
+        client = _FakeClient(channel)
+        guild = SimpleNamespace(id=666666, name="Guild")
+        interaction = SimpleNamespace(guild=guild, client=client)
+        raid = SimpleNamespace(id=1, display_id=1, dungeon="Test")
+        cache_store = {}
+
+        @asynccontextmanager
+        async def _fake_session_scope():
+            yield _FakeSession(cache_store)
+
+        with patch.object(views_raid, "session_scope", _fake_session_scope):
+            await views_raid._mirror_memberlist_debug(interaction, raid, ["line"])
+            first_message_id = channel.sent[0]["id"]
+            channel.messages.pop(first_message_id, None)
+            await views_raid._mirror_memberlist_debug(interaction, raid, ["line"])
+
+        self.assertEqual(len(channel.sent), 2)
+
+    async def test_memberlist_debug_force_refresh_updates_existing_message_even_if_payload_same(self):
+        channel = _FakeChannel()
+        client = _FakeClient(channel)
+        guild = SimpleNamespace(id=555555, name="Guild")
+        raid = SimpleNamespace(id=1, display_id=1, dungeon="Test")
+        cache_store = {}
+
+        @asynccontextmanager
+        async def _fake_session_scope():
+            yield _FakeSession(cache_store)
+
+        with patch.object(views_raid, "session_scope", _fake_session_scope):
+            await views_raid._mirror_memberlist_debug_for_guild(client, guild, raid, ["line"])
+            await views_raid._mirror_memberlist_debug_for_guild(
+                client, guild, raid, ["line"], force_refresh=True
+            )
+
+        self.assertEqual(len(channel.sent), 1)
+        message_id = channel.sent[0]["id"]
+        self.assertEqual(len(channel.messages[message_id].edits), 1)
 
 
 if __name__ == "__main__":

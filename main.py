@@ -17,6 +17,7 @@ from config import (
     LOG_GUILD_ID,
     LOG_CHANNEL_ID,
     SELF_TEST_INTERVAL_SECONDS,
+    DISCORD_LOG_LEVEL,
 )
 from ensure_schema import ensure_schema
 from db import try_acquire_singleton_lock, session_scope
@@ -30,7 +31,7 @@ from commands_raid import register_raid_commands
 from commands_purge import register_purge_commands
 from models import Raid, UserLevel, GuildSettings
 from roles import cleanup_temp_role
-from views_raid import RaidVoteView, cleanup_posted_slot_messages
+from views_raid import RaidVoteView, cleanup_posted_slot_messages, sync_memberlists_for_raid
 from leveling import calculate_level_from_xp
 from permissions import admin_or_privileged_check
 
@@ -126,6 +127,7 @@ class RaidBot(discord.Client):
         self._startup_guild_cleanup_done = False
         self._ready_sync_done = False
         self._initial_raidlist_refresh_done = False
+        self._initial_memberlist_restore_done = False
         self._discord_log_handler = self._build_discord_log_handler()
         log.addHandler(self._discord_log_handler)
 
@@ -247,7 +249,8 @@ class RaidBot(discord.Client):
                 except Exception:
                     self.handleError(record)
 
-        handler = _DiscordQueueHandler(level=logging.INFO)
+        discord_level = getattr(logging, DISCORD_LOG_LEVEL, logging.DEBUG)
+        handler = _DiscordQueueHandler(level=discord_level)
         handler.setFormatter(
             logging.Formatter(
                 "[%(asctime)s] %(levelname)s [%(name)s|%(module)s.%(funcName)s] %(message)s",
@@ -655,6 +658,27 @@ class RaidBot(discord.Client):
 
         await asyncio.gather(*(_refresh_one(guild.id) for guild in self.guilds))
 
+    async def _restore_memberlists_for_all_guilds(self) -> None:
+        async def _restore_one(guild: discord.Guild, raid_id: int) -> None:
+            try:
+                await sync_memberlists_for_raid(self, guild, raid_id, ensure_debug_mirror=True)
+            except Exception:
+                log.exception("Memberlist restore failed for guild %s raid %s", guild.id, raid_id)
+
+        tasks: list[asyncio.Task] = []
+        for guild in self.guilds:
+            async with session_scope() as session:
+                raid_ids = (
+                    await session.execute(
+                        select(Raid.id).where(Raid.guild_id == guild.id, Raid.status == "open")
+                    )
+                ).scalars().all()
+
+            tasks.extend(asyncio.create_task(_restore_one(guild, int(raid_id))) for raid_id in raid_ids)
+
+        if tasks:
+            await asyncio.gather(*tasks)
+
     async def on_ready(self):
         if not self._startup_guild_cleanup_done:
             await self._cleanup_removed_guild_data_on_startup()
@@ -679,6 +703,10 @@ class RaidBot(discord.Client):
         if not self._initial_raidlist_refresh_done:
             await self._refresh_raidlists_for_all_guilds()
             self._initial_raidlist_refresh_done = True
+
+        if not self._initial_memberlist_restore_done:
+            await self._restore_memberlists_for_all_guilds()
+            self._initial_memberlist_restore_done = True
 
     async def close(self):
         log.removeHandler(self._discord_log_handler)
