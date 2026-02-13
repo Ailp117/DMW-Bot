@@ -22,7 +22,7 @@ from db import try_acquire_singleton_lock, session_scope
 from raidlist_updater import RaidlistUpdater
 from raidlist import refresh_raidlist_for_guild, force_raidlist_refresh, schedule_raidlist_refresh
 from views_settings import SettingsView, settings_embed
-from helpers import get_settings, delete_raid_cascade, get_options
+from helpers import get_settings, delete_raid_cascade, get_options, purge_guild_data
 
 from commands_admin import register_admin_commands
 from commands_raid import register_raid_commands
@@ -119,6 +119,7 @@ class RaidBot(discord.Client):
         self.log_forwarder_task: asyncio.Task | None = None
         self.log_forward_queue: asyncio.Queue[str] = asyncio.Queue()
         self.pending_log_buffer: deque[str] = deque(maxlen=250)
+        self._startup_guild_cleanup_done = False
         self._discord_log_handler = self._build_discord_log_handler()
         log.addHandler(self._discord_log_handler)
 
@@ -126,6 +127,43 @@ class RaidBot(discord.Client):
         async with session_scope() as session:
             guild_ids = (await session.execute(select(GuildSettings.guild_id))).scalars().all()
         return sorted({int(gid) for gid in guild_ids if gid})
+
+    async def _get_known_guild_ids_from_db(self) -> list[int]:
+        async with session_scope() as session:
+            settings_ids = (await session.execute(select(GuildSettings.guild_id))).scalars().all()
+            raid_ids = (await session.execute(select(Raid.guild_id))).scalars().all()
+            level_ids = (await session.execute(select(UserLevel.guild_id))).scalars().all()
+
+        return sorted({int(gid) for gid in [*settings_ids, *raid_ids, *level_ids] if gid})
+
+    async def _cleanup_removed_guild_data_on_startup(self) -> None:
+        db_guild_ids = set(await self._get_known_guild_ids_from_db())
+        connected_guild_ids = {guild.id for guild in self.guilds}
+        removed_guild_ids = sorted(db_guild_ids - connected_guild_ids)
+
+        if not removed_guild_ids:
+            return
+
+        cleaned = 0
+        for guild_id in removed_guild_ids:
+            try:
+                async with session_scope() as session:
+                    deleted = await purge_guild_data(session, guild_id)
+                self.voice_xp_last_award = {
+                    key: value for key, value in self.voice_xp_last_award.items() if key[0] != guild_id
+                }
+                cleaned += 1
+                log.info(
+                    "Startup cleanup removed stale guild %s data (raids=%s, user_levels=%s, guild_settings=%s)",
+                    guild_id,
+                    deleted["raids"],
+                    deleted["user_levels"],
+                    deleted["guild_settings"],
+                )
+            except Exception:
+                log.exception("Startup cleanup failed for removed guild %s", guild_id)
+
+        log.info("Startup guild cleanup processed %s removed guild(s).", cleaned)
 
     async def _sync_commands_for_known_guilds(self) -> None:
         guild_ids = await self._get_configured_guild_ids()
@@ -137,15 +175,37 @@ class RaidBot(discord.Client):
             log.warning("No known guild IDs in database yet -> global sync (can take up to ~1h).")
             return
 
-        synced_count = 0
+        synced_ids: list[int] = []
+        failed_ids: list[int] = []
         for guild_id in target_ids:
             try:
                 await self.tree.sync(guild=discord.Object(id=guild_id))
-                synced_count += 1
+                synced_ids.append(guild_id)
+            except discord.Forbidden:
+                failed_ids.append(guild_id)
+                log.warning(
+                    "Skipping command sync for guild %s due to missing access (bot not in guild or insufficient permissions).",
+                    guild_id,
+                )
             except Exception:
+                failed_ids.append(guild_id)
                 log.exception("Failed to sync commands to guild %s", guild_id)
 
-        log.info("Synced commands to %s guild(s): %s", synced_count, ", ".join(str(gid) for gid in target_ids))
+        if synced_ids:
+            log.info(
+                "Synced commands to %s guild(s): %s",
+                len(synced_ids),
+                ", ".join(str(gid) for gid in synced_ids),
+            )
+        else:
+            log.warning("No guild command syncs succeeded.")
+
+        if failed_ids:
+            log.warning(
+                "Command sync failed for %s guild(s): %s",
+                len(failed_ids),
+                ", ".join(str(gid) for gid in failed_ids),
+            )
 
     async def _restart_process(self) -> None:
         log.warning("Restart requested. Restarting bot process now.")
@@ -506,7 +566,31 @@ class RaidBot(discord.Client):
         if contains_approved_keyword(message.content):
             await message.reply(APPROVED_GIF_URL, mention_author=False)
 
+
+    async def on_guild_remove(self, guild: discord.Guild):
+        try:
+            async with session_scope() as session:
+                deleted = await purge_guild_data(session, guild.id)
+
+            self.voice_xp_last_award = {
+                key: value for key, value in self.voice_xp_last_award.items() if key[0] != guild.id
+            }
+
+            log.info(
+                "Removed database data for guild %s after bot removal (raids=%s, user_levels=%s, guild_settings=%s)",
+                guild.id,
+                deleted["raids"],
+                deleted["user_levels"],
+                deleted["guild_settings"],
+            )
+        except Exception:
+            log.exception("Failed to remove database data for removed guild %s", guild.id)
+
     async def on_ready(self):
+        if not self._startup_guild_cleanup_done:
+            await self._cleanup_removed_guild_data_on_startup()
+            self._startup_guild_cleanup_done = True
+
         if self.log_channel is None:
             self.log_channel = await self._resolve_log_channel()
 
