@@ -1,6 +1,8 @@
 import discord
 from discord import app_commands
 
+from permissions import admin_or_privileged_check
+
 
 def _iter_purgeable_channels(guild: discord.Guild, me: discord.Member) -> list[discord.TextChannel]:
     return [c for c in guild.text_channels if c.permissions_for(me).read_message_history]
@@ -9,7 +11,7 @@ def _iter_purgeable_channels(guild: discord.Guild, me: discord.Member) -> list[d
 def register_purge_commands(tree: app_commands.CommandTree):
 
     @tree.command(name="purge", description="Löscht die letzten N Nachrichten (Admin).")
-    @app_commands.checks.has_permissions(manage_messages=True)
+    @admin_or_privileged_check()
     async def purge(interaction: discord.Interaction, amount: int = 10):
         if not interaction.channel or not isinstance(interaction.channel, discord.TextChannel):
             return await interaction.response.send_message("Nur im Textchannel nutzbar.", ephemeral=True)
@@ -27,7 +29,7 @@ def register_purge_commands(tree: app_commands.CommandTree):
         app_commands.Choice(name="channel", value="channel"),
         app_commands.Choice(name="server", value="server"),
     ])
-    @app_commands.checks.has_permissions(manage_messages=True)
+    @admin_or_privileged_check()
     async def purgebot(
         interaction: discord.Interaction,
         scope: app_commands.Choice[str],
