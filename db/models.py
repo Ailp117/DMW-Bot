@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.sql import func
@@ -17,7 +19,7 @@ class Dungeon(Base):
     short_code: Mapped[str] = mapped_column(Text, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), nullable=False, server_default=func.now())
 
 
 class GuildSettings(Base):
@@ -27,8 +29,8 @@ class GuildSettings(Base):
     participants_channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     raidlist_channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     raidlist_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     planner_channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     guild_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     default_min_players: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -45,7 +47,7 @@ class Raid(Base):
     creator_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     dungeon: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False, default="open")
-    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), nullable=False, server_default=func.now())
     message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     min_players: Mapped[int] = mapped_column(Integer, nullable=False, default=4)
     participants_posted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -61,7 +63,7 @@ class RaidOption(Base):
     raid_id: Mapped[int] = mapped_column(Integer, ForeignKey("raids.id", ondelete="CASCADE"), nullable=False)
     kind: Mapped[str] = mapped_column(Text, nullable=False)
     label: Mapped[str] = mapped_column(Text, nullable=False)
-    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class RaidVote(Base):
@@ -72,7 +74,7 @@ class RaidVote(Base):
     kind: Mapped[str] = mapped_column(Text, nullable=False)
     option_label: Mapped[str] = mapped_column(Text, nullable=False)
     user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class RaidPostedSlot(Base):
@@ -84,8 +86,8 @@ class RaidPostedSlot(Base):
     time_label: Mapped[str] = mapped_column(Text, nullable=False)
     channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    posted_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    posted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
 
 class RaidTemplate(Base):
@@ -96,8 +98,8 @@ class RaidTemplate(Base):
     dungeon_id: Mapped[int] = mapped_column(Integer, ForeignKey("dungeons.id", ondelete="CASCADE"), nullable=False)
     template_name: Mapped[str] = mapped_column(String(80), nullable=False)
     template_data: Mapped[str] = mapped_column(Text, nullable=False)
-    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
 
 class RaidAttendance(Base):
@@ -110,8 +112,8 @@ class RaidAttendance(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
     marked_by_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
 
 class UserLevel(Base):
@@ -119,9 +121,9 @@ class UserLevel(Base):
 
     guild_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    xp: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    level: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    xp: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    level: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     username: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
@@ -134,7 +136,7 @@ class DebugMirrorCache(Base):
     raid_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
 
 def mapped_public_table_names() -> tuple[str, ...]:

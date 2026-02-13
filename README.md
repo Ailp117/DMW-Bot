@@ -30,11 +30,13 @@ Ein Discord-Bot zur Planung, Verwaltung und Nachverfolgung von Raids inkl. persi
 pip install -r requirements.txt
 ```
 
-3. Optional: zweitneueste stabile Versionen neu auflösen (für lokale Updates):
+3. Optional: neueste stabile Versionen neu auflösen (für lokale Updates):
 
 ```bash
 python scripts/resolve_second_latest_requirements.py --input requirements.in --output requirements.txt
 ```
+
+Für zweitneueste stabile Versionen kannst du optional `--offset 1` setzen.
 
 4. Umgebungsvariablen setzen (siehe unten).
 5. Bot starten:
@@ -63,7 +65,7 @@ LEVELUP_MESSAGE_COOLDOWN_SECONDS=20
 
 LOG_GUILD_ID=0
 LOG_CHANNEL_ID=0
-DISCORD_LOG_LEVEL=DEBUG
+DISCORD_LOG_LEVEL=INFO
 
 SELF_TEST_INTERVAL_SECONDS=900
 BACKUP_INTERVAL_SECONDS=21600

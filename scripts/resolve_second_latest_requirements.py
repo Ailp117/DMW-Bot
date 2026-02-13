@@ -3,11 +3,20 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
-from pip._vendor.packaging.requirements import Requirement
-from pip._vendor.packaging.version import InvalidVersion, Version
+if TYPE_CHECKING:
+    from packaging.requirements import Requirement  # pyright: ignore[reportMissingImports]
+    from packaging.version import InvalidVersion, Version  # pyright: ignore[reportMissingImports]
+else:
+    try:
+        from packaging.requirements import Requirement
+        from packaging.version import InvalidVersion, Version
+    except Exception:  # pragma: no cover - fallback for minimal environments
+        from pip._vendor.packaging.requirements import Requirement
+        from pip._vendor.packaging.version import InvalidVersion, Version
 
 
 PYPI_JSON_URL = "https://pypi.org/pypi/{package}/json"
@@ -67,22 +76,32 @@ def _format_requirement(requirement: Requirement, version: Version) -> str:
     return out
 
 
-def resolve_second_latest(requirement: Requirement) -> str:
+def resolve_stable_with_offset(requirement: Requirement, offset: int = 0) -> str:
+    if offset < 0:
+        raise ValueError("Offset must be >= 0")
+
     payload = _fetch_package_json(requirement.name)
     releases = payload.get("releases", {})
     stable_versions = _stable_versions_from_releases(releases, requirement)
     if not stable_versions:
         raise RuntimeError(f"No stable versions found for requirement: {requirement}")
-    selected = stable_versions[1] if len(stable_versions) > 1 else stable_versions[0]
+    selected_index = offset if len(stable_versions) > offset else len(stable_versions) - 1
+    selected = stable_versions[selected_index]
     return _format_requirement(requirement, selected)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Resolve requirements to the second latest stable version on PyPI.",
+        description="Resolve requirements to the latest stable version on PyPI (with optional offset).",
     )
     parser.add_argument("--input", default="requirements.in", help="Path to source requirements file")
     parser.add_argument("--output", default="requirements.txt", help="Path to resolved pinned output")
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Stable version offset (0=latest, 1=second latest, ...).",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -90,9 +109,11 @@ def main() -> int:
 
     if not input_path.exists():
         raise FileNotFoundError(f"Input requirements file not found: {input_path}")
+    if args.offset < 0:
+        raise ValueError("--offset must be >= 0")
 
     requirements = _read_requirements(input_path)
-    resolved_lines = [resolve_second_latest(req) for req in requirements]
+    resolved_lines = [resolve_stable_with_offset(req, offset=args.offset) for req in requirements]
 
     output_path.write_text("\n".join(resolved_lines) + "\n", encoding="utf-8")
     print(f"Wrote {len(resolved_lines)} resolved requirements to {output_path}")

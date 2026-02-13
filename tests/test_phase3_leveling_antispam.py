@@ -39,7 +39,7 @@ def test_message_xp_cooldown_blocks_spam_awards(repo):
     assert third.xp_awarded is True
 
     row = repo.get_or_create_user_level(1, 500, "User500")
-    assert row.xp == 20
+    assert row.xp == 10
 
 
 def test_levelup_announcement_deduplicates_fast_repeats():

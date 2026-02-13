@@ -4,23 +4,24 @@ import asyncio
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable, Coroutine
 
 
 UpdateFn = Callable[[int], Awaitable[None]]
+TaskFactory = Callable[[], Coroutine[Any, Any, None]]
 
 
 @dataclass(slots=True)
 class TaskHandle:
     name: str
-    task: asyncio.Task
+    task: asyncio.Task[None]
 
 
 class SingletonTaskRegistry:
     def __init__(self) -> None:
-        self._tasks: dict[str, asyncio.Task] = {}
+        self._tasks: dict[str, asyncio.Task[None]] = {}
 
-    def start_once(self, name: str, factory: Callable[[], Awaitable[None]]) -> asyncio.Task:
+    def start_once(self, name: str, factory: TaskFactory) -> asyncio.Task[None]:
         task = self._tasks.get(name)
         if task and not task.done():
             return task
@@ -28,7 +29,7 @@ class SingletonTaskRegistry:
         self._tasks[name] = task
         return task
 
-    def get(self, name: str) -> asyncio.Task | None:
+    def get(self, name: str) -> asyncio.Task[None] | None:
         return self._tasks.get(name)
 
     async def cancel_all(self) -> None:
@@ -46,7 +47,7 @@ class DebouncedGuildUpdater:
         self.cooldown = float(cooldown_seconds)
         self._dirty = defaultdict(lambda: False)
         self._generation = defaultdict(lambda: 0)
-        self._tasks: dict[int, asyncio.Task] = {}
+        self._tasks: dict[int, asyncio.Task[None]] = {}
         self._locks = defaultdict(asyncio.Lock)
         self._last_run = defaultdict(lambda: 0.0)
 

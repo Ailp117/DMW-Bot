@@ -28,8 +28,8 @@ async def test_restore_runtime_messages_uses_recreate_mode():
     async def _fake_refresh_raidlists(*, force: bool):
         calls.append(("raidlists", force))
 
-    async def _fake_persist():
-        calls.append(("persist", None))
+    async def _fake_persist(*, dirty_tables=None):
+        calls.append(("persist", dirty_tables))
         return True
 
     bot._refresh_planner_message = _fake_refresh_planner
@@ -86,6 +86,12 @@ async def test_sync_memberlists_recreate_replaces_old_message(repo, monkeypatch)
     async def _fake_ensure_temp_role(_raid):
         return None
 
+    async def _fake_ensure_slot_temp_role(_raid, *, day_label: str, time_label: str):
+        return None
+
+    async def _fake_sync_slot_role_members(_raid, *, role, user_ids):
+        return None
+
     async def _fake_mirror_debug_payload(**_kwargs):
         return None
 
@@ -106,6 +112,8 @@ async def test_sync_memberlists_recreate_replaces_old_message(repo, monkeypatch)
 
     bot._get_text_channel = _fake_get_text_channel
     bot._ensure_temp_role = _fake_ensure_temp_role
+    bot._ensure_slot_temp_role = _fake_ensure_slot_temp_role
+    bot._sync_slot_role_members = _fake_sync_slot_role_members
     bot._mirror_debug_payload = _fake_mirror_debug_payload
     monkeypatch.setattr(runtime_mod, "_safe_fetch_message", _fake_fetch_message)
     monkeypatch.setattr(runtime_mod, "_safe_edit_message", _fake_edit_message)

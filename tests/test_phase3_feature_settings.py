@@ -30,6 +30,7 @@ def test_feature_settings_defaults_come_from_config(repo):
     assert loaded.levelup_messages_enabled is True
     assert loaded.nanomon_reply_enabled is True
     assert loaded.approved_reply_enabled is True
+    assert loaded.raid_reminder_enabled is False
     assert loaded.message_xp_interval_seconds == 15
     assert loaded.levelup_message_cooldown_seconds == 20
 
@@ -45,6 +46,7 @@ def test_feature_settings_roundtrip_uses_debug_cache(repo):
             levelup_messages_enabled=True,
             nanomon_reply_enabled=False,
             approved_reply_enabled=True,
+            raid_reminder_enabled=True,
             message_xp_interval_seconds=35,
             levelup_message_cooldown_seconds=90,
         ),
@@ -72,6 +74,7 @@ def test_feature_settings_intervals_are_clamped(repo):
             levelup_messages_enabled=True,
             nanomon_reply_enabled=True,
             approved_reply_enabled=True,
+            raid_reminder_enabled=True,
             message_xp_interval_seconds=999_999,
             levelup_message_cooldown_seconds=999_999,
         ),

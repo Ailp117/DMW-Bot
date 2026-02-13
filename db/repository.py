@@ -122,6 +122,10 @@ class InMemoryRepository:
         self.raid_attendance: Dict[int, RaidAttendanceRecord] = {}
         self.user_levels: Dict[Tuple[int, int], UserLevelRecord] = {}
         self.debug_cache: Dict[str, DebugMirrorCacheRecord] = {}
+        self._vote_id_by_key: Dict[Tuple[int, str, str, int], int] = {}
+        self._debug_cache_keys_by_kind: Dict[str, set[str]] = {}
+        self._debug_cache_keys_by_kind_guild: Dict[Tuple[str, int], set[str]] = {}
+        self._debug_cache_keys_by_kind_guild_raid: Dict[Tuple[str, int, int | None], set[str]] = {}
 
         self._raid_id = 1
         self._option_id = 1
@@ -142,6 +146,10 @@ class InMemoryRepository:
         self.raid_attendance.clear()
         self.user_levels.clear()
         self.debug_cache.clear()
+        self._vote_id_by_key.clear()
+        self._debug_cache_keys_by_kind.clear()
+        self._debug_cache_keys_by_kind_guild.clear()
+        self._debug_cache_keys_by_kind_guild_raid.clear()
 
         self._raid_id = 1
         self._option_id = 1
@@ -165,6 +173,65 @@ class InMemoryRepository:
                 self._display_id_by_guild.get(raid.guild_id, 0),
                 int(raid.display_id),
             )
+        self._rebuild_vote_index()
+        self._rebuild_debug_cache_indices()
+
+    @staticmethod
+    def _vote_key(*, raid_id: int, kind: str, option_label: str, user_id: int) -> Tuple[int, str, str, int]:
+        return (int(raid_id), str(kind), str(option_label), int(user_id))
+
+    def _rebuild_vote_index(self) -> None:
+        self._vote_id_by_key.clear()
+        for vote_id, row in self.raid_votes.items():
+            self._vote_id_by_key[self._vote_key(
+                raid_id=row.raid_id,
+                kind=row.kind,
+                option_label=row.option_label,
+                user_id=row.user_id,
+            )] = vote_id
+
+    @staticmethod
+    def _normalized_raid_id(raid_id: int | None) -> int | None:
+        if raid_id is None:
+            return None
+        return int(raid_id)
+
+    def _debug_cache_index_add(self, row: DebugMirrorCacheRecord) -> None:
+        kind_key = row.kind
+        guild_id = int(row.guild_id)
+        raid_id = self._normalized_raid_id(row.raid_id)
+        self._debug_cache_keys_by_kind.setdefault(kind_key, set()).add(row.cache_key)
+        self._debug_cache_keys_by_kind_guild.setdefault((kind_key, guild_id), set()).add(row.cache_key)
+        self._debug_cache_keys_by_kind_guild_raid.setdefault((kind_key, guild_id, raid_id), set()).add(row.cache_key)
+
+    def _debug_cache_index_remove(self, row: DebugMirrorCacheRecord) -> None:
+        kind_key = row.kind
+        guild_id = int(row.guild_id)
+        raid_id = self._normalized_raid_id(row.raid_id)
+        keys_kind = self._debug_cache_keys_by_kind.get(kind_key)
+        if keys_kind is not None:
+            keys_kind.discard(row.cache_key)
+            if not keys_kind:
+                self._debug_cache_keys_by_kind.pop(kind_key, None)
+
+        keys_kind_guild = self._debug_cache_keys_by_kind_guild.get((kind_key, guild_id))
+        if keys_kind_guild is not None:
+            keys_kind_guild.discard(row.cache_key)
+            if not keys_kind_guild:
+                self._debug_cache_keys_by_kind_guild.pop((kind_key, guild_id), None)
+
+        keys_kind_guild_raid = self._debug_cache_keys_by_kind_guild_raid.get((kind_key, guild_id, raid_id))
+        if keys_kind_guild_raid is not None:
+            keys_kind_guild_raid.discard(row.cache_key)
+            if not keys_kind_guild_raid:
+                self._debug_cache_keys_by_kind_guild_raid.pop((kind_key, guild_id, raid_id), None)
+
+    def _rebuild_debug_cache_indices(self) -> None:
+        self._debug_cache_keys_by_kind.clear()
+        self._debug_cache_keys_by_kind_guild.clear()
+        self._debug_cache_keys_by_kind_guild_raid.clear()
+        for row in self.debug_cache.values():
+            self._debug_cache_index_add(row)
 
     def add_dungeon(self, *, name: str, short_code: str, is_active: bool = True, sort_order: int = 0) -> DungeonRecord:
         dungeon_id = len(self.dungeons) + 1
@@ -267,13 +334,11 @@ class InMemoryRepository:
         return days, times
 
     def toggle_vote(self, *, raid_id: int, kind: str, option_label: str, user_id: int) -> None:
-        existing_id = None
-        for vote_id, row in self.raid_votes.items():
-            if row.raid_id == raid_id and row.kind == kind and row.option_label == option_label and row.user_id == user_id:
-                existing_id = vote_id
-                break
+        vote_key = self._vote_key(raid_id=raid_id, kind=kind, option_label=option_label, user_id=user_id)
+        existing_id = self._vote_id_by_key.get(vote_key)
         if existing_id is not None:
-            del self.raid_votes[existing_id]
+            self.raid_votes.pop(existing_id, None)
+            self._vote_id_by_key.pop(vote_key, None)
             return
         self.raid_votes[self._vote_id] = RaidVoteRecord(
             id=self._vote_id,
@@ -282,6 +347,7 @@ class InMemoryRepository:
             option_label=option_label,
             user_id=user_id,
         )
+        self._vote_id_by_key[vote_key] = self._vote_id
         self._vote_id += 1
 
     def vote_counts(self, raid_id: int) -> dict[str, dict[str, int]]:
@@ -422,16 +488,38 @@ class InMemoryRepository:
                 return True
         return False
 
+    def _delete_raids_cascade(self, raid_ids: set[int]) -> None:
+        if not raid_ids:
+            return
+
+        for raid_id in raid_ids:
+            self.raids.pop(raid_id, None)
+
+        if self.raid_options:
+            self.raid_options = {k: v for k, v in self.raid_options.items() if v.raid_id not in raid_ids}
+
+        if self.raid_votes:
+            for vote_id, row in list(self.raid_votes.items()):
+                if row.raid_id not in raid_ids:
+                    continue
+                self.raid_votes.pop(vote_id, None)
+                vote_key = self._vote_key(
+                    raid_id=row.raid_id,
+                    kind=row.kind,
+                    option_label=row.option_label,
+                    user_id=row.user_id,
+                )
+                self._vote_id_by_key.pop(vote_key, None)
+
+        if self.raid_posted_slots:
+            self.raid_posted_slots = {k: v for k, v in self.raid_posted_slots.items() if v.raid_id not in raid_ids}
+
     def delete_raid_cascade(self, raid_id: int) -> None:
-        self.raids.pop(raid_id, None)
-        self.raid_options = {k: v for k, v in self.raid_options.items() if v.raid_id != raid_id}
-        self.raid_votes = {k: v for k, v in self.raid_votes.items() if v.raid_id != raid_id}
-        self.raid_posted_slots = {k: v for k, v in self.raid_posted_slots.items() if v.raid_id != raid_id}
+        self._delete_raids_cascade({int(raid_id)})
 
     def cancel_open_raids_for_guild(self, guild_id: int) -> int:
         raid_ids = [raid.id for raid in self.list_open_raids(guild_id)]
-        for raid_id in raid_ids:
-            self.delete_raid_cascade(raid_id)
+        self._delete_raids_cascade(set(raid_ids))
         return len(raid_ids)
 
     def list_open_raid_ids_by_guild(self, guild_id: int) -> List[int]:
@@ -442,9 +530,8 @@ class InMemoryRepository:
         levels_before = len([row for row in self.user_levels.values() if row.guild_id == guild_id])
         settings_before = 1 if guild_id in self.settings else 0
 
-        raid_ids = [row.id for row in self.raids.values() if row.guild_id == guild_id]
-        for raid_id in raid_ids:
-            self.delete_raid_cascade(raid_id)
+        raid_ids = {row.id for row in self.raids.values() if row.guild_id == guild_id}
+        self._delete_raids_cascade(raid_ids)
 
         self.user_levels = {key: row for key, row in self.user_levels.items() if row.guild_id != guild_id}
         self.settings.pop(guild_id, None)
@@ -500,7 +587,14 @@ class InMemoryRepository:
                 payload_hash=payload_hash,
             )
             self.debug_cache[cache_key] = row
+            self._debug_cache_index_add(row)
             return row
+        if row.kind != kind or int(row.guild_id) != int(guild_id) or self._normalized_raid_id(row.raid_id) != self._normalized_raid_id(raid_id):
+            self._debug_cache_index_remove(row)
+            row.kind = kind
+            row.guild_id = int(guild_id)
+            row.raid_id = self._normalized_raid_id(raid_id)
+            self._debug_cache_index_add(row)
         row.message_id = message_id
         row.payload_hash = payload_hash
         return row
@@ -515,6 +609,19 @@ class InMemoryRepository:
         guild_id: int | None = None,
         raid_id: int | None = None,
     ) -> List[DebugMirrorCacheRecord]:
+        if kind is not None and guild_id is not None:
+            normalized_guild = int(guild_id)
+            if raid_id is not None:
+                normalized_raid = int(raid_id)
+                keys = self._debug_cache_keys_by_kind_guild_raid.get((kind, normalized_guild, normalized_raid), set())
+                return [self.debug_cache[key] for key in keys if key in self.debug_cache]
+            keys = self._debug_cache_keys_by_kind_guild.get((kind, normalized_guild), set())
+            return [self.debug_cache[key] for key in keys if key in self.debug_cache]
+
+        if kind is not None and guild_id is None and raid_id is None:
+            keys = self._debug_cache_keys_by_kind.get(kind, set())
+            return [self.debug_cache[key] for key in keys if key in self.debug_cache]
+
         rows = list(self.debug_cache.values())
         if kind is not None:
             rows = [row for row in rows if row.kind == kind]
@@ -525,7 +632,9 @@ class InMemoryRepository:
         return rows
 
     def delete_debug_cache(self, cache_key: str) -> None:
-        self.debug_cache.pop(cache_key, None)
+        row = self.debug_cache.pop(cache_key, None)
+        if row is not None:
+            self._debug_cache_index_remove(row)
 
     def get_or_create_user_level(self, guild_id: int, user_id: int, username: str | None) -> UserLevelRecord:
         key = (guild_id, user_id)

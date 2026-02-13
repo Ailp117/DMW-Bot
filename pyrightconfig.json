@@ -1,0 +1,20 @@
+{
+  "include": [
+    "bot",
+    "db",
+    "discord",
+    "features",
+    "services",
+    "utils",
+    "scripts/resolve_second_latest_requirements.py"
+  ],
+  "exclude": [
+    "legacy_archive",
+    "tests",
+    ".venv",
+    "backups"
+  ],
+  "venvPath": ".",
+  "venv": ".venv",
+  "typeCheckingMode": "basic"
+}
