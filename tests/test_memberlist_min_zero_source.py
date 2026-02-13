@@ -11,7 +11,7 @@ class MemberlistMinZeroSourceTests(unittest.TestCase):
         self.assertIn('def _memberlist_threshold(min_players: int) -> int:', self.src)
         self.assertIn('return min_players if min_players > 0 else 1', self.src)
         self.assertIn('threshold = _memberlist_threshold(raid.min_players)', self.src)
-        self.assertIn('if len(users) < threshold:', self.src)
+        self.assertIn('compute_qualified_slot_users(days, times, day_users, time_users, threshold)', self.src)
 
     def test_refresh_calls_sync_even_with_zero_min_players(self):
         self.assertIn('if s.participants_channel_id:', self.src)

@@ -3,7 +3,13 @@ from discord import app_commands
 from sqlalchemy import select
 
 from db import session_scope
-from helpers import get_active_dungeons
+from helpers import (
+    AUTO_DUNGEON_TEMPLATE_NAME,
+    get_active_dungeons,
+    get_settings,
+    get_template_by_name,
+    load_template_data,
+)
 from models import Dungeon
 from views_raid import RaidCreateModal
 from raidlist import force_raidlist_refresh
@@ -17,7 +23,7 @@ def register_raid_commands(tree: app_commands.CommandTree):
         if not interaction.guild:
             return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
 
-        # ✅ validate dungeon + settings BEFORE sending modal (modal must be first ack if shown)
+        # validate dungeon + settings before modal response
         async with session_scope() as session:
             d = (await session.execute(
                 select(Dungeon).where(Dungeon.name == dungeon, Dungeon.is_active.is_(True))
@@ -26,17 +32,30 @@ def register_raid_commands(tree: app_commands.CommandTree):
             if not d:
                 return await interaction.response.send_message("❌ Dungeon nicht gefunden / nicht aktiv.", ephemeral=True)
 
-            # settings check
-            from helpers import get_settings
             s = await get_settings(session, interaction.guild.id, interaction.guild.name)
             if not s.planner_channel_id or not s.participants_channel_id:
                 return await interaction.response.send_message(
                     "❌ Bitte zuerst `/settings` konfigurieren (Planner + Participants Channel).",
-                    ephemeral=True
+                    ephemeral=True,
                 )
 
-        # ✅ modal MUST be the first response for this interaction
-        await interaction.response.send_modal(RaidCreateModal(dungeon_name=dungeon))
+            template_defaults: tuple[list[str], list[str], int] | None = None
+            if s.templates_enabled:
+                auto_tpl = await get_template_by_name(session, interaction.guild.id, d.id, AUTO_DUNGEON_TEMPLATE_NAME)
+                if auto_tpl is not None:
+                    template_defaults = load_template_data(auto_tpl.template_data)
+
+            if template_defaults is None:
+                template_defaults = ([], [], max(0, int(s.default_min_players or 0)))
+
+        await interaction.response.send_modal(
+            RaidCreateModal(
+                dungeon_name=dungeon,
+                default_days=template_defaults[0],
+                default_times=template_defaults[1],
+                default_min_players=template_defaults[2],
+            )
+        )
 
     @raidplan.autocomplete("dungeon")
     async def dungeon_ac(interaction: discord.Interaction, current: str):

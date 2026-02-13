@@ -9,17 +9,15 @@ class MainStaleAndHelpSourceTests(unittest.TestCase):
 
     def test_status_command_registered(self):
         self.assertIn('@self.tree.command(name="status"', self.src)
-        self.assertIn('"📊 DMW Bot Status"', self.src)
-        self.assertIn('Stale Cleanup', self.src)
+        self.assertIn("Server-Status", self.src)
+        self.assertIn("Standard Mindestspieler", self.src)
 
     def test_help_command_registered(self):
         self.assertIn('@self.tree.command(name="help"', self.src)
         self.assertIn('`/raidplan`', self.src)
         self.assertIn('`/purgebot`', self.src)
         self.assertIn('`/help2`', self.src)
-        self.assertNotIn('`/remote_guilds`', self.src)
-        self.assertNotIn('`/remote_cancel_all_raids`', self.src)
-        self.assertNotIn('`/remote_raidlist`', self.src)
+        self.assertIn("if getattr(interaction.user, \"id\", None)", self.src)
 
     def test_help2_command_registered(self):
         self.assertIn('@self.tree.command(name="help2"', self.src)

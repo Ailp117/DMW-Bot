@@ -6,11 +6,12 @@ from sqlalchemy import select
 
 from config import LOG_GUILD_ID, MEMBERLIST_DEBUG_CHANNEL_ID
 from db import session_scope
-from models import DebugMirrorCache, Raid, RaidPostedSlot
+from models import DebugMirrorCache, Dungeon, Raid, RaidPostedSlot
 from helpers import (
     normalize_list, get_settings, create_raid, get_raid, get_options,
     toggle_vote, vote_counts, vote_user_sets, posted_slot_map, upsert_posted_slot,
-    delete_raid_cascade, short_list
+    delete_raid_cascade, short_list, compute_qualified_slot_users, create_attendance_snapshot,
+    upsert_auto_dungeon_template
 )
 from roles import ensure_temp_role, cleanup_temp_role
 from raidlist import schedule_raidlist_refresh
@@ -199,37 +200,33 @@ async def sync_memberlists_for_raid(
         day_users, time_users = await vote_user_sets(session, raid_id)
         slot_rows = await posted_slot_map(session, raid_id)
 
+        qualified_slots, _ = compute_qualified_slot_users(days, times, day_users, time_users, threshold)
         debug_slot_lines: list[str] = []
         active_slot_keys: set[tuple[str, str]] = set()
 
-        for d in days:
-            for t in times:
-                users = sorted(day_users.get(d, set()).intersection(time_users.get(t, set())))
-                if len(users) < threshold:
+        for (d, t), users in qualified_slots.items():
+            active_slot_keys.add((d, t))
+            txt = slot_text(raid, d, t, role, users)
+            debug_slot_lines.append(f"• {d} {t}: {', '.join(f'<@{u}>' for u in users)}")
+            row = slot_rows.get((d, t))
+
+            if row:
+                try:
+                    msg = await target_channel.fetch_message(int(row.message_id))
+                    await msg.edit(content=txt, allowed_mentions=discord.AllowedMentions(users=True, roles=True))
                     continue
+                except (discord.NotFound, discord.Forbidden):
+                    pass
 
-                active_slot_keys.add((d, t))
-                txt = slot_text(raid, d, t, role, users)
-                debug_slot_lines.append(f"• {d} {t}: {', '.join(f'<@{u}>' for u in users)}")
-                row = slot_rows.get((d, t))
-
-                if row:
-                    try:
-                        msg = await target_channel.fetch_message(int(row.message_id))
-                        await msg.edit(content=txt, allowed_mentions=discord.AllowedMentions(users=True, roles=True))
-                        continue
-                    except (discord.NotFound, discord.Forbidden):
-                        pass
-
-                msg = await target_channel.send(txt, allowed_mentions=discord.AllowedMentions(users=True, roles=True))
-                await upsert_posted_slot(session, raid_id, d, t, target_channel.id, msg.id)
-                slot_rows[(d, t)] = RaidPostedSlot(
-                    raid_id=raid_id,
-                    day_label=d,
-                    time_label=t,
-                    channel_id=target_channel.id,
-                    message_id=msg.id,
-                )
+            msg = await target_channel.send(txt, allowed_mentions=discord.AllowedMentions(users=True, roles=True))
+            await upsert_posted_slot(session, raid_id, d, t, target_channel.id, msg.id)
+            slot_rows[(d, t)] = RaidPostedSlot(
+                raid_id=raid_id,
+                day_label=d,
+                time_label=t,
+                channel_id=target_channel.id,
+                message_id=msg.id,
+            )
 
         for key, row in list(slot_rows.items()):
             if key in active_slot_keys:
@@ -264,9 +261,14 @@ class RaidCreateModal(discord.ui.Modal, title="Raid erstellen"):
     times = discord.ui.TextInput(label="Uhrzeiten (Komma/Zeilen)", required=True, max_length=400)
     min_players = discord.ui.TextInput(label="Min Spieler pro Slot (0=ab 1 Teilnehmer)", required=True, max_length=3)
 
-    def __init__(self, dungeon_name: str):
+    def __init__(self, dungeon_name: str, default_days: list[str] | None = None, default_times: list[str] | None = None, default_min_players: int = 0):
         super().__init__()
         self.dungeon_name = dungeon_name
+        if default_days:
+            self.days.default = ", ".join(default_days)[:400]
+        if default_times:
+            self.times.default = ", ".join(default_times)[:400]
+        self.min_players.default = str(max(0, int(default_min_players)))
 
     async def on_submit(self, interaction: discord.Interaction):
         if not interaction.guild:
@@ -307,6 +309,21 @@ class RaidCreateModal(discord.ui.Modal, title="Raid erstellen"):
                 times=times,
                 min_players=mp,
             )
+
+            # Keep one per-guild per-dungeon auto template in sync with latest raid-planning inputs.
+            if s.templates_enabled:
+                dungeon_row = (await session.execute(
+                    select(Dungeon).where(Dungeon.name == self.dungeon_name)
+                )).scalar_one_or_none()
+                if dungeon_row is not None:
+                    await upsert_auto_dungeon_template(
+                        session,
+                        guild_id=interaction.guild.id,
+                        dungeon_id=dungeon_row.id,
+                        days=days,
+                        times=times,
+                        min_players=mp,
+                    )
 
             counts = {"day": {}, "time": {}}
             embed = planner_embed(raid, counts)
@@ -382,6 +399,20 @@ class FinishButton(Button):
             if interaction.user.id != raid.creator_id:
                 return await interaction.followup.send("Nur der Ersteller kann beenden.", ephemeral=True)
 
+            # Persist attendance snapshot before deleting the open-raid state.
+            # This keeps check-in data restart-persistent without changing existing raid cleanup behavior.
+            days, times = await get_options(session, raid.id)
+            day_users, time_users = await vote_user_sets(session, raid.id)
+            threshold = _memberlist_threshold(raid.min_players)
+            _, attendance_user_ids = compute_qualified_slot_users(days, times, day_users, time_users, threshold)
+            attendance_rows = await create_attendance_snapshot(
+                session,
+                guild_id=raid.guild_id,
+                raid_display_id=raid.display_id,
+                dungeon=raid.dungeon,
+                user_ids=attendance_user_ids,
+            )
+
             # cleanup participant list messages + role + delete raid (cascade)
             await cleanup_posted_slot_messages(session, interaction, raid.id)
             await cleanup_temp_role(session, interaction.guild, raid)
@@ -392,7 +423,7 @@ class FinishButton(Button):
             for item in self.view.children:
                 item.disabled = True
 
-        await interaction.edit_original_response(embed=discord.Embed(title="✅ Raid beendet"), view=self.view)
+        await interaction.edit_original_response(embed=discord.Embed(title=f"✅ Raid beendet • Attendance-Snapshot: {attendance_rows}"), view=self.view)
         await schedule_raidlist_refresh(interaction.client, interaction.guild.id)
 
 
