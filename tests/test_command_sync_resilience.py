@@ -54,6 +54,10 @@ class CommandSyncResilienceTests(unittest.IsolatedAsyncioTestCase):
                 "remote_guilds",
                 "remote_cancel_all_raids",
                 "remote_raidlist",
+                "template_config",
+                "attendance_list",
+                "attendance_mark",
+                "backup_db",
             },
         )
 
@@ -129,6 +133,8 @@ class CommandSyncResilienceTests(unittest.IsolatedAsyncioTestCase):
             "settings", "status", "help", "help2", "restart",
             "raidplan", "raidlist", "dungeonlist", "cancel_all_raids", "purge", "purgebot",
             "remote_guilds", "remote_cancel_all_raids", "remote_raidlist",
+            "template_config",
+            "attendance_list", "attendance_mark", "backup_db",
         ]]
 
         class _Result:

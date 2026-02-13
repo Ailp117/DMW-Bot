@@ -18,6 +18,12 @@ def _ensure_guild_settings_name_column(sync_conn) -> None:
     columns = {col["name"] for col in inspector.get_columns("guild_settings")}
     if "guild_name" not in columns:
         sync_conn.execute(text("ALTER TABLE guild_settings ADD COLUMN guild_name TEXT"))
+    if "default_min_players" not in columns:
+        sync_conn.execute(text("ALTER TABLE guild_settings ADD COLUMN default_min_players INTEGER NOT NULL DEFAULT 0"))
+    if "templates_enabled" not in columns:
+        sync_conn.execute(text("ALTER TABLE guild_settings ADD COLUMN templates_enabled BOOLEAN NOT NULL DEFAULT TRUE"))
+    if "template_manager_role_id" not in columns:
+        sync_conn.execute(text("ALTER TABLE guild_settings ADD COLUMN template_manager_role_id BIGINT"))
 
 def _ensure_raids_display_id_column(sync_conn) -> None:
     inspector = inspect(sync_conn)
@@ -43,9 +49,25 @@ def _ensure_raids_display_id_column(sync_conn) -> None:
     """))
 
 
+def _ensure_raid_templates_constraints(sync_conn) -> None:
+    sync_conn.execute(text("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_raid_templates_guild_dungeon_name
+        ON raid_templates (guild_id, dungeon_id, template_name)
+    """))
+
+
+def _ensure_raid_attendance_constraints(sync_conn) -> None:
+    sync_conn.execute(text("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ix_raid_attendance_unique_user
+        ON raid_attendance (guild_id, raid_display_id, user_id)
+    """))
+
+
 async def ensure_schema():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_ensure_user_levels_username_column)
         await conn.run_sync(_ensure_guild_settings_name_column)
         await conn.run_sync(_ensure_raids_display_id_column)
+        await conn.run_sync(_ensure_raid_templates_constraints)
+        await conn.run_sync(_ensure_raid_attendance_constraints)

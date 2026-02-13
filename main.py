@@ -18,6 +18,7 @@ from config import (
     LOG_CHANNEL_ID,
     SELF_TEST_INTERVAL_SECONDS,
     DISCORD_LOG_LEVEL,
+    BACKUP_INTERVAL_SECONDS,
 )
 from ensure_schema import ensure_schema
 from db import try_acquire_singleton_lock, session_scope
@@ -30,7 +31,11 @@ from commands_admin import register_admin_commands
 from commands_raid import register_raid_commands
 from commands_purge import register_purge_commands
 from commands_remote import register_remote_commands
-from models import Raid, UserLevel, GuildSettings
+from commands_templates import register_template_commands
+from commands_attendance import register_attendance_commands
+from commands_backup import register_backup_commands
+from backup_sql import export_database_to_sql
+from models import Raid, UserLevel, GuildSettings, Dungeon
 from roles import cleanup_temp_role
 from views_raid import RaidVoteView, cleanup_posted_slot_messages, sync_memberlists_for_raid
 from leveling import calculate_level_from_xp
@@ -107,6 +112,12 @@ def _perm_status(channel: discord.TextChannel | None, me: discord.Member | None)
         f"manage={ '✅' if p.manage_messages else '❌' }"
     )
 
+
+
+
+def _is_server_admin(interaction: discord.Interaction) -> bool:
+    perms = getattr(interaction.user, "guild_permissions", None)
+    return bool(perms and getattr(perms, "administrator", False))
 INTENTS = discord.Intents.default()
 INTENTS.message_content = ENABLE_MESSAGE_CONTENT_INTENT
 
@@ -118,6 +129,7 @@ class RaidBot(discord.Client):
         self.stale_raid_task: asyncio.Task | None = None
         self.voice_xp_task: asyncio.Task | None = None
         self.self_test_task: asyncio.Task | None = None
+        self.backup_task: asyncio.Task | None = None
         self.voice_xp_last_award: dict[tuple[int, int], datetime] = {}
         self.last_self_test_ok_at: datetime | None = None
         self.last_self_test_error: str | None = None
@@ -322,6 +334,9 @@ class RaidBot(discord.Client):
         register_raid_commands(self.tree)
         register_purge_commands(self.tree)
         register_remote_commands(self.tree)
+        register_template_commands(self.tree)
+        register_attendance_commands(self.tree)
+        register_backup_commands(self.tree)
 
         await self.restore_persistent_raid_views()
 
@@ -340,68 +355,68 @@ class RaidBot(discord.Client):
 
 
 
-        @self.tree.command(name="status", description="Zeigt Bot-Status, Settings und Berechtigungen")
+        @self.tree.command(name="status", description="Zeigt Kern-Konfiguration für Server-Admins")
+        @app_commands.default_permissions(administrator=True)
         async def status_cmd(interaction: discord.Interaction):
             if not interaction.guild:
                 return await interaction.response.send_message("Nur im Server.", ephemeral=True)
+            if not _is_server_admin(interaction):
+                return await interaction.response.send_message("❌ Nur für Server-Admins.", ephemeral=True)
 
             async with session_scope() as session:
                 settings = await get_settings(session, interaction.guild.id, interaction.guild.name)
+                active_dungeons = (await session.execute(
+                    select(Dungeon.name).where(Dungeon.is_active.is_(True)).order_by(Dungeon.sort_order.asc(), Dungeon.name.asc())
+                )).scalars().all()
 
-            me = interaction.guild.me or interaction.guild.get_member(self.user.id if self.user else 0)
-            planner_ch = interaction.guild.get_channel(int(settings.planner_channel_id)) if settings.planner_channel_id else None
-            participants_ch = interaction.guild.get_channel(int(settings.participants_channel_id)) if settings.participants_channel_id else None
-            raidlist_ch = interaction.guild.get_channel(int(settings.raidlist_channel_id)) if settings.raidlist_channel_id else None
-
-            e = discord.Embed(title="📊 DMW Bot Status", description=f"Server: **{interaction.guild.name}**")
+            active_dungeon_list = [name for name in active_dungeons if name]
+            e = discord.Embed(title=f"⚙️ Server-Status · {interaction.guild.name}")
             e.add_field(name="Planner Channel", value=_channel_status(interaction.guild, settings.planner_channel_id), inline=False)
             e.add_field(name="Participants Channel", value=_channel_status(interaction.guild, settings.participants_channel_id), inline=False)
             e.add_field(name="Raidlist Channel", value=_channel_status(interaction.guild, settings.raidlist_channel_id), inline=False)
-
-            e.add_field(name="Planner Rechte", value=_perm_status(planner_ch, me), inline=False)
-            e.add_field(name="Participants Rechte", value=_perm_status(participants_ch, me), inline=False)
-            e.add_field(name="Raidlist Rechte", value=_perm_status(raidlist_ch, me), inline=False)
-
-            stale_running = bool(self.stale_raid_task and not self.stale_raid_task.done())
-            voice_xp_running = bool(self.voice_xp_task and not self.voice_xp_task.done())
-            self_test_running = bool(self.self_test_task and not self.self_test_task.done())
-            self_test_status = (
-                f"letzter Erfolg: {self.last_self_test_ok_at.isoformat(timespec='seconds')}"
-                if self.last_self_test_ok_at
-                else "noch kein erfolgreicher Lauf"
-            )
-            if self.last_self_test_error:
-                self_test_status = f"{self_test_status} | letzter Fehler: {self.last_self_test_error}"
+            e.add_field(name="Standard Mindestspieler", value=str(settings.default_min_players), inline=True)
+            e.add_field(name="Templates aktiviert", value="✅ Ja" if settings.templates_enabled else "❌ Nein", inline=True)
             e.add_field(
-                name="Background Jobs",
-                value=(
-                    f"Stale Cleanup: {'✅ aktiv' if stale_running else '❌ inaktiv'}\n"
-                    f"Cutoff: {STALE_RAID_HOURS}h | Intervall: {STALE_RAID_CHECK_SECONDS}s\n"
-                    f"Voice XP: {'✅ aktiv' if voice_xp_running else '❌ inaktiv'} | +1 XP/{int(VOICE_XP_AWARD_INTERVAL.total_seconds() // 3600)}h\n"
-                    f"Self-Tests: {'✅ aktiv' if self_test_running else '❌ inaktiv'} | Intervall: {SELF_TEST_INTERVAL_SECONDS}s | {self_test_status}"
-                ),
+                name="Aktive Dungeons (offene Raids)",
+                value="\n".join(f"• {name}" for name in active_dungeon_list[:20]) if active_dungeon_list else "—",
                 inline=False,
             )
-            e.add_field(name="Intents", value=f"message_content={'✅' if INTENTS.message_content else '❌'}", inline=False)
-
             await interaction.response.send_message(embed=e, ephemeral=True)
 
         @self.tree.command(name="help", description="Zeigt verfügbare Commands und Kurzinfos")
         async def help_cmd(interaction: discord.Interaction):
-            text = (
-                "**DMW Raid Bot Hilfe**\n"
-                "`/raidplan` - Raid erstellen\n"
-                "`/raidlist` - Raidlist sofort aktualisieren\n"
-                "`/settings` - Bot-Channels konfigurieren\n"
-                "`/dungeonlist` - aktive Dungeons anzeigen\n"
-                "`/cancel_all_raids` - alle offenen Raids stoppen (Admin)\n"
-                "`/purge` - letzte N Nachrichten löschen\n"
-                "`/purgebot` - Bot-Nachrichten channelweit/serverweit löschen\n"
-                "`/help2` - Schritt-für-Schritt Raid-Anleitung im Channel posten\n"
-                "\n"
-                f"Stale-Raid Auto-Cleanup: offen > {STALE_RAID_HOURS}h wird automatisch beendet."
-            )
-            await interaction.response.send_message(text, ephemeral=True)
+            lines = [
+                "**DMW Raid Bot Hilfe**",
+                "`/raidplan` - Raid erstellen",
+                "`/raidlist` - Raidlist sofort aktualisieren",
+                "`/settings` - Bot-Channels konfigurieren",
+                "`/dungeonlist` - aktive Dungeons anzeigen",
+                "`/help2` - Schritt-für-Schritt Raid-Anleitung im Channel posten",
+            ]
+
+            if _is_server_admin(interaction):
+                lines.extend([
+                    "`/status` - Kern-Konfiguration prüfen",
+                    "`/cancel_all_raids` - alle offenen Raids stoppen",
+                    "`/template_config` - Auto-Templates aktivieren/deaktivieren",
+                    "`/attendance_list` - Attendance pro Raid anzeigen",
+                    "`/attendance_mark` - Attendance setzen",
+                    "`/purge` - letzte N Nachrichten löschen",
+                    "`/purgebot` - Bot-Nachrichten channelweit/serverweit löschen",
+                    "`/restart` - Bot neu starten",
+                ])
+
+            if getattr(interaction.user, "id", None) == 403988960638009347:
+                lines.extend([
+                    "`/remote_guilds` - bekannte Guilds anzeigen (privileged)",
+                    "`/remote_cancel_all_raids` - Remote-Cancel (privileged)",
+                    "`/remote_raidlist` - Remote-Raidlist Refresh (privileged)",
+                    "`/backup_db` - Failsafe: DB SQL Backup sofort (privileged)",
+                ])
+
+            lines.append("")
+            lines.append(f"Stale-Raid Auto-Cleanup: offen > {STALE_RAID_HOURS}h wird automatisch beendet.")
+            await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
         @self.tree.command(name="help2", description="Postet eine Schritt-für-Schritt Raid-Anleitung in diesen Channel")
         async def help2_cmd(interaction: discord.Interaction):
@@ -439,6 +454,8 @@ class RaidBot(discord.Client):
             self.voice_xp_task = asyncio.create_task(self._voice_xp_worker())
         if self.self_test_task is None or self.self_test_task.done():
             self.self_test_task = asyncio.create_task(self._self_test_worker())
+        if self.backup_task is None or self.backup_task.done():
+            self.backup_task = asyncio.create_task(self._backup_worker())
 
     async def restore_persistent_raid_views(self) -> None:
         """Re-register persistent raid planner views after bot restart."""
@@ -502,6 +519,24 @@ class RaidBot(discord.Client):
                 log.exception("Stale raid cleanup failed")
             await asyncio.sleep(STALE_RAID_CHECK_SECONDS)
 
+
+    async def _run_backup_once(self) -> str:
+        self.enqueue_discord_log("[backup] Auto-Backup gestartet.")
+        log.info("Repository SQL auto-backup started")
+        path = await export_database_to_sql()
+        self.enqueue_discord_log(f"[backup] Auto-Backup abgeschlossen: {path.as_posix()}")
+        log.info("Repository SQL backup written to %s", path.as_posix())
+        return path.as_posix()
+
+    async def _backup_worker(self):
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                await self._run_backup_once()
+            except Exception:
+                log.exception("Repository SQL backup worker failed")
+            await asyncio.sleep(max(300, BACKUP_INTERVAL_SECONDS))
+
     async def _voice_xp_worker(self):
         await self.wait_until_ready()
         while not self.is_closed():
@@ -517,6 +552,8 @@ class RaidBot(discord.Client):
             "settings", "status", "help", "help2", "restart",
             "raidplan", "raidlist", "dungeonlist", "cancel_all_raids", "purge", "purgebot",
             "remote_guilds", "remote_cancel_all_raids", "remote_raidlist",
+            "template_config",
+            "attendance_list", "attendance_mark", "backup_db",
         }
         missing = sorted(expected_commands - registered_commands)
         if missing:
@@ -750,6 +787,8 @@ class RaidBot(discord.Client):
             self.voice_xp_task.cancel()
         if self.self_test_task and not self.self_test_task.done():
             self.self_test_task.cancel()
+        if self.backup_task and not self.backup_task.done():
+            self.backup_task.cancel()
         if self.log_forwarder_task and not self.log_forwarder_task.done():
             self.log_forwarder_task.cancel()
         await super().close()
