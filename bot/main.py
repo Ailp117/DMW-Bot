@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Iterable
 
 from bot.config import BotConfig
@@ -146,7 +146,7 @@ class BotApplication:
             self.self_test_state.last_error = f"Unexpected commands: {', '.join(unexpected)}"
             raise RuntimeError(self.self_test_state.last_error)
 
-        self.self_test_state.last_ok_at = datetime.now()
+        self.self_test_state.last_ok_at = datetime.now(UTC)
         self.self_test_state.last_error = None
 
     async def cleanup_removed_guilds(self, *, connected_guild_ids: Iterable[int]) -> None:

@@ -245,3 +245,44 @@ If a new chat should continue safely:
   - line number
 - Validation after change:
   - `pytest -q` -> `50 passed, 1 warning`.
+
+### Full code scan + DB request optimization pass (2026-02-13, latest)
+- Performed full regression and safety scan on active runtime path.
+- Validation status:
+  - `pytest -q` => `76 passed, 1 warning`
+  - `python -m compileall bot db services features utils tests` => passed
+- Existing warning remains external-only (`discord.py` `audioop` deprecation), no runtime failure.
+
+#### Level system hardening and command XP exclusion
+- Confirmed/kept integer-safe XP thresholds in `utils/leveling.py`.
+- Added runtime guard so registered bot commands do not grant message XP:
+  - Slash-like command names are extracted and checked against registered command set.
+  - If message content matches a registered command (e.g. `/status`), XP award path is skipped.
+- Added tests in `tests/test_phase3_command_xp_filter.py` to verify:
+  - command detection
+  - no XP on command messages
+  - XP still granted for normal messages
+
+#### DB query/load reduction improvements
+- Major persistence optimization in `services/persistence_service.py`:
+  - Added deterministic repository snapshot fingerprinting.
+  - `flush()` now short-circuits (no SQL delete/insert cycle) when state is unchanged.
+  - `load()` now stores baseline fingerprint so first no-op flush can be skipped.
+- Added test `tests/test_phase3_persistence_optimization.py`:
+  - verifies unchanged state does not open a DB write cycle again.
+
+#### Bot message index optimization (reduces DB churn)
+- Improved bot-message tracking in `bot/runtime.py`:
+  - Added per-channel cap for indexed bot messages (`BOT_MESSAGE_INDEX_MAX_PER_CHANNEL`).
+  - Oldest index rows are pruned automatically.
+- Purpose:
+  - keeps `debug_mirror_cache` bounded
+  - avoids unbounded growth and expensive full-table flush payloads
+  - keeps `/purgebot` indexed path fast
+- Added regression coverage in `tests/test_phase3_purgebot_index.py` for pruning behavior.
+
+#### Additional minor safety fix
+- Updated `bot/main.py` self-test timestamp to timezone-aware UTC (`datetime.now(UTC)`).
+
+#### Latest verified test snapshot
+- `76 passed, 1 warning in 0.48s`
