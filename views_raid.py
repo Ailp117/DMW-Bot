@@ -1,9 +1,12 @@
+import hashlib
+
 import discord
 from discord.ui import View, Select, Button
 from sqlalchemy import select
 
+from config import LOG_GUILD_ID, MEMBERLIST_DEBUG_CHANNEL_ID
 from db import session_scope
-from models import Raid, RaidPostedSlot
+from models import DebugMirrorCache, Raid, RaidPostedSlot
 from helpers import (
     normalize_list, get_settings, create_raid, get_raid, get_options,
     toggle_vote, vote_counts, vote_user_sets, posted_slot_map, upsert_posted_slot,
@@ -38,6 +41,98 @@ def slot_text(raid: Raid, day_label: str, time_label: str, role: discord.Role | 
         f"{short_list(mentions)}"
     )
 
+
+def _debug_cache_key_for_memberlist(guild_id: int, raid_id: int) -> str:
+    return f"memberlist:{guild_id}:{raid_id}"
+
+
+async def _load_debug_cache_entry(cache_key: str) -> DebugMirrorCache | None:
+    async with session_scope() as session:
+        return await session.get(DebugMirrorCache, cache_key)
+
+
+async def _upsert_debug_cache_entry(
+    cache_key: str,
+    *,
+    guild_id: int,
+    raid_id: int,
+    message_id: int,
+    payload_hash: str,
+) -> None:
+    async with session_scope() as session:
+        row = await session.get(DebugMirrorCache, cache_key)
+        if row is None:
+            row = DebugMirrorCache(
+                cache_key=cache_key,
+                kind="memberlist",
+                guild_id=guild_id,
+                raid_id=raid_id,
+                message_id=message_id,
+                payload_hash=payload_hash,
+            )
+            session.add(row)
+            return
+
+        row.message_id = message_id
+        row.payload_hash = payload_hash
+
+
+async def _mirror_memberlist_debug(interaction: discord.Interaction, raid, slot_lines: list[str]) -> None:
+    if interaction.guild is None or interaction.guild.id == LOG_GUILD_ID or not MEMBERLIST_DEBUG_CHANNEL_ID:
+        return
+
+    channel = interaction.client.get_channel(MEMBERLIST_DEBUG_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await interaction.client.fetch_channel(MEMBERLIST_DEBUG_CHANNEL_ID)
+        except (discord.NotFound, discord.Forbidden):
+            return
+
+    if not hasattr(channel, "send"):
+        return
+
+    if slot_lines:
+        content = "\n".join(slot_lines)
+    else:
+        content = "Keine erfüllten Member-Slots für diesen Raid."
+
+    header = (
+        f"🧪 Memberlist Debug | Guild `{interaction.guild.id}` ({interaction.guild.name})\n"
+        f"Raid `{raid.id}` | Dungeon **{raid.dungeon}**"
+    )
+    payload = f"{header}\n{content}"
+    if len(payload) > 1900:
+        payload = payload[:1897] + "..."
+
+    cache_key = _debug_cache_key_for_memberlist(interaction.guild.id, raid.id)
+    payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    cached = await _load_debug_cache_entry(cache_key)
+    if cached is not None and cached.payload_hash == payload_hash:
+        return
+
+    if cached is not None and cached.message_id:
+        try:
+            msg = await channel.fetch_message(int(cached.message_id))
+            await msg.edit(content=payload)
+            await _upsert_debug_cache_entry(
+                cache_key,
+                guild_id=interaction.guild.id,
+                raid_id=raid.id,
+                message_id=msg.id,
+                payload_hash=payload_hash,
+            )
+            return
+        except (discord.NotFound, discord.Forbidden):
+            pass
+
+    msg = await channel.send(payload)
+    await _upsert_debug_cache_entry(
+        cache_key,
+        guild_id=interaction.guild.id,
+        raid_id=raid.id,
+        message_id=msg.id,
+        payload_hash=payload_hash,
+    )
 
 class RaidCreateModal(discord.ui.Modal, title="Raid erstellen"):
     days = discord.ui.TextInput(label="Tage (Komma/Zeilen)", required=True, max_length=400)
@@ -231,6 +326,7 @@ class RaidVoteView(View):
                     days, times = await get_options(session, self.raid_id)
                     day_users, time_users = await vote_user_sets(session, self.raid_id)
                     slot_rows = await posted_slot_map(session, self.raid_id)
+                    debug_slot_lines: list[str] = []
                     for d in days:
                         for t in times:
                             users = sorted(day_users.get(d, set()).intersection(time_users.get(t, set())))
@@ -238,6 +334,7 @@ class RaidVoteView(View):
                                 continue
 
                             txt = slot_text(raid, d, t, role, users)
+                            debug_slot_lines.append(f"• {d} {t}: {', '.join(f'<@{u}>' for u in users)}")
                             row = slot_rows.get((d, t))
 
                             if not row:
@@ -264,6 +361,8 @@ class RaidVoteView(View):
                                         channel_id=ch.id,
                                         message_id=msg.id,
                                     )
+
+                    await _mirror_memberlist_debug(interaction, raid, debug_slot_lines)
 
         await interaction.edit_original_response(embed=embed, view=self)
         await schedule_raidlist_refresh(interaction.client, interaction.guild.id)
