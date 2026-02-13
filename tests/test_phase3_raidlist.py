@@ -32,7 +32,8 @@ def test_raidlist_render_contains_open_raids(repo):
 
     render = render_raidlist(1, "Guild", repo.list_open_raids(1))
     assert "Nanos" in render.body
-    assert "ID 1" in render.body
+    assert "🆔 `1`" in render.body
+    assert "https://discord.com/channels/1/11/5400" in render.body
 
 
 @pytest.mark.asyncio
