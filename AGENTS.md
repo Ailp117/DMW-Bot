@@ -1,101 +1,256 @@
-# AGENTS.md — Discord Bot Rewrite Execution Rules (Binding)
+# AGENTS.md — ENTERPRISE EXECUTION CONTRACT (NON-NEGOTIABLE)
 
-These rules are binding for every step taken in this repository.
+This document is the binding execution contract for Codex.
 
-######################################################################
-# PRIMARY GOAL
-######################################################################
+Failure to follow ANY rule in this document invalidates completion.
 
-Perform a complete rewrite-from-scratch of the Discord bot
-with 100% feature parity and the existing database schema unchanged.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+0. ABSOLUTE AUTHORITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-The task is NOT documentation.
-The task is NOT a report.
-The task is WORKING, TESTED, CI-READY SOURCE CODE.
+This file overrides:
+- Any previous repository conventions
+- Any prior AGENTS.md versions
+- Any informal assumptions
+- Any undocumented behaviors
 
-######################################################################
-# NON-NEGOTIABLE RULES
-######################################################################
+No exceptions.
 
-1. Do NOT stop after listing required inputs.
-2. Do NOT only edit README.md or DELIVERY_REPORT.md.
-3. Primary deliverable is WORKING SOURCE CODE.
-4. Database schema must remain unchanged.
-5. No renaming tables, columns, constraints.
-6. No adding constraints unless explicitly requested.
-7. If information is missing:
-   - Ask specifically what is missing.
-   - After receiving it, immediately continue implementation.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. FULL REWRITE MANDATE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-######################################################################
-# ANTI-REPORT RULE
-######################################################################
+This repository MUST undergo:
 
-You are not allowed to complete this task by only:
+- Complete behavioral inventory
+- Complete legacy archival
+- Complete modular rebuild
+- Complete test enforcement
+- Complete CI enforcement
 
-- editing README.md
-- editing DELIVERY_REPORT.md
-- updating bot.yml
-- summarizing actions
+This is NOT:
+- A refactor
+- A cleanup
+- A patch cycle
+- A hybrid migration
 
-If core application files (main.py, commands/, views/, services/, repositories/, db/, etc.)
-are not created or modified, the task is incomplete.
+This IS a clean rebuild from zero with full behavioral parity.
 
-######################################################################
-# EXECUTION LOOP
-######################################################################
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. PHASE LOCK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-If tests fail:
+Execution MUST follow:
 
-1. Fix the code.
-2. Rerun `pytest -q`.
-3. Repeat until all tests pass.
+Phase 1   — Inventory + Feature Matrix (analysis only)
+Phase 1B  — Legacy Archival
+Phase 2   — Modular Rebuild
+Phase 3   — Test Enforcement Loop
+Phase 4   — CI Enforcement
+Final     — Feature Matrix Validation
 
-Never declare completion while tests are failing.
+No skipping.
+No reordering.
+No early termination.
 
-######################################################################
-# REQUIRED COMMANDS
-######################################################################
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. LEGACY ANALYSIS REQUIREMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-You must execute and show output for:
+Before moving ANY file:
 
-pip install -r requirements.txt
-pytest -q
+- Entire repository must be analyzed.
+- All commands must be extracted.
+- All background tasks must be extracted.
+- All Discord views/modals/buttons must be mapped.
+- All DB interactions must be mapped.
+- All config usage must be mapped.
+- All message/role/channel side effects must be mapped.
+- All interaction edge cases must be mapped.
 
-The full pytest output must be displayed.
+Only AFTER FEATURE_MATRIX.md is complete may legacy files be moved.
 
-######################################################################
-# EXECUTION ENFORCEMENT
-######################################################################
+Legacy files must be moved into:
 
-Before declaring completion, verify:
+    legacy_archive/
 
-- At least one core application file changed
-- tests/ directory exists with real test cases
-- pytest output is shown
-- GitHub Actions workflow runs pytest
-- No interaction response errors remain
-- Persistent views work
-- Feature parity verified
+Deletion is forbidden.
 
-If any condition is false → continue working.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. DATABASE IMMUTABILITY (ABSOLUTE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-######################################################################
-# DEFINITION OF DONE
-######################################################################
+The database schema is LOCKED.
 
-The task is complete only if:
+Forbidden:
+- Table renaming
+- Column renaming
+- Adding columns
+- Removing columns
+- Changing constraints
+- Adding indexes
+- Running migrations
+- Modifying schema SQL files
 
-[ ] Feature Matrix created  
-[ ] Rewrite complete  
-[ ] DB schema unchanged  
-[ ] Persistent views restored  
-[ ] Voting logic preserved  
-[ ] Cleanup logic preserved  
-[ ] No interaction double responses  
-[ ] Tests green  
-[ ] CI workflow aligned  
-[ ] README complete  
-[ ] Full pytest output shown  
+Any schema modification = HARD FAILURE.
 
-If any box unchecked → continue implementation.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. FEATURE PARITY ENFORCEMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Every feature MUST be preserved:
+
+- Slash commands
+- Voting logic
+- Raid creation
+- Minimum participant trigger
+- Cleanup on raid end (creator only)
+- Persistent view restoration
+- Raidlist refresh
+- Background loops
+- DB semantics
+
+FEATURE_MATRIX.md is the authoritative checklist.
+
+Any missing feature = NOT COMPLETE.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. REQUIRED ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Mandatory structure:
+
+bot/
+  main.py
+  config.py
+  logging.py
+db/
+discord/
+features/
+services/
+utils/
+
+Strict separation:
+- No DB logic in Discord layer
+- No Discord API in db/
+- Business logic in services/
+- Pure helpers in utils/
+
+Violation = HARD FAILURE.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. DISCORD SAFETY REQUIREMENTS (BOMBENSICHER)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Mandatory protections:
+
+- Interaction safety wrappers
+- HTTP 40060 prevention
+- Idempotent responses
+- Idempotent message updates
+- Safe edit wrappers (NotFound/Forbidden safe)
+- Singleton background loops
+- Async cancellation safety
+- Restart-safe persistent views
+- Defensive config validation
+
+System must tolerate:
+- Double button presses
+- Restart with active raids
+- Deleted messages
+- Race conditions
+- Discord reconnects
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. TEST ENFORCEMENT LOOP (MANDATORY)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+pytest + pytest-asyncio REQUIRED.
+
+Coverage MUST include:
+
+- Raid creation
+- Voting logic
+- Min participant trigger
+- Cleanup logic
+- Raidlist refresh
+- Interaction safety
+- DB persistence after restart
+- Background singleton enforcement
+- Startup smoke test
+
+Execution loop:
+
+1. Run `pytest -q`
+2. If ANY failure → fix
+3. Re-run `pytest -q`
+4. Repeat until ALL pass
+5. Print COMPLETE output (no truncation)
+
+Skipping this loop = HARD FAILURE.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. CI ENFORCEMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+.github/workflows/bot.yml MUST:
+
+- Install dependencies
+- Install pytest
+- Run pytest -q
+- Fail on failure
+- Cache pip
+- Include scheduled cron watchdog
+
+CI must enforce correctness on every push.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+10. QUESTION POLICY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+If Codex encounters uncertainty:
+
+- It MAY ask clarifying questions.
+- After receiving answers, it MUST immediately continue execution.
+- It may NOT stop permanently after asking.
+- Questions do NOT justify phase skipping.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+11. HARD FAILURE CONDITIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Task is NOT complete if:
+
+- Legacy moved before analysis
+- FEATURE_MATRIX incomplete
+- DB modified
+- Tests not written
+- pytest not executed
+- pytest output missing
+- Any failing test
+- CI not running pytest
+- Architecture incorrect
+- Feature parity incomplete
+- Early termination
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+12. FINAL VALIDATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+At end of execution:
+
+Re-open FEATURE_MATRIX.md.
+
+For EACH feature confirm:
+
+- Implementation file(s)
+- DB usage
+- Test coverage
+
+If ANY feature is not VERIFIED:
+
+Return to implementation.
+Repeat Phase 3.
+Re-run validation.
+
+Completion only allowed after full verification.

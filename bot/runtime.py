@@ -1,0 +1,1945 @@
+from __future__ import annotations
+
+import asyncio
+from collections import deque
+from dataclasses import asdict
+from datetime import datetime
+import importlib.machinery
+import importlib.util
+import logging
+import os
+from pathlib import Path
+import re
+import sys
+from typing import Any
+
+from bot.config import load_config
+from bot.logging import setup_logging
+from db.repository import InMemoryRepository, RaidPostedSlotRecord, RaidRecord
+from db.schema_guard import ensure_required_schema, validate_required_tables
+from services.admin_service import cancel_all_open_raids, list_active_dungeons
+from services.backup_service import export_rows_to_sql
+from services.leveling_service import LevelingService
+from services.persistence_service import RepositoryPersistence
+from services.raid_service import (
+    build_raid_plan_defaults,
+    create_raid_from_modal,
+    finish_raid,
+    planner_counts,
+    slot_text,
+    toggle_vote,
+)
+from services.raidlist_service import render_raidlist
+from services.settings_service import save_channel_settings, set_templates_enabled
+from services.startup_service import EXPECTED_SLASH_COMMANDS
+from discord.task_registry import DebouncedGuildUpdater, SingletonTaskRegistry
+from utils.hashing import sha256_text
+from utils.slots import compute_qualified_slot_users, memberlist_threshold
+from utils.text import contains_approved_keyword, contains_nanomon_keyword
+
+
+def _import_discord_api_module():
+    cwd = os.path.abspath(os.getcwd())
+    search_path: list[str] = []
+    for raw in sys.path:
+        absolute = os.path.abspath(raw or os.getcwd())
+        if absolute == cwd:
+            continue
+        search_path.append(raw)
+
+    spec = importlib.machinery.PathFinder.find_spec("discord", search_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("discord.py package not found in environment")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["discord"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+discord = _import_discord_api_module()
+app_commands = discord.app_commands
+
+
+log = logging.getLogger("dmw.runtime")
+PRIVILEGED_USER_ID = 403988960638009347
+NANOMON_IMAGE_URL = "https://wikimon.net/images/thumb/c/cc/Nanomon_New_Century.png/200px-Nanomon_New_Century.png"
+APPROVED_GIF_URL = "https://media1.tenor.com/m/l8waltLHrxcAAAAC/approved.gif"
+STALE_RAID_HOURS = 7 * 24
+STALE_RAID_CHECK_SECONDS = 15 * 60
+VOICE_XP_CHECK_SECONDS = 60
+LOG_CHANNEL_LOGGER_NAMES = ("dmw.runtime", "dmw.db")
+PRIVILEGED_ONLY_HELP_COMMANDS = frozenset(
+    {
+        "restart",
+        "remote_guilds",
+        "remote_cancel_all_raids",
+        "remote_raidlist",
+        "backup_db",
+    }
+)
+
+_RESPONSE_ERRORS = {"InteractionResponded", "HTTPException", "NotFound", "Forbidden"}
+
+
+def _is_response_error(exc: Exception) -> bool:
+    return exc.__class__.__name__ in _RESPONSE_ERRORS
+
+
+def _log_safe_wrapper_error(action: str, exc: Exception) -> None:
+    if _is_response_error(exc):
+        return
+    log.debug("Safe Discord wrapper '%s' failed: %s", action, exc, exc_info=True)
+
+
+async def _safe_defer(interaction: Any, *, ephemeral: bool = False) -> bool:
+    response = getattr(interaction, "response", None)
+    if response is None:
+        return False
+    is_done = getattr(response, "is_done", None)
+    if callable(is_done) and is_done():
+        return False
+
+    try:
+        await response.defer(ephemeral=ephemeral)
+        return True
+    except Exception as exc:
+        _log_safe_wrapper_error("defer", exc)
+        return False
+
+
+async def _safe_followup(interaction: Any, content: str, *, ephemeral: bool = False, **kwargs: Any) -> bool:
+    followup = getattr(interaction, "followup", None)
+    if followup is None:
+        return False
+    try:
+        await followup.send(content, ephemeral=ephemeral, **kwargs)
+        return True
+    except Exception as exc:
+        _log_safe_wrapper_error("followup.send", exc)
+        return False
+
+
+async def _safe_send_initial(interaction: Any, content: str, *, ephemeral: bool = False, **kwargs: Any) -> bool:
+    response = getattr(interaction, "response", None)
+    if response is None:
+        return False
+    is_done = getattr(response, "is_done", None)
+    if callable(is_done) and is_done():
+        return await _safe_followup(interaction, content, ephemeral=ephemeral, **kwargs)
+
+    try:
+        await response.send_message(content, ephemeral=ephemeral, **kwargs)
+        return True
+    except Exception as exc:
+        _log_safe_wrapper_error("response.send_message", exc)
+        return await _safe_followup(interaction, content, ephemeral=ephemeral, **kwargs)
+
+
+async def _safe_send_channel_message(channel: Any, **kwargs: Any) -> Any | None:
+    send_fn = getattr(channel, "send", None)
+    if send_fn is None:
+        return None
+    try:
+        return await send_fn(**kwargs)
+    except Exception as exc:
+        _log_safe_wrapper_error("channel.send", exc)
+        return None
+
+
+async def _safe_fetch_message(channel: Any, message_id: int) -> Any | None:
+    fetch_fn = getattr(channel, "fetch_message", None)
+    if fetch_fn is None:
+        return None
+    try:
+        return await fetch_fn(int(message_id))
+    except Exception as exc:
+        _log_safe_wrapper_error("channel.fetch_message", exc)
+        return None
+
+
+async def _safe_edit_message(message: Any, **kwargs: Any) -> bool:
+    edit_fn = getattr(message, "edit", None)
+    if edit_fn is None:
+        return False
+    try:
+        await edit_fn(**kwargs)
+        return True
+    except Exception as exc:
+        _log_safe_wrapper_error("message.edit", exc)
+        return False
+
+
+async def _safe_delete_message(message: Any) -> bool:
+    delete_fn = getattr(message, "delete", None)
+    if delete_fn is None:
+        return False
+    try:
+        await delete_fn()
+        return True
+    except Exception as exc:
+        _log_safe_wrapper_error("message.delete", exc)
+        return False
+
+
+def _member_name(member: Any) -> str | None:
+    for attr in ("display_name", "global_name", "name"):
+        value = getattr(member, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+async def _is_admin_or_privileged(interaction) -> bool:
+    user_id = getattr(interaction.user, "id", None)
+    if user_id == PRIVILEGED_USER_ID:
+        return True
+    perms = getattr(interaction.user, "guild_permissions", None)
+    return bool(perms and getattr(perms, "administrator", False))
+
+
+def _admin_or_privileged_check():
+    return app_commands.check(_is_admin_or_privileged)
+
+
+def _settings_embed(settings, guild_name: str):
+    embed = discord.Embed(title=f"Settings: {guild_name}", color=discord.Color.blurple())
+    embed.add_field(
+        name="Planner Channel",
+        value=f"`{settings.planner_channel_id}`" if settings.planner_channel_id else "nicht gesetzt",
+        inline=False,
+    )
+    embed.add_field(
+        name="Participants Channel",
+        value=f"`{settings.participants_channel_id}`" if settings.participants_channel_id else "nicht gesetzt",
+        inline=False,
+    )
+    embed.add_field(
+        name="Raidlist Channel",
+        value=f"`{settings.raidlist_channel_id}`" if settings.raidlist_channel_id else "nicht gesetzt",
+        inline=False,
+    )
+    embed.add_field(name="Default Min Players", value=str(settings.default_min_players), inline=True)
+    embed.add_field(name="Templates Enabled", value="ja" if settings.templates_enabled else "nein", inline=True)
+    embed.set_footer(text="Channel-Auswahl unten aendern und speichern.")
+    return embed
+
+
+class RaidCreateModal(discord.ui.Modal, title="Raid erstellen"):
+    days = discord.ui.TextInput(label="Tage (Komma/Zeilen)", required=True, max_length=400)
+    times = discord.ui.TextInput(label="Uhrzeiten (Komma/Zeilen)", required=True, max_length=400)
+    min_players = discord.ui.TextInput(label="Min Spieler pro Slot (0=ab 1)", required=True, max_length=3)
+
+    def __init__(
+        self,
+        bot: "RewriteDiscordBot",
+        *,
+        guild_id: int,
+        guild_name: str,
+        channel_id: int,
+        dungeon_name: str,
+        default_days: list[str],
+        default_times: list[str],
+        default_min_players: int,
+    ):
+        super().__init__()
+        self.bot = bot
+        self.guild_id = guild_id
+        self.guild_name = guild_name
+        self.channel_id = channel_id
+        self.dungeon_name = dungeon_name
+
+        if default_days:
+            self.days.default = ", ".join(default_days)[:400]
+        if default_times:
+            self.times.default = ", ".join(default_times)[:400]
+        self.min_players.default = str(max(0, int(default_min_players)))
+
+    async def on_submit(self, interaction):
+        if not interaction.guild:
+            await self.bot._reply(interaction, "Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        await self.bot._defer(interaction, ephemeral=True)
+
+        try:
+            min_players_value = int(str(self.min_players.value).strip())
+            if min_players_value < 0:
+                raise ValueError
+        except ValueError:
+            await _safe_followup(interaction, "Min Spieler muss Zahl >= 0 sein.", ephemeral=True)
+            return
+
+        async with self.bot._state_lock:
+            try:
+                result = create_raid_from_modal(
+                    self.bot.repo,
+                    guild_id=self.guild_id,
+                    guild_name=self.guild_name,
+                    planner_channel_id=self.channel_id,
+                    creator_id=interaction.user.id,
+                    dungeon_name=self.dungeon_name,
+                    days_input=str(self.days.value),
+                    times_input=str(self.times.value),
+                    min_players_input=str(min_players_value),
+                    message_id=0,
+                )
+            except ValueError as exc:
+                await _safe_followup(interaction, f"Fehler: {exc}", ephemeral=True)
+                return
+
+            planner_message = await self.bot._refresh_planner_message(result.raid.id)
+            if planner_message is None:
+                self.bot.repo.delete_raid_cascade(result.raid.id)
+                await self.bot._persist()
+                await _safe_followup(interaction, "Planner-Post konnte nicht erstellt werden.", ephemeral=True)
+                return
+
+            await self.bot._sync_memberlist_messages_for_raid(result.raid.id)
+            await self.bot._refresh_raidlist_for_guild(self.guild_id, force=True)
+            persisted = await self.bot._persist()
+            counts = planner_counts(self.bot.repo, result.raid.id)
+
+        if not persisted:
+            await _safe_followup(interaction, "Raid erstellt, aber DB-Speicherung fehlgeschlagen.", ephemeral=True)
+            return
+        jump_url = getattr(
+            planner_message,
+            "jump_url",
+            f"/channels/{interaction.guild.id}/{self.channel_id}/{planner_message.id}",
+        )
+        await _safe_followup(
+            interaction,
+            (
+                f"Raid erstellt: `{result.raid.display_id}` {result.raid.dungeon}\n"
+                f"Day Votes: {counts['day']}\n"
+                f"Time Votes: {counts['time']}\n"
+                f"Planner Post: {jump_url}"
+            ),
+            ephemeral=True,
+        )
+
+
+class SettingsView(discord.ui.View):
+    def __init__(self, bot: "RewriteDiscordBot", *, guild_id: int):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.guild_id = guild_id
+        settings = bot.repo.ensure_settings(guild_id)
+        self.planner_channel_id: int | None = settings.planner_channel_id
+        self.participants_channel_id: int | None = settings.participants_channel_id
+        self.raidlist_channel_id: int | None = settings.raidlist_channel_id
+
+        planner_select = discord.ui.ChannelSelect(
+            placeholder="Planner Channel waehlen",
+            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
+            min_values=0,
+            max_values=1,
+            custom_id=f"settings:{guild_id}:planner",
+        )
+        participants_select = discord.ui.ChannelSelect(
+            placeholder="Participants Channel waehlen",
+            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
+            min_values=0,
+            max_values=1,
+            custom_id=f"settings:{guild_id}:participants",
+        )
+        raidlist_select = discord.ui.ChannelSelect(
+            placeholder="Raidlist Channel waehlen",
+            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
+            min_values=0,
+            max_values=1,
+            custom_id=f"settings:{guild_id}:raidlist",
+        )
+
+        planner_select.callback = self._on_planner_select
+        participants_select.callback = self._on_participants_select
+        raidlist_select.callback = self._on_raidlist_select
+
+        self.add_item(planner_select)
+        self.add_item(participants_select)
+        self.add_item(raidlist_select)
+        self.add_item(SettingsSaveButton(bot, guild_id))
+
+    async def _on_planner_select(self, interaction):
+        selected = ((interaction.data or {}).get("values") or [])
+        self.planner_channel_id = int(selected[0]) if selected else None
+        await self.bot._defer(interaction, ephemeral=True)
+        await _safe_followup(interaction, "Planner Channel vorgemerkt.", ephemeral=True)
+
+    async def _on_participants_select(self, interaction):
+        selected = ((interaction.data or {}).get("values") or [])
+        self.participants_channel_id = int(selected[0]) if selected else None
+        await self.bot._defer(interaction, ephemeral=True)
+        await _safe_followup(interaction, "Participants Channel vorgemerkt.", ephemeral=True)
+
+    async def _on_raidlist_select(self, interaction):
+        selected = ((interaction.data or {}).get("values") or [])
+        self.raidlist_channel_id = int(selected[0]) if selected else None
+        await self.bot._defer(interaction, ephemeral=True)
+        await _safe_followup(interaction, "Raidlist Channel vorgemerkt.", ephemeral=True)
+
+
+class SettingsSaveButton(discord.ui.Button):
+    def __init__(self, bot: "RewriteDiscordBot", guild_id: int):
+        super().__init__(
+            style=discord.ButtonStyle.success,
+            label="Speichern",
+            custom_id=f"settings:{guild_id}:save",
+        )
+        self.bot = bot
+        self.guild_id = guild_id
+
+    async def callback(self, interaction):
+        if not interaction.guild or interaction.guild.id != self.guild_id:
+            await self.bot._reply(interaction, "Ungueltiger Guild-Kontext.", ephemeral=True)
+            return
+
+        view = self.view
+        if not isinstance(view, SettingsView):
+            await self.bot._reply(interaction, "Settings View nicht verfuegbar.", ephemeral=True)
+            return
+
+        await self.bot._defer(interaction, ephemeral=True)
+        async with self.bot._state_lock:
+            row = save_channel_settings(
+                self.bot.repo,
+                guild_id=interaction.guild.id,
+                guild_name=interaction.guild.name,
+                planner_channel_id=view.planner_channel_id,
+                participants_channel_id=view.participants_channel_id,
+                raidlist_channel_id=view.raidlist_channel_id,
+            )
+            await self.bot._refresh_raidlist_for_guild(interaction.guild.id, force=True)
+            persisted = await self.bot._persist()
+
+        if not persisted:
+            await _safe_followup(interaction, "Settings konnten nicht gespeichert werden.", ephemeral=True)
+            return
+        await _safe_followup(
+            interaction,
+            (
+                "Settings gespeichert:\n"
+                f"Planner: `{row.planner_channel_id}`\n"
+                f"Participants: `{row.participants_channel_id}`\n"
+                f"Raidlist: `{row.raidlist_channel_id}`"
+            ),
+            ephemeral=True,
+        )
+
+
+class FinishButton(discord.ui.Button):
+    def __init__(self, bot: "RewriteDiscordBot", raid_id: int):
+        super().__init__(
+            style=discord.ButtonStyle.danger,
+            label="Raid beenden",
+            custom_id=f"raid:{raid_id}:finish",
+        )
+        self.bot = bot
+        self.raid_id = raid_id
+
+    async def callback(self, interaction):
+        await self.bot._defer(interaction, ephemeral=True)
+        await self.bot._finish_raid_interaction(interaction, raid_id=self.raid_id, deferred=True)
+
+
+class RaidVoteView(discord.ui.View):
+    def __init__(self, bot: "RewriteDiscordBot", raid_id: int, days: list[str], times: list[str]):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.raid_id = raid_id
+
+        day_values = days[:25]
+        time_values = times[:25]
+
+        if day_values:
+            day_select = discord.ui.Select(
+                placeholder="Tage waehlen/abwaehlen...",
+                min_values=1,
+                max_values=min(25, max(1, len(day_values))),
+                options=[discord.SelectOption(label=value, value=value) for value in day_values],
+                custom_id=f"raid:{raid_id}:day",
+            )
+            day_select.callback = self.on_day_select
+            self.add_item(day_select)
+
+        if time_values:
+            time_select = discord.ui.Select(
+                placeholder="Uhrzeiten waehlen/abwaehlen...",
+                min_values=1,
+                max_values=min(25, max(1, len(time_values))),
+                options=[discord.SelectOption(label=value, value=value) for value in time_values],
+                custom_id=f"raid:{raid_id}:time",
+            )
+            time_select.callback = self.on_time_select
+            self.add_item(time_select)
+
+        self.add_item(FinishButton(bot, raid_id))
+
+    async def _vote(self, interaction, *, kind: str) -> None:
+        if not interaction.guild:
+            await self.bot._reply(interaction, "Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        await self.bot._defer(interaction, ephemeral=True)
+        values = [str(value) for value in ((interaction.data or {}).get("values") or [])]
+        if not values:
+            await _safe_followup(interaction, "Keine Werte ausgewaehlt.", ephemeral=True)
+            return
+
+        async with self.bot._state_lock:
+            raid = self.bot.repo.get_raid(self.raid_id)
+            if raid is None or raid.status != "open":
+                await _safe_followup(interaction, "Raid ist nicht mehr aktiv.", ephemeral=True)
+                return
+
+            labels = self.bot.repo.list_raid_options(raid.id)[0 if kind == "day" else 1]
+            lookup = {label.lower(): label for label in labels}
+            applied = 0
+            for raw in values:
+                selected = lookup.get(raw.strip().lower())
+                if selected is None:
+                    continue
+                toggle_vote(
+                    self.bot.repo,
+                    raid_id=raid.id,
+                    kind=kind,
+                    option_label=selected,
+                    user_id=interaction.user.id,
+                )
+                applied += 1
+
+            if applied == 0:
+                await _safe_followup(interaction, "Keine gueltige Option erkannt.", ephemeral=True)
+                return
+
+            await self.bot._sync_vote_ui_after_change(raid.id)
+            persisted = await self.bot._persist()
+
+        voter = _member_name(interaction.user) or str(interaction.user.id)
+        if not persisted:
+            await _safe_followup(interaction, "Stimme gesetzt, aber DB-Speicherung fehlgeschlagen.", ephemeral=True)
+            return
+        await _safe_followup(interaction, f"Stimme aktualisiert fuer **{voter}**.", ephemeral=True)
+
+    async def on_day_select(self, interaction):
+        await self._vote(interaction, kind="day")
+
+    async def on_time_select(self, interaction):
+        await self._vote(interaction, kind="time")
+
+
+class RewriteDiscordBot(discord.Client):
+    def __init__(self, repo: InMemoryRepository, config) -> None:
+        intents = discord.Intents.default()
+        intents.message_content = config.enable_message_content_intent
+        super().__init__(intents=intents)
+
+        self.repo = repo
+        self.config = config
+        self.persistence = RepositoryPersistence(config)
+        self.tree = app_commands.CommandTree(self)
+        self.task_registry = SingletonTaskRegistry()
+        self.raidlist_updater = DebouncedGuildUpdater(
+            self._refresh_raidlist_for_guild_persisted,
+            debounce_seconds=1.5,
+            cooldown_seconds=0.8,
+        )
+        self.leveling_service = LevelingService()
+
+        self.log_channel = None
+        self.log_forward_queue: asyncio.Queue[str] = asyncio.Queue()
+        self.pending_log_buffer: deque[str] = deque(maxlen=250)
+        self.log_forwarder_active = False
+        self.last_self_test_ok_at: datetime | None = None
+        self.last_self_test_error: str | None = None
+
+        self._commands_registered = False
+        self._state_loaded = False
+        self._views_restored = False
+        self._commands_synced = False
+        self._runtime_restored = False
+
+        self._ack_lock = asyncio.Lock()
+        self._state_lock = asyncio.Lock()
+        self._acked_interactions: set[int] = set()
+        self._raidlist_hash_by_guild: dict[int, str] = {}
+        self._discord_log_handler = self._build_discord_log_handler()
+        self._discord_loggers: list[logging.Logger] = []
+        self._attach_discord_log_handler()
+
+    async def setup_hook(self) -> None:
+        if not self._state_loaded:
+            await self._bootstrap_repository()
+            self._state_loaded = True
+        if not self._commands_registered:
+            self._register_commands()
+            self._commands_registered = True
+        if not self._views_restored:
+            self._restore_persistent_vote_views()
+            self._views_restored = True
+
+    async def _bootstrap_repository(self) -> None:
+        if not await self.persistence.session_manager.try_acquire_singleton_lock():
+            log.warning("Another instance holds singleton lock. Exiting.")
+            raise SystemExit(0)
+
+        async with self.persistence.session_manager.engine.begin() as connection:
+            changes = await ensure_required_schema(connection)
+            await validate_required_tables(connection)
+            if changes:
+                log.info("Applied DB schema changes: %s", ", ".join(changes))
+
+        await self.persistence.load(self.repo)
+        if not self.repo.dungeons:
+            self._seed_default_dungeons()
+            await self.persistence.flush(self.repo)
+
+    def _restore_persistent_vote_views(self) -> None:
+        restored = 0
+        for raid in self.repo.list_open_raids():
+            if not raid.message_id:
+                continue
+            days, times = self.repo.list_raid_options(raid.id)
+            if not days or not times:
+                continue
+            self.add_view(RaidVoteView(self, raid.id, days, times), message_id=raid.message_id)
+            restored += 1
+        if restored:
+            log.info("Restored %s persistent raid vote views", restored)
+
+    async def on_ready(self) -> None:
+        if not self._commands_synced:
+            synced: list[int] = []
+            for guild in self.guilds:
+                try:
+                    await self.tree.sync(guild=discord.Object(id=guild.id))
+                    synced.append(guild.id)
+                except Exception:
+                    log.exception("Guild sync failed for %s", guild.id)
+
+            try:
+                await self.tree.sync()
+            except Exception:
+                log.exception("Global command sync failed")
+
+            self._commands_synced = True
+            log.info("Command sync completed (guild_sync=%s)", synced)
+
+        async with self._state_lock:
+            guild_settings_changed = self._sync_connected_guild_settings()
+            if not self._runtime_restored:
+                await self._restore_runtime_messages()
+                self._runtime_restored = True
+            elif guild_settings_changed:
+                await self._persist()
+
+        if not self._runtime_restored:
+            return
+
+        self._start_background_loops()
+
+        if self.log_channel is None:
+            self.log_channel = await self._resolve_log_channel()
+        self.log_forwarder_active = True
+        self._flush_pending_logs()
+
+        log.info("Rewrite bot ready as %s", self.user)
+
+    async def _restore_runtime_messages(self) -> None:
+        for raid in list(self.repo.list_open_raids()):
+            await self._refresh_planner_message(raid.id)
+            await self._sync_memberlist_messages_for_raid(raid.id)
+        await self._refresh_raidlists_for_all_guilds(force=True)
+        await self._persist()
+
+    def _sync_connected_guild_settings(self) -> bool:
+        changed = False
+        for guild in self.guilds:
+            existing = self.repo.settings.get(int(guild.id))
+            current_name = (guild.name or "").strip() or None
+            before_name = existing.guild_name if existing else None
+            if existing is None or before_name != current_name:
+                self.repo.ensure_settings(int(guild.id), current_name)
+                changed = True
+        return changed
+
+    def _start_background_loops(self) -> None:
+        self.task_registry.start_once("stale_raid_worker", self._stale_raid_worker)
+        self.task_registry.start_once("voice_xp_worker", self._voice_xp_worker)
+        self.task_registry.start_once("self_test_worker", self._self_test_worker)
+        self.task_registry.start_once("backup_worker", self._backup_worker)
+        self.task_registry.start_once("log_forwarder_worker", self._log_forwarder_worker)
+
+    async def on_guild_join(self, guild) -> None:
+        async with self._state_lock:
+            self.repo.ensure_settings(guild.id, guild.name)
+            await self._force_raidlist_refresh(guild.id)
+            await self._persist()
+
+        try:
+            await self.tree.sync(guild=discord.Object(id=guild.id))
+        except Exception:
+            log.exception("Guild sync failed for joined guild %s", guild.id)
+
+    async def on_guild_remove(self, guild) -> None:
+        async with self._state_lock:
+            self.repo.purge_guild_data(guild.id)
+            await self._persist()
+
+    async def on_message(self, message) -> None:
+        if message.author.bot:
+            return
+
+        if (
+            self.log_channel is not None
+            and message.guild is not None
+            and message.channel.id == getattr(self.log_channel, "id", None)
+            and bool(getattr(getattr(message.author, "guild_permissions", None), "administrator", False))
+        ):
+            handled = await self._execute_console_command(message)
+            if handled:
+                return
+
+        if message.guild is not None:
+            async with self._state_lock:
+                result = self.leveling_service.update_message_xp(
+                    self.repo,
+                    guild_id=message.guild.id,
+                    user_id=message.author.id,
+                    username=_member_name(message.author),
+                )
+                await self._persist()
+            if result.current_level > result.previous_level:
+                try:
+                    await message.channel.send(
+                        f"🎉 {message.author.mention} ist auf **Level {result.current_level}** aufgestiegen! "
+                        f"(XP: {result.xp})"
+                    )
+                except Exception:
+                    log.exception("Failed to send level-up message")
+
+        if contains_nanomon_keyword(message.content):
+            try:
+                await message.reply(NANOMON_IMAGE_URL, mention_author=False)
+            except Exception:
+                log.exception("Failed to send nanomon reply")
+        if contains_approved_keyword(message.content):
+            try:
+                await message.reply(APPROVED_GIF_URL, mention_author=False)
+            except Exception:
+                log.exception("Failed to send approved reply")
+
+    async def on_voice_state_update(self, member, before, after) -> None:
+        if getattr(member, "bot", False):
+            return
+        guild = getattr(member, "guild", None)
+        if guild is None:
+            return
+
+        if getattr(after, "channel", None) is None:
+            self.leveling_service.on_voice_disconnect(guild.id, member.id)
+        elif getattr(before, "channel", None) is None:
+            self.leveling_service.on_voice_connect(guild.id, member.id, datetime.utcnow())
+
+    async def _execute_console_command(self, message) -> bool:
+        raw = (getattr(message, "content", "") or "").strip()
+        if not raw:
+            return False
+        command = raw.lstrip("/").strip().split()[0].lower()
+        if command != "restart":
+            return False
+        try:
+            await message.channel.send("♻️ Neustart wird eingeleitet ...")
+        except Exception:
+            pass
+        await self.close()
+        return True
+
+    def _build_discord_log_handler(self) -> logging.Handler:
+        bot = self
+
+        class _DiscordQueueHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                try:
+                    msg = self.format(record)
+                    bot.enqueue_discord_log(msg)
+                except Exception:
+                    self.handleError(record)
+
+        handler = _DiscordQueueHandler(level=getattr(logging, self.config.discord_log_level, logging.DEBUG))
+        handler.setFormatter(
+            logging.Formatter(
+                "[%(asctime)s] %(levelname)s "
+                "src=%(name)s/%(module)s.%(funcName)s:%(lineno)d | %(message)s",
+                "%Y-%m-%d %H:%M:%S",
+            )
+        )
+        return handler
+
+    def _attach_discord_log_handler(self) -> None:
+        attached: list[logging.Logger] = []
+        for logger_name in LOG_CHANNEL_LOGGER_NAMES:
+            logger = logging.getLogger(logger_name)
+            if self._discord_log_handler not in logger.handlers:
+                logger.addHandler(self._discord_log_handler)
+            attached.append(logger)
+        self._discord_loggers = attached
+
+    def enqueue_discord_log(self, message: str) -> None:
+        if not message:
+            return
+        text = message if len(message) <= 1800 else f"{message[:1797]}..."
+        if self.log_forwarder_active:
+            self.log_forward_queue.put_nowait(text)
+            return
+        self.pending_log_buffer.append(text)
+
+    def _flush_pending_logs(self) -> None:
+        while self.pending_log_buffer:
+            self.log_forward_queue.put_nowait(self.pending_log_buffer.popleft())
+
+    async def _resolve_log_channel(self):
+        if self.config.log_guild_id <= 0 or self.config.log_channel_id <= 0:
+            return None
+        guild = self.get_guild(self.config.log_guild_id)
+        if guild is None:
+            return None
+        channel = guild.get_channel(self.config.log_channel_id)
+        if isinstance(channel, discord.TextChannel):
+            return channel
+        return None
+
+    async def _log_forwarder_worker(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            message = await self.log_forward_queue.get()
+            channel = self.log_channel
+            if channel is None:
+                continue
+            try:
+                await channel.send(f"```\n{message}\n```")
+            except Exception:
+                continue
+
+    async def _run_self_tests_once(self) -> None:
+        registered = sorted(cmd.name for cmd in self.tree.get_commands())
+        reg_set = set(registered)
+        missing = sorted(name for name in EXPECTED_SLASH_COMMANDS if name not in reg_set)
+        if missing:
+            raise RuntimeError(f"Missing commands: {', '.join(missing)}")
+        unexpected = sorted(name for name in reg_set if name not in EXPECTED_SLASH_COMMANDS)
+        if unexpected:
+            log.warning("Unexpected extra commands registered: %s", ", ".join(unexpected))
+        self.last_self_test_ok_at = datetime.utcnow()
+        self.last_self_test_error = None
+
+    async def _self_test_worker(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                await self._run_self_tests_once()
+            except Exception as exc:
+                self.last_self_test_error = str(exc)
+                log.exception("Background self-test failed")
+            await asyncio.sleep(max(30, int(self.config.self_test_interval_seconds)))
+
+    def _snapshot_rows_by_table(self) -> dict[str, list[dict[str, object]]]:
+        return {
+            "guild_settings": [asdict(row) for row in self.repo.settings.values()],
+            "raids": [asdict(row) for row in self.repo.raids.values()],
+            "raid_options": [asdict(row) for row in self.repo.raid_options.values()],
+            "raid_votes": [asdict(row) for row in self.repo.raid_votes.values()],
+            "raid_posted_slots": [asdict(row) for row in self.repo.raid_posted_slots.values()],
+            "raid_templates": [asdict(row) for row in self.repo.raid_templates.values()],
+            "raid_attendance": [asdict(row) for row in self.repo.raid_attendance.values()],
+            "user_levels": [asdict(row) for row in self.repo.user_levels.values()],
+            "debug_mirror_cache": [asdict(row) for row in self.repo.debug_cache.values()],
+            "dungeons": [asdict(row) for row in self.repo.dungeons.values()],
+        }
+
+    async def _run_backup_once(self) -> Path:
+        log.info("Automatic backup started")
+        rows = self._snapshot_rows_by_table()
+        path = await export_rows_to_sql(Path("backups/db_backup.sql"), rows_by_table=rows)
+        log.info("Automatic backup completed: %s", path.as_posix())
+        return path
+
+    async def _backup_worker(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                async with self._state_lock:
+                    await self._run_backup_once()
+            except Exception:
+                log.exception("Background backup failed")
+            await asyncio.sleep(max(300, int(self.config.backup_interval_seconds)))
+
+    async def _voice_xp_worker(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            changed = False
+            now = datetime.utcnow()
+            async with self._state_lock:
+                for guild in self.guilds:
+                    for voice_channel in guild.voice_channels:
+                        for member in voice_channel.members:
+                            if member.bot:
+                                continue
+                            awarded = self.leveling_service.award_voice_xp_once(
+                                self.repo,
+                                now=now,
+                                guild_id=guild.id,
+                                user_id=member.id,
+                                username=_member_name(member),
+                            )
+                            changed = changed or awarded
+                if changed:
+                    await self._persist()
+            await asyncio.sleep(VOICE_XP_CHECK_SECONDS)
+
+    async def _cleanup_stale_raids_once(self) -> int:
+        cutoff_hours = STALE_RAID_HOURS
+
+        stale_ids: list[int] = []
+        for raid in self.repo.list_open_raids():
+            created_at = raid.created_at
+            now = datetime.now(created_at.tzinfo) if created_at.tzinfo is not None else datetime.utcnow()
+            age_seconds = (now - raid.created_at).total_seconds()
+            if age_seconds >= cutoff_hours * 3600:
+                stale_ids.append(raid.id)
+
+        removed = 0
+        for raid_id in stale_ids:
+            raid = self.repo.get_raid(raid_id)
+            if raid is None:
+                continue
+            slot_rows = list(self.repo.list_posted_slots(raid.id).values())
+            await self._close_planner_message(
+                guild_id=raid.guild_id,
+                channel_id=raid.channel_id,
+                message_id=raid.message_id,
+                reason="stale-cleanup",
+            )
+            await self._cleanup_temp_role(raid)
+            for row in slot_rows:
+                await self._delete_slot_message(row)
+            self.repo.delete_raid_cascade(raid.id)
+            await self._refresh_raidlist_for_guild(raid.guild_id, force=True)
+            removed += 1
+
+        if removed:
+            await self._persist()
+        return removed
+
+    async def _stale_raid_worker(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                async with self._state_lock:
+                    await self._cleanup_stale_raids_once()
+            except Exception:
+                log.exception("Stale raid cleanup failed")
+            await asyncio.sleep(STALE_RAID_CHECK_SECONDS)
+
+    def _seed_default_dungeons(self) -> None:
+        self.repo.add_dungeon(name="Nanos", short_code="NAN", sort_order=1)
+        self.repo.add_dungeon(name="Skull", short_code="SKL", sort_order=2)
+
+    async def _mark_interaction_once(self, interaction: Any) -> bool:
+        interaction_id = int(getattr(interaction, "id", 0) or 0)
+        if interaction_id <= 0:
+            return True
+        async with self._ack_lock:
+            if interaction_id in self._acked_interactions:
+                return False
+            self._acked_interactions.add(interaction_id)
+            if len(self._acked_interactions) > 20_000:
+                self._acked_interactions.clear()
+            return True
+
+    async def _reply(self, interaction: Any, content: str, *, ephemeral: bool = True) -> None:
+        first = await self._mark_interaction_once(interaction)
+        if first and await _safe_send_initial(interaction, content, ephemeral=ephemeral):
+            return
+        await _safe_followup(interaction, content, ephemeral=ephemeral)
+
+    async def _defer(self, interaction: Any, *, ephemeral: bool = True) -> bool:
+        first = await self._mark_interaction_once(interaction)
+        if not first:
+            return False
+        return await _safe_defer(interaction, ephemeral=ephemeral)
+
+    async def _persist(self) -> bool:
+        try:
+            await self.persistence.flush(self.repo)
+            return True
+        except Exception:
+            log.exception("Failed to flush state. Reloading repository snapshot.")
+            try:
+                await self.persistence.load(self.repo)
+            except Exception:
+                log.exception("Failed to reload repository after flush error.")
+            return False
+
+    def _find_open_raid_by_display_id(self, guild_id: int, display_id: int) -> RaidRecord | None:
+        for raid in self.repo.list_open_raids(guild_id):
+            if raid.display_id is None:
+                continue
+            if int(raid.display_id) == int(display_id):
+                return raid
+        return None
+
+    def _public_help_command_names(self) -> list[str]:
+        names = sorted(cmd.name for cmd in self.tree.get_commands())
+        return [name for name in names if name not in PRIVILEGED_ONLY_HELP_COMMANDS]
+
+    def _resolve_remote_target_by_name(self, raw_value: str) -> tuple[int | None, str | None]:
+        value = (raw_value or "").strip()
+        if not value:
+            return None, "❌ Bitte einen Servernamen angeben."
+
+        suffix_match = re.search(r"\((\d+)\)\s*$", value)
+        if suffix_match:
+            guild_id = int(suffix_match.group(1))
+            guild = self.get_guild(guild_id)
+            if guild is None:
+                return None, "❌ Bot ist auf diesem Server nicht aktiv."
+            return guild_id, None
+
+        lowered = value.casefold()
+        exact = [guild for guild in self.guilds if (guild.name or "").strip().casefold() == lowered]
+        if len(exact) == 1:
+            return int(exact[0].id), None
+        if len(exact) > 1:
+            return None, "❌ Mehrdeutiger Servername. Bitte genauer eingeben."
+
+        partial = [guild for guild in self.guilds if lowered in (guild.name or "").strip().casefold()]
+        if len(partial) == 1:
+            return int(partial[0].id), None
+        if len(partial) > 1:
+            return None, "❌ Mehrere passende Server gefunden. Bitte genauer eingeben."
+
+        return None, "❌ Ungültiger Servername / kein passender Server gefunden."
+
+    def _remote_guild_autocomplete_choices(self, query: str) -> list[app_commands.Choice[str]]:
+        search = (query or "").strip().casefold()
+        guilds = sorted(self.guilds, key=lambda guild: ((guild.name or "").casefold(), int(guild.id)))
+        name_counts: dict[str, int] = {}
+        for guild in guilds:
+            key = ((guild.name or "").strip() or str(guild.id)).casefold()
+            name_counts[key] = name_counts.get(key, 0) + 1
+
+        choices: list[app_commands.Choice[str]] = []
+        for guild in guilds:
+            guild_name = (guild.name or "").strip() or f"Server {guild.id}"
+            unique_key = guild_name.casefold()
+            value = guild_name if name_counts.get(unique_key, 0) == 1 else f"{guild_name} ({guild.id})"
+            if search and search not in guild_name.casefold() and search not in value.casefold():
+                continue
+            choices.append(app_commands.Choice(name=value[:100], value=value))
+            if len(choices) >= 25:
+                break
+        return choices
+
+    async def _get_text_channel(self, channel_id: int | None):
+        if not channel_id:
+            return None
+        channel = self.get_channel(int(channel_id))
+        if isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return channel
+        try:
+            fetched = await self.fetch_channel(int(channel_id))
+        except Exception:
+            return None
+        if isinstance(fetched, (discord.TextChannel, discord.Thread)):
+            return fetched
+        return None
+
+    async def _mirror_debug_payload(
+        self,
+        *,
+        debug_channel_id: int,
+        cache_key: str,
+        kind: str,
+        guild_id: int,
+        raid_id: int | None,
+        content: str,
+    ) -> None:
+        if debug_channel_id <= 0:
+            return
+        channel = await self._get_text_channel(debug_channel_id)
+        if channel is None:
+            return
+
+        payload = content if len(content) <= 1900 else f"{content[:1897]}..."
+        payload_hash = sha256_text(payload)
+        cached = self.repo.get_debug_cache(cache_key)
+
+        if cached is not None and cached.payload_hash == payload_hash and cached.message_id:
+            existing = await _safe_fetch_message(channel, cached.message_id)
+            if existing is not None:
+                return
+
+        if cached is not None and cached.message_id:
+            existing = await _safe_fetch_message(channel, cached.message_id)
+            if existing is not None:
+                edited = await _safe_edit_message(existing, content=payload)
+                if edited:
+                    self.repo.upsert_debug_cache(
+                        cache_key=cache_key,
+                        kind=kind,
+                        guild_id=guild_id,
+                        raid_id=raid_id,
+                        message_id=existing.id,
+                        payload_hash=payload_hash,
+                    )
+                    return
+
+        posted = await _safe_send_channel_message(channel, content=payload)
+        if posted is None:
+            return
+        self.repo.upsert_debug_cache(
+            cache_key=cache_key,
+            kind=kind,
+            guild_id=guild_id,
+            raid_id=raid_id,
+            message_id=posted.id,
+            payload_hash=payload_hash,
+        )
+
+    def _planner_embed(self, raid: RaidRecord):
+        counts = planner_counts(self.repo, raid.id)
+        day_users, time_users = self.repo.vote_user_sets(raid.id)
+        day_voters = set().union(*day_users.values()) if day_users else set()
+        time_voters = set().union(*time_users.values()) if time_users else set()
+        complete_voters = day_voters.intersection(time_voters)
+
+        day_lines = [
+            f"- {label}: {count}"
+            for label, count in sorted(counts["day"].items(), key=lambda item: (-item[1], item[0].lower()))
+        ]
+        time_lines = [
+            f"- {label}: {count}"
+            for label, count in sorted(counts["time"].items(), key=lambda item: (-item[1], item[0].lower()))
+        ]
+        embed = discord.Embed(
+            title=f"Raid Planer: {raid.dungeon}",
+            description=f"Raid ID `{raid.display_id}`",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="Min Spieler pro Slot", value=str(raid.min_players), inline=True)
+        embed.add_field(name="Tage Votes", value="\n".join(day_lines) if day_lines else "-", inline=False)
+        embed.add_field(name="Uhrzeiten Votes", value="\n".join(time_lines) if time_lines else "-", inline=False)
+        embed.add_field(
+            name="Bereits abgestimmt (Tag + Zeit)",
+            value=self._plain_user_list_for_embed(raid.guild_id, complete_voters),
+            inline=False,
+        )
+        embed.set_footer(text="Namensliste ohne @-Mention. Schwellwert triggert Teilnehmerlisten.")
+        return embed
+
+    def _plain_user_list_for_embed(self, guild_id: int, user_ids: set[int], *, limit: int = 30) -> str:
+        if not user_ids:
+            return "-"
+
+        guild = self.get_guild(guild_id)
+        labels: list[str] = []
+        for user_id in sorted(user_ids):
+            label: str | None = None
+            if guild is not None:
+                member = guild.get_member(int(user_id))
+                if member is not None:
+                    label = _member_name(member)
+            labels.append(label or f"User {user_id}")
+
+        unique_labels = sorted(set(labels), key=lambda value: value.casefold())
+        lines = [f"- {label}" for label in unique_labels]
+        text = "\n".join(lines[:limit])
+        if len(lines) > limit:
+            text += f"\n... +{len(lines) - limit} weitere"
+        if len(text) > 1024:
+            text = text[:1021] + "..."
+        return text
+
+    async def _refresh_planner_message(self, raid_id: int):
+        raid = self.repo.get_raid(raid_id)
+        if raid is None or raid.status != "open":
+            return None
+
+        channel = await self._get_text_channel(raid.channel_id)
+        if channel is None:
+            return None
+
+        days, times = self.repo.list_raid_options(raid.id)
+        if not days or not times:
+            return None
+
+        embed = self._planner_embed(raid)
+        view = RaidVoteView(self, raid.id, days, times)
+
+        if raid.message_id:
+            existing = await _safe_fetch_message(channel, raid.message_id)
+            if existing is not None:
+                edited = await _safe_edit_message(existing, embed=embed, view=view, content=None)
+                if edited:
+                    return existing
+
+        posted = await _safe_send_channel_message(channel, embed=embed, view=view)
+        if posted is None:
+            return None
+        self.repo.set_raid_message_id(raid.id, posted.id)
+        self.add_view(view, message_id=posted.id)
+        return posted
+
+    async def _close_planner_message(
+        self,
+        *,
+        guild_id: int,
+        channel_id: int,
+        message_id: int | None,
+        reason: str,
+        attendance_rows: int | None = None,
+    ) -> None:
+        if not message_id:
+            return
+        channel = await self._get_text_channel(channel_id)
+        if channel is None:
+            return
+        message = await _safe_fetch_message(channel, message_id)
+        if message is None:
+            return
+
+        title = f"Raid geschlossen: {reason}"
+        description = f"Guild `{guild_id}`"
+        if attendance_rows is not None:
+            description += f"\nAttendance Rows: `{attendance_rows}`"
+        embed = discord.Embed(title=title, description=description, color=discord.Color.red())
+        await _safe_edit_message(message, embed=embed, view=None, content=None)
+
+    async def _delete_slot_message(self, row: RaidPostedSlotRecord) -> None:
+        if row.channel_id is None or row.message_id is None:
+            return
+        channel = await self._get_text_channel(row.channel_id)
+        if channel is None:
+            return
+        message = await _safe_fetch_message(channel, row.message_id)
+        if message is None:
+            return
+        await _safe_delete_message(message)
+
+    async def _ensure_temp_role(self, raid: RaidRecord):
+        if raid.min_players <= 0:
+            return None
+        guild = self.get_guild(raid.guild_id)
+        if guild is None:
+            return None
+
+        if raid.temp_role_id:
+            role = guild.get_role(int(raid.temp_role_id))
+            if role is not None:
+                return role
+
+        role_name = f"DMW Raid: {raid.dungeon}"
+        role = discord.utils.get(guild.roles, name=role_name)
+        if role is not None:
+            raid.temp_role_id = role.id
+            raid.temp_role_created = False
+            return role
+
+        try:
+            role = await guild.create_role(name=role_name, mentionable=True, reason="DMW Raid temp role")
+        except Exception:
+            return None
+
+        raid.temp_role_id = role.id
+        raid.temp_role_created = True
+        return role
+
+    async def _cleanup_temp_role(self, raid: RaidRecord) -> None:
+        if not raid.temp_role_id:
+            return
+        guild = self.get_guild(raid.guild_id)
+        if guild is None:
+            return
+        role = guild.get_role(int(raid.temp_role_id))
+        if role is None:
+            return
+
+        for member in list(role.members):
+            try:
+                await member.remove_roles(role, reason="DMW Raid finished")
+            except Exception:
+                continue
+
+        if raid.temp_role_created:
+            try:
+                await role.delete(reason="DMW Raid finished")
+            except Exception:
+                pass
+
+    async def _sync_memberlist_messages_for_raid(self, raid_id: int) -> tuple[int, int, int]:
+        raid = self.repo.get_raid(raid_id)
+        if raid is None or raid.status != "open":
+            return (0, 0, 0)
+
+        settings = self.repo.ensure_settings(raid.guild_id)
+        if not settings.participants_channel_id:
+            return (0, 0, 0)
+
+        participants_channel = await self._get_text_channel(settings.participants_channel_id)
+        if participants_channel is None:
+            return (0, 0, 0)
+
+        days, times = self.repo.list_raid_options(raid.id)
+        day_users, time_users = self.repo.vote_user_sets(raid.id)
+        threshold = memberlist_threshold(raid.min_players)
+        qualified_slots, _ = compute_qualified_slot_users(
+            days=days,
+            times=times,
+            day_users=day_users,
+            time_users=time_users,
+            threshold=threshold,
+        )
+
+        existing_rows = self.repo.list_posted_slots(raid.id)
+        active_keys: set[tuple[str, str]] = set()
+        created = 0
+        updated = 0
+        deleted = 0
+        debug_lines: list[str] = []
+        role = await self._ensure_temp_role(raid)
+
+        for (day_label, time_label), users in qualified_slots.items():
+            active_keys.add((day_label, time_label))
+            content = slot_text(raid, day_label, time_label, users)
+            if role is not None:
+                content = f"{content}\n{role.mention}"
+            debug_lines.append(f"- {day_label} {time_label}: {', '.join(f'<@{u}>' for u in users)}")
+            row = existing_rows.get((day_label, time_label))
+
+            edited = False
+            if row is not None and row.message_id is not None:
+                existing_channel = await self._get_text_channel(row.channel_id or participants_channel.id)
+                if existing_channel is not None:
+                    old_msg = await _safe_fetch_message(existing_channel, row.message_id)
+                    if old_msg is not None:
+                        edited = await _safe_edit_message(
+                            old_msg,
+                            content=content,
+                            allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+                        )
+                        if edited:
+                            self.repo.upsert_posted_slot(
+                                raid_id=raid.id,
+                                day_label=day_label,
+                                time_label=time_label,
+                                channel_id=existing_channel.id,
+                                message_id=old_msg.id,
+                            )
+                            updated += 1
+
+            if edited:
+                continue
+
+            new_msg = await _safe_send_channel_message(
+                participants_channel,
+                content=content,
+                allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+            )
+            if new_msg is None:
+                continue
+            self.repo.upsert_posted_slot(
+                raid_id=raid.id,
+                day_label=day_label,
+                time_label=time_label,
+                channel_id=participants_channel.id,
+                message_id=new_msg.id,
+            )
+            created += 1
+
+        for key, row in list(existing_rows.items()):
+            if key in active_keys:
+                continue
+            await self._delete_slot_message(row)
+            self.repo.delete_posted_slot(row.id)
+            deleted += 1
+
+        debug_body = (
+            f"Memberlist Debug Guild `{raid.guild_id}` Raid `{raid.display_id}`\n"
+            + ("\n".join(debug_lines) if debug_lines else "Keine qualifizierten Slots.")
+        )
+        await self._mirror_debug_payload(
+            debug_channel_id=int(self.config.memberlist_debug_channel_id),
+            cache_key=f"memberlist:{raid.guild_id}:{raid.id}",
+            kind="memberlist",
+            guild_id=raid.guild_id,
+            raid_id=raid.id,
+            content=debug_body,
+        )
+
+        return (created, updated, deleted)
+
+    async def _refresh_raidlist_for_guild(self, guild_id: int, *, force: bool = False) -> bool:
+        settings = self.repo.ensure_settings(guild_id)
+        if not settings.raidlist_channel_id:
+            return False
+
+        guild = self.get_guild(guild_id)
+        guild_name = guild.name if guild is not None else (settings.guild_name or str(guild_id))
+        render = render_raidlist(guild_id, guild_name, self.repo.list_open_raids(guild_id))
+        debug_payload = f"Raidlist Debug Guild `{guild_id}` ({guild_name})\n{render.title}\n{render.body}"
+
+        if not force and self._raidlist_hash_by_guild.get(guild_id) == render.payload_hash:
+            await self._mirror_debug_payload(
+                debug_channel_id=int(self.config.raidlist_debug_channel_id),
+                cache_key=f"raidlist:{guild_id}:0",
+                kind="raidlist",
+                guild_id=guild_id,
+                raid_id=None,
+                content=debug_payload,
+            )
+            return False
+
+        channel = await self._get_text_channel(settings.raidlist_channel_id)
+        if channel is None:
+            return False
+
+        content = f"**{render.title}**\n{render.body}"
+        if settings.raidlist_message_id:
+            message = await _safe_fetch_message(channel, settings.raidlist_message_id)
+            if message is not None:
+                if await _safe_edit_message(message, content=content):
+                    self._raidlist_hash_by_guild[guild_id] = render.payload_hash
+                    await self._mirror_debug_payload(
+                        debug_channel_id=int(self.config.raidlist_debug_channel_id),
+                        cache_key=f"raidlist:{guild_id}:0",
+                        kind="raidlist",
+                        guild_id=guild_id,
+                        raid_id=None,
+                        content=debug_payload,
+                    )
+                    return True
+
+        posted = await _safe_send_channel_message(channel, content=content)
+        if posted is None:
+            return False
+        settings.raidlist_message_id = posted.id
+        self._raidlist_hash_by_guild[guild_id] = render.payload_hash
+        await self._mirror_debug_payload(
+            debug_channel_id=int(self.config.raidlist_debug_channel_id),
+            cache_key=f"raidlist:{guild_id}:0",
+            kind="raidlist",
+            guild_id=guild_id,
+            raid_id=None,
+            content=debug_payload,
+        )
+        return True
+
+    async def _schedule_raidlist_refresh(self, guild_id: int) -> None:
+        await self.raidlist_updater.mark_dirty(guild_id)
+
+    async def _force_raidlist_refresh(self, guild_id: int) -> None:
+        await self._refresh_raidlist_for_guild(guild_id, force=True)
+
+    async def _refresh_raidlist_for_guild_persisted(self, guild_id: int) -> None:
+        async with self._state_lock:
+            await self._refresh_raidlist_for_guild(guild_id)
+            persisted = await self._persist()
+        if not persisted:
+            log.warning("Debounced raidlist refresh persisted failed for guild %s", guild_id)
+
+    async def _refresh_raidlists_for_all_guilds(self, *, force: bool) -> None:
+        guild_ids = set(self.repo.settings.keys())
+        guild_ids.update(raid.guild_id for raid in self.repo.list_open_raids())
+        for guild_id in sorted(guild_ids):
+            await self._refresh_raidlist_for_guild(guild_id, force=force)
+
+    async def _sync_vote_ui_after_change(self, raid_id: int) -> None:
+        raid = self.repo.get_raid(raid_id)
+        if raid is None or raid.status != "open":
+            return
+        await self._refresh_planner_message(raid.id)
+        await self._sync_memberlist_messages_for_raid(raid.id)
+        await self._schedule_raidlist_refresh(raid.guild_id)
+
+    async def _finish_raid_interaction(self, interaction, *, raid_id: int, deferred: bool) -> None:
+        async with self._state_lock:
+            raid = self.repo.get_raid(raid_id)
+            if raid is None:
+                msg = "Raid existiert nicht mehr."
+                if deferred:
+                    await _safe_followup(interaction, msg, ephemeral=True)
+                else:
+                    await self._reply(interaction, msg, ephemeral=True)
+                return
+
+            slot_rows = list(self.repo.list_posted_slots(raid.id).values())
+            planner_message_id = raid.message_id
+            planner_channel_id = raid.channel_id
+            guild_id = raid.guild_id
+            display_id = raid.display_id
+
+            result = finish_raid(self.repo, raid_id=raid.id, actor_user_id=interaction.user.id)
+            if not result.success:
+                if result.reason == "only_creator":
+                    msg = "Nur der Raid-Ersteller darf den Raid beenden."
+                else:
+                    msg = "Raid konnte nicht beendet werden."
+                if deferred:
+                    await _safe_followup(interaction, msg, ephemeral=True)
+                else:
+                    await self._reply(interaction, msg, ephemeral=True)
+                return
+
+            await self._cleanup_temp_role(raid)
+            for row in slot_rows:
+                await self._delete_slot_message(row)
+
+            await self._close_planner_message(
+                guild_id=guild_id,
+                channel_id=planner_channel_id,
+                message_id=planner_message_id,
+                reason="beendet",
+                attendance_rows=result.attendance_rows,
+            )
+            await self._force_raidlist_refresh(guild_id)
+            persisted = await self._persist()
+
+        if not persisted:
+            msg = "Raid beendet, aber DB-Speicherung fehlgeschlagen."
+        else:
+            msg = f"Raid `{display_id}` beendet. Attendance Rows: `{result.attendance_rows}`"
+        if deferred:
+            await _safe_followup(interaction, msg, ephemeral=True)
+        else:
+            await self._reply(interaction, msg, ephemeral=True)
+
+    async def _cancel_raids_for_guild(self, guild_id: int, *, reason: str) -> int:
+        raids = list(self.repo.list_open_raids(guild_id))
+        for raid in raids:
+            slot_rows = list(self.repo.list_posted_slots(raid.id).values())
+            await self._close_planner_message(
+                guild_id=raid.guild_id,
+                channel_id=raid.channel_id,
+                message_id=raid.message_id,
+                reason=reason,
+            )
+            await self._cleanup_temp_role(raid)
+            for row in slot_rows:
+                await self._delete_slot_message(row)
+
+        count = cancel_all_open_raids(self.repo, guild_id=guild_id)
+        await self._force_raidlist_refresh(guild_id)
+        return count
+
+    def _register_commands(self) -> None:
+        @self.tree.command(name="settings", description="Setzt Planner/Participants/Raidlist auf diesen Channel.")
+        @_admin_or_privileged_check()
+        async def settings_cmd(interaction):
+            if not interaction.guild:
+                await self._reply(interaction, "Nur im Server nutzbar.", ephemeral=True)
+                return
+
+            async with self._state_lock:
+                settings = self.repo.ensure_settings(interaction.guild.id, interaction.guild.name)
+            view = SettingsView(self, guild_id=interaction.guild.id)
+            sent = await _safe_send_initial(
+                interaction,
+                "Settings",
+                ephemeral=True,
+                embed=_settings_embed(settings, interaction.guild.name),
+                view=view,
+            )
+            if not sent:
+                await self._reply(interaction, "Settings-Ansicht konnte nicht geoeffnet werden.", ephemeral=True)
+
+        @self.tree.command(name="status", description="Zeigt den aktuellen Bot-Status")
+        async def status_cmd(interaction):
+            if not interaction.guild:
+                await self._reply(interaction, "Nur im Server nutzbar.", ephemeral=True)
+                return
+
+            settings = self.repo.ensure_settings(interaction.guild.id, interaction.guild.name)
+            open_raids = self.repo.list_open_raids(interaction.guild.id)
+            self_test_ok = self.last_self_test_ok_at.isoformat() if self.last_self_test_ok_at else "-"
+            self_test_err = self.last_self_test_error or "-"
+            await self._reply(
+                interaction,
+                (
+                    f"Guild: **{interaction.guild.name}**\n"
+                    f"Planner Channel: `{settings.planner_channel_id}`\n"
+                    f"Participants Channel: `{settings.participants_channel_id}`\n"
+                    f"Raidlist Channel: `{settings.raidlist_channel_id}`\n"
+                    f"Raidlist Message: `{settings.raidlist_message_id}`\n"
+                    f"Open Raids: `{len(open_raids)}`\n"
+                    f"Self-Test OK: `{self_test_ok}`\n"
+                    f"Self-Test Error: `{self_test_err}`"
+                ),
+                ephemeral=True,
+            )
+
+        @self.tree.command(name="help", description="Zeigt verfuegbare Commands")
+        async def help_cmd(interaction):
+            names = self._public_help_command_names()
+            await self._reply(
+                interaction,
+                "Verfuegbare Commands:\n" + "\n".join(f"- /{name}" for name in names),
+                ephemeral=True,
+            )
+
+        @self.tree.command(name="help2", description="Postet eine kurze Anleitung")
+        async def help2_cmd(interaction):
+            if not isinstance(interaction.channel, discord.TextChannel):
+                await self._reply(interaction, "Nur im Textchannel nutzbar.", ephemeral=True)
+                return
+            await interaction.channel.send(
+                "1) /settings\n"
+                "2) /raidplan\n"
+                "3) Abstimmung im Raid-Post per Selects\n"
+                "4) /raidlist fuer Live-Refresh\n"
+                "5) Raid beenden ueber Button oder /raid_finish\n"
+                "6) /purgebot scope=channel|server fuer Bot-Nachrichten-Reset"
+            )
+            await self._reply(interaction, "Anleitung gepostet.", ephemeral=True)
+
+        @self.tree.command(name="restart", description="Stoppt den Prozess (Runner startet neu)")
+        async def restart_cmd(interaction):
+            if interaction.user.id != PRIVILEGED_USER_ID:
+                await self._reply(interaction, "Nur privileged.", ephemeral=True)
+                return
+            await self._reply(interaction, "Neustart wird eingeleitet.", ephemeral=True)
+            await self.close()
+
+        @self.tree.command(name="dungeonlist", description="Aktive Dungeons")
+        async def dungeonlist_cmd(interaction):
+            names = list_active_dungeons(self.repo)
+            if not names:
+                await self._reply(interaction, "Keine aktiven Dungeons.", ephemeral=True)
+                return
+            await self._reply(interaction, "\n".join(f"- {name}" for name in names), ephemeral=True)
+
+        @self.tree.command(name="raidplan", description="Erstellt einen Raid Plan (Modal)")
+        @app_commands.describe(dungeon="Dungeon Name")
+        async def raidplan_cmd(interaction, dungeon: str):
+            if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
+                await self._reply(interaction, "Nur im Text-Serverchannel nutzbar.", ephemeral=True)
+                return
+
+            async with self._state_lock:
+                settings = self.repo.ensure_settings(interaction.guild.id, interaction.guild.name)
+                if not settings.planner_channel_id or not settings.participants_channel_id:
+                    await self._reply(
+                        interaction,
+                        "Bitte zuerst /settings konfigurieren (Planner + Participants Channel).",
+                        ephemeral=True,
+                    )
+                    return
+
+                try:
+                    defaults = build_raid_plan_defaults(
+                        self.repo,
+                        guild_id=interaction.guild.id,
+                        guild_name=interaction.guild.name,
+                        dungeon_name=dungeon,
+                    )
+                except ValueError as exc:
+                    await self._reply(interaction, f"Fehler: {exc}", ephemeral=True)
+                    return
+
+            modal = RaidCreateModal(
+                self,
+                guild_id=interaction.guild.id,
+                guild_name=interaction.guild.name,
+                channel_id=int(settings.planner_channel_id),
+                dungeon_name=dungeon,
+                default_days=defaults.days,
+                default_times=defaults.times,
+                default_min_players=defaults.min_players,
+            )
+            try:
+                await interaction.response.send_modal(modal)
+            except Exception:
+                await self._reply(interaction, "Raid-Modal konnte nicht geoeffnet werden.", ephemeral=True)
+
+        @raidplan_cmd.autocomplete("dungeon")
+        async def raidplan_dungeon_autocomplete(interaction, current: str):
+            query = (current or "").strip().lower()
+            rows = self.repo.list_active_dungeons()
+            if query:
+                rows = [row for row in rows if query in row.name.lower()]
+            return [app_commands.Choice(name=row.name, value=row.name) for row in rows[:25]]
+
+        @self.tree.command(name="raid_finish", description="Schliesst einen Raid und erstellt Attendance")
+        async def raid_finish_cmd(interaction, raid_id: int):
+            if not interaction.guild:
+                await self._reply(interaction, "Nur im Server nutzbar.", ephemeral=True)
+                return
+
+            raid = self._find_open_raid_by_display_id(interaction.guild.id, raid_id)
+            if raid is None:
+                await self._reply(interaction, f"Kein offener Raid mit ID `{raid_id}` gefunden.", ephemeral=True)
+                return
+            await self._finish_raid_interaction(interaction, raid_id=raid.id, deferred=False)
+
+        @self.tree.command(name="raidlist", description="Aktualisiert die Raidlist Nachricht")
+        async def raidlist_cmd(interaction):
+            if not interaction.guild:
+                await self._reply(interaction, "Nur im Server nutzbar.", ephemeral=True)
+                return
+            async with self._state_lock:
+                await self._force_raidlist_refresh(interaction.guild.id)
+                persisted = await self._persist()
+            if not persisted:
+                await self._reply(interaction, "Raidlist Refresh fehlgeschlagen (DB).", ephemeral=True)
+                return
+            await self._reply(interaction, "Raidlist aktualisiert.", ephemeral=True)
+
+        @self.tree.command(name="cancel_all_raids", description="Bricht alle offenen Raids ab")
+        @_admin_or_privileged_check()
+        async def cancel_all_raids_cmd(interaction):
+            if not interaction.guild:
+                await self._reply(interaction, "Nur im Server nutzbar.", ephemeral=True)
+                return
+            async with self._state_lock:
+                count = await self._cancel_raids_for_guild(interaction.guild.id, reason="abgebrochen")
+                persisted = await self._persist()
+            if not persisted:
+                await self._reply(interaction, "Raids gecancelt, aber DB-Speicherung fehlgeschlagen.", ephemeral=True)
+                return
+            await self._reply(interaction, f"{count} offene Raids gecancelt.", ephemeral=True)
+
+        @self.tree.command(name="template_config", description="Aktiviert/Deaktiviert Templates")
+        @_admin_or_privileged_check()
+        @app_commands.describe(enabled="Templates aktiv")
+        async def template_config_cmd(interaction, enabled: bool):
+            if not interaction.guild:
+                await self._reply(interaction, "Nur im Server nutzbar.", ephemeral=True)
+                return
+            async with self._state_lock:
+                row = set_templates_enabled(self.repo, interaction.guild.id, interaction.guild.name, enabled)
+                persisted = await self._persist()
+            if not persisted:
+                await self._reply(interaction, "Template-Config konnte nicht gespeichert werden.", ephemeral=True)
+                return
+            await self._reply(interaction, f"templates_enabled={row.templates_enabled}", ephemeral=True)
+
+        @self.tree.command(name="purge", description="Loescht letzte N Nachrichten")
+        @_admin_or_privileged_check()
+        async def purge_cmd(interaction, amount: int = 10):
+            if not isinstance(interaction.channel, discord.TextChannel):
+                await self._reply(interaction, "Nur im Textchannel nutzbar.", ephemeral=True)
+                return
+            await self._defer(interaction, ephemeral=True)
+            amount = max(1, min(100, int(amount)))
+            deleted = await interaction.channel.purge(limit=amount)
+            await _safe_followup(interaction, f"{len(deleted)} Nachrichten geloescht.", ephemeral=True)
+
+        @self.tree.command(name="purgebot", description="Loescht Bot-Nachrichten im Channel oder serverweit")
+        @_admin_or_privileged_check()
+        @app_commands.describe(
+            scope="`channel` = aktueller Channel, `server` = alle Textchannels",
+            limit="Max. gepruefte Nachrichten je Channel (1-5000)",
+        )
+        @app_commands.choices(
+            scope=[
+                app_commands.Choice(name="channel", value="channel"),
+                app_commands.Choice(name="server", value="server"),
+            ]
+        )
+        async def purgebot_cmd(interaction, scope: app_commands.Choice[str], limit: int = 500):
+            if interaction.guild is None:
+                await self._reply(interaction, "Nur im Server nutzbar.", ephemeral=True)
+                return
+            await self._defer(interaction, ephemeral=True)
+
+            limit = max(1, min(5000, int(limit)))
+            me = interaction.guild.me or interaction.guild.get_member(getattr(self.user, "id", 0))
+            if me is None:
+                await _safe_followup(interaction, "Bot-Mitglied im Server nicht gefunden.", ephemeral=True)
+                return
+
+            channels: list[discord.TextChannel]
+            if scope.value == "channel":
+                if not isinstance(interaction.channel, discord.TextChannel):
+                    await _safe_followup(interaction, "Nur im Textchannel nutzbar.", ephemeral=True)
+                    return
+                channels = [interaction.channel]
+            else:
+                channels = [
+                    channel
+                    for channel in interaction.guild.text_channels
+                    if channel.permissions_for(me).read_message_history
+                ]
+
+            total_deleted = 0
+            touched_channels = 0
+            bot_user_id = getattr(self.user, "id", 0)
+            for channel in channels:
+                perms = channel.permissions_for(me)
+                if not (perms.read_message_history and perms.manage_messages):
+                    continue
+
+                deleted_here = 0
+                async for msg in channel.history(limit=limit):
+                    if msg.author.id != bot_user_id:
+                        continue
+                    try:
+                        await msg.delete()
+                        deleted_here += 1
+                    except Exception:
+                        continue
+
+                if deleted_here > 0:
+                    total_deleted += deleted_here
+                    touched_channels += 1
+
+            where = "aktueller Channel" if scope.value == "channel" else f"{touched_channels} Channel(s)"
+            await _safe_followup(
+                interaction,
+                f"{total_deleted} Bot-Nachrichten geloescht ({where}, Limit je Channel: {limit}).",
+                ephemeral=True,
+            )
+
+        @self.tree.command(name="remote_guilds", description="Zeigt bekannte Server für Fernwartung an (privileged).")
+        async def remote_guilds_cmd(interaction):
+            if interaction.user.id != PRIVILEGED_USER_ID:
+                await self._reply(interaction, "❌ Nur für den Debug-Owner erlaubt.", ephemeral=True)
+                return
+            await self._defer(interaction, ephemeral=True)
+            guilds = sorted(self.guilds, key=lambda guild: ((guild.name or "").casefold(), int(guild.id)))
+            if not guilds:
+                await _safe_followup(interaction, "Keine verbundenen Server gefunden.", ephemeral=True)
+                return
+            lines: list[str] = []
+            for guild in guilds[:50]:
+                name = (guild.name or "").strip() or "(unbekannt)"
+                lines.append(f"• **{name}**")
+            await _safe_followup(interaction, "\n".join(lines), ephemeral=True)
+
+        @self.tree.command(name="remote_cancel_all_raids", description="Fernwartung: Alle offenen Raids eines Servers abbrechen.")
+        @app_commands.describe(guild_name="Zielservername (Autocomplete)")
+        async def remote_cancel_all_raids_cmd(interaction, guild_name: str):
+            if interaction.user.id != PRIVILEGED_USER_ID:
+                await self._reply(interaction, "❌ Nur für den Debug-Owner erlaubt.", ephemeral=True)
+                return
+            target, err = self._resolve_remote_target_by_name(guild_name)
+            if target is None:
+                await self._reply(interaction, err or "❌ Zielserver konnte nicht aufgelöst werden.", ephemeral=True)
+                return
+
+            await self._defer(interaction, ephemeral=True)
+            async with self._state_lock:
+                count = await self._cancel_raids_for_guild(target, reason="remote-abgebrochen")
+                persisted = await self._persist()
+
+            if not persisted:
+                await _safe_followup(
+                    interaction,
+                    "Remote-Cancel ausgeführt, aber DB-Speicherung fehlgeschlagen.",
+                    ephemeral=True,
+                )
+                return
+            target_guild = self.get_guild(target)
+            target_name = (target_guild.name if target_guild else None) or guild_name
+            await _safe_followup(interaction, f"✅ {count} offene Raids in **{target_name}** abgebrochen.", ephemeral=True)
+
+        @remote_cancel_all_raids_cmd.autocomplete("guild_name")
+        async def remote_cancel_all_raids_autocomplete(interaction, current: str):
+            if interaction.user.id != PRIVILEGED_USER_ID:
+                return []
+            return self._remote_guild_autocomplete_choices(current)
+
+        @self.tree.command(name="remote_raidlist", description="Fernwartung: Raidlist eines Zielservers neu aufbauen.")
+        @app_commands.describe(guild_name="Zielservername (Autocomplete)")
+        async def remote_raidlist_cmd(interaction, guild_name: str):
+            if interaction.user.id != PRIVILEGED_USER_ID:
+                await self._reply(interaction, "❌ Nur für den Debug-Owner erlaubt.", ephemeral=True)
+                return
+            target, err = self._resolve_remote_target_by_name(guild_name)
+            if target is None:
+                await self._reply(interaction, err or "❌ Zielserver konnte nicht aufgelöst werden.", ephemeral=True)
+                return
+
+            await self._defer(interaction, ephemeral=True)
+            async with self._state_lock:
+                await self._refresh_raidlist_for_guild(target, force=True)
+                persisted = await self._persist()
+
+            if not persisted:
+                await _safe_followup(interaction, "Remote-Raidlist-Refresh fehlgeschlagen (DB).", ephemeral=True)
+                return
+
+            target_guild = self.get_guild(target)
+            target_name = (target_guild.name if target_guild else None) or guild_name
+            await _safe_followup(interaction, f"✅ Raidlist für **{target_name}** aktualisiert.", ephemeral=True)
+
+        @remote_raidlist_cmd.autocomplete("guild_name")
+        async def remote_raidlist_autocomplete(interaction, current: str):
+            if interaction.user.id != PRIVILEGED_USER_ID:
+                return []
+            return self._remote_guild_autocomplete_choices(current)
+
+        @self.tree.command(name="backup_db", description="Schreibt ein SQL Backup")
+        async def backup_db_cmd(interaction):
+            if interaction.user.id != PRIVILEGED_USER_ID:
+                await self._reply(interaction, "Nur privileged.", ephemeral=True)
+                return
+            await self._defer(interaction, ephemeral=True)
+            log.info(
+                "Manual backup requested by user_id=%s guild_id=%s",
+                getattr(interaction.user, "id", None),
+                getattr(getattr(interaction, "guild", None), "id", None),
+            )
+
+            try:
+                async with self._state_lock:
+                    rows = self._snapshot_rows_by_table()
+                out = await export_rows_to_sql(Path("backups/db_backup.sql"), rows_by_table=rows)
+            except Exception:
+                log.exception("Manual backup failed")
+                await _safe_followup(interaction, "Backup fehlgeschlagen. Bitte Logs pruefen.", ephemeral=True)
+                return
+
+            log.info("Manual backup completed: %s", out.as_posix())
+            await _safe_followup(interaction, f"Backup geschrieben: {out.as_posix()}", ephemeral=True)
+
+    async def close(self) -> None:
+        try:
+            await self.task_registry.cancel_all()
+        except Exception:
+            pass
+        try:
+            for logger in self._discord_loggers:
+                logger.removeHandler(self._discord_log_handler)
+        except Exception:
+            pass
+        await super().close()
+
+
+def run() -> int:
+    setup_logging(os.getenv("LOG_LEVEL", "INFO"))
+
+    try:
+        config = load_config()
+    except ValueError as exc:
+        log.error("Config error: %s", exc)
+        return 1
+
+    setup_logging(config.discord_log_level)
+    if not config.discord_token:
+        log.error("DISCORD_TOKEN missing")
+        return 1
+
+    repo = InMemoryRepository()
+    bot = RewriteDiscordBot(repo=repo, config=config)
+
+    try:
+        bot.run(config.discord_token)
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run())
