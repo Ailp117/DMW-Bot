@@ -7,6 +7,7 @@ from models import Dungeon, Raid
 from helpers import get_active_dungeons, delete_raid_cascade
 from roles import cleanup_temp_role
 from raidlist import schedule_raidlist_refresh
+from permissions import admin_or_privileged_check
 
 
 def register_admin_commands(tree: app_commands.CommandTree):
@@ -21,7 +22,7 @@ def register_admin_commands(tree: app_commands.CommandTree):
         await interaction.followup.send("\n".join([f"• **{d.name}** (`{d.short_code}`)" for d in rows[:50]]), ephemeral=True)
 
     @tree.command(name="cancel_all_raids", description="❌ Alle offenen Raids abbrechen (Admin)")
-    @app_commands.checks.has_permissions(manage_guild=True)
+    @admin_or_privileged_check()
     async def cancel_all_raids(interaction: discord.Interaction):
         if not interaction.guild:
             return await interaction.response.send_message("Nur im Server.", ephemeral=True)
