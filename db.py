@@ -5,6 +5,7 @@ import time
 from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy import event, text
+from sqlalchemy.inspection import inspect
 
 from config import DATABASE_URL, DB_ECHO
 
@@ -35,11 +36,46 @@ def _on_sqlalchemy_error(exception_context):
 
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
+
+
+def _safe_db_value(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float, bool)):
+        return value
+    if isinstance(value, str):
+        return value if len(value) <= 120 else value[:117] + "..."
+    return str(value)
+
+
+def _serialize_db_entity(entity) -> dict[str, object]:
+    mapper = inspect(entity).mapper
+    payload: dict[str, object] = {"__model__": mapper.class_.__name__}
+    for attr in mapper.column_attrs:
+        key = attr.key
+        payload[key] = _safe_db_value(getattr(entity, key, None))
+    return payload
+
+
+def _log_unit_of_work(session: AsyncSession) -> None:
+    new_items = [_serialize_db_entity(obj) for obj in session.new]
+    dirty_items = [_serialize_db_entity(obj) for obj in session.dirty]
+    deleted_items = [_serialize_db_entity(obj) for obj in session.deleted]
+
+    if new_items or dirty_items or deleted_items:
+        log.debug(
+            "[to-db] unit_of_work new=%s dirty=%s deleted=%s",
+            new_items,
+            dirty_items,
+            deleted_items,
+        )
+
 @asynccontextmanager
 async def session_scope() -> AsyncSession:
     session = SessionLocal()
     try:
         yield session
+        _log_unit_of_work(session)
         await session.commit()
     except Exception:
         await session.rollback()
