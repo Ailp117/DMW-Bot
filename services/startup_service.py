@@ -23,6 +23,7 @@ EXPECTED_SLASH_COMMANDS = {
     "remote_guilds",
     "remote_cancel_all_raids",
     "remote_raidlist",
+    "remote_rebuild_memberlists",
     "template_config",
     "backup_db",
 }
