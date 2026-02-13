@@ -26,7 +26,7 @@ from db.models import REQUIRED_BOOT_TABLES
 
 
 NANOMON_IMAGE_URL = "https://wikimon.net/images/thumb/c/cc/Nanomon_New_Century.png/200px-Nanomon_New_Century.png"
-APPROVED_GIF_URL = "https://media1.tenor.com/m/l8waltLHrxcAAAAC/approved.gif"
+APPROVED_GIF_URL = "https://c.tenor.com/l8waltLHrxcAAAAC/tenor.gif"
 
 
 @dataclass(slots=True)
