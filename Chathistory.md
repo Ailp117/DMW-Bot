@@ -286,3 +286,60 @@ If a new chat should continue safely:
 
 #### Latest verified test snapshot
 - `76 passed, 1 warning in 0.48s`
+
+### Message formatting + username sync + runtime trigger policy update (2026-02-13, newest)
+
+#### Message formatting refresh (new runtime)
+- Updated raid-facing message presentation to be closer to legacy readability while keeping new architecture:
+  - `services/raidlist_service.py`
+    - Raidlist now uses structured bullet lines with icons and clickable Discord message links.
+    - Empty state text changed to localized format (`Keine offenen Raids.`).
+  - `services/raid_service.py`
+    - Participant slot posts now use a structured block:
+      - dungeon header
+      - raid id
+      - day/time
+      - participant counter
+      - user mention list
+  - `bot/runtime.py` planner embed
+    - Better section headers and vote formatting (`• **Label** — \`count\``)
+    - clearer title/description style
+    - improved footer text
+
+#### Username sync implementation (server-wide)
+- Added robust username capture and persistence into existing DB model (`user_levels.username`) without schema changes.
+- Implemented in `bot/runtime.py`:
+  - immediate sync on guild join (`force=True`)
+  - periodic background sync worker (`username_sync_worker`)
+  - realtime updates on `on_member_join` and `on_member_update`
+  - DB fallback for planner voter-name rendering when member object is not cached
+- Added throttling controls:
+  - `USERNAME_SYNC_WORKER_SLEEP_SECONDS = 10 * 60`
+  - `USERNAME_SYNC_RESCAN_SECONDS = 12 * 60 * 60`
+- Username writes are batched through existing dirty/persist flow (no forced per-event flush), reducing DB write pressure.
+
+#### Tests added/updated for this phase
+- Added: `tests/test_phase3_username_sync.py`
+  - verifies insert of usernames during guild scan
+  - verifies update on renamed members
+  - verifies planner name fallback from DB username
+- Updated: `tests/test_phase3_raidlist.py`
+  - verifies new formatted raidlist content and Discord jump URL output
+
+#### Verification snapshot after these changes
+- `pytest -q` => `79 passed, 1 warning in 0.47s`
+- `python -m compileall bot db services features utils tests` => passed
+
+#### Workflow runtime trigger policy (manual-first + watchdog)
+- Updated `.github/workflows/bot.yml` so runtime behavior matches requested operation:
+  - Push/PR do NOT auto-start runtime hosting job.
+  - Runtime starts manually via `workflow_dispatch`.
+  - 6h schedule remains present, but runs runtime only when watchdog flag is enabled.
+  - Manual dispatch toggles repo variable `BOT_RUNTIME_WATCHDOG`:
+    - `start_runtime=true` => enable watchdog + start runtime now
+    - `start_runtime=false` => disable watchdog (no runtime start)
+- Monthly dependency refresh schedule remains unchanged.
+
+#### Relevant commits recorded in this period
+- `a3865f3` — message formatting + username sync implementation/tests
+- pending commit in this step — chathistory update + workflow trigger policy update

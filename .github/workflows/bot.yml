@@ -6,11 +6,18 @@ on:
       - "**"
   pull_request:
   workflow_dispatch:
+    inputs:
+      start_runtime:
+        description: "Bot Runtime jetzt starten (true) oder Watchdog deaktivieren (false)"
+        required: false
+        type: boolean
+        default: true
   schedule:
     - cron: "0 */6 * * *"
     - cron: "17 3 28-31 * *"
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -48,9 +55,10 @@ jobs:
         run: |
           echo "Health strategy:" >> "$GITHUB_STEP_SUMMARY"
           echo "- Every push and pull request must pass pytest -q." >> "$GITHUB_STEP_SUMMARY"
-          echo "- Scheduled watchdog starts the runtime job every 6 hours." >> "$GITHUB_STEP_SUMMARY"
+          echo "- Bot runtime starts only via manual workflow dispatch." >> "$GITHUB_STEP_SUMMARY"
+          echo "- 6-hour watchdog remains disabled until first manual runtime start toggles it on." >> "$GITHUB_STEP_SUMMARY"
           echo "- Dedicated runner restarts crashed bot processes automatically." >> "$GITHUB_STEP_SUMMARY"
-          echo "- Runtime job is best-effort 24/7 within GitHub-Hosted runner limits." >> "$GITHUB_STEP_SUMMARY"
+          echo "- Runtime is best-effort while the manually started runner job is active." >> "$GITHUB_STEP_SUMMARY"
 
   update-requirements:
     name: Monthly Stable Requirements Refresh
@@ -193,11 +201,43 @@ jobs:
             echo "requirements.txt update path skipped." >> "$GITHUB_STEP_SUMMARY"
           fi
 
+  runtime-watchdog-state:
+    name: Runtime Watchdog State
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    steps:
+      - name: Set runtime watchdog variable
+        uses: actions/github-script@v7
+        env:
+          START_RUNTIME: ${{ github.event.inputs.start_runtime || 'true' }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const name = "BOT_RUNTIME_WATCHDOG";
+            const normalized = `${process.env.START_RUNTIME || "true"}`.toLowerCase();
+            const value = normalized === "true" ? "true" : "false";
+
+            try {
+              await github.rest.actions.updateRepoVariable({ owner, repo, name, value });
+            } catch (error) {
+              if (error.status === 404) {
+                await github.rest.actions.createRepoVariable({ owner, repo, name, value });
+              } else {
+                throw error;
+              }
+            }
+
+            core.summary
+              .addHeading("Runtime watchdog")
+              .addRaw(`Set ${name}=${value}`)
+              .write();
+
   bot-runtime:
     name: Bot Runtime (Best-Effort 24/7)
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && github.event.schedule == '0 */6 * * *') }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.start_runtime != 'false') || (github.event_name == 'schedule' && github.event.schedule == '0 */6 * * *' && vars.BOT_RUNTIME_WATCHDOG == 'true') }}
     concurrency:
       group: dmw-bot-runtime
       cancel-in-progress: false
