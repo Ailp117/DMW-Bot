@@ -508,6 +508,25 @@ class InMemoryRepository:
     def get_debug_cache(self, cache_key: str) -> DebugMirrorCacheRecord | None:
         return self.debug_cache.get(cache_key)
 
+    def list_debug_cache(
+        self,
+        *,
+        kind: str | None = None,
+        guild_id: int | None = None,
+        raid_id: int | None = None,
+    ) -> List[DebugMirrorCacheRecord]:
+        rows = list(self.debug_cache.values())
+        if kind is not None:
+            rows = [row for row in rows if row.kind == kind]
+        if guild_id is not None:
+            rows = [row for row in rows if int(row.guild_id) == int(guild_id)]
+        if raid_id is not None:
+            rows = [row for row in rows if row.raid_id is not None and int(row.raid_id) == int(raid_id)]
+        return rows
+
+    def delete_debug_cache(self, cache_key: str) -> None:
+        self.debug_cache.pop(cache_key, None)
+
     def get_or_create_user_level(self, guild_id: int, user_id: int, username: str | None) -> UserLevelRecord:
         key = (guild_id, user_id)
         row = self.user_levels.get(key)

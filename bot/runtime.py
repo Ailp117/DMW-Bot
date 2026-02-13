@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import importlib.machinery
 import importlib.util
 import logging
@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
 from typing import Any
 
 from bot.config import load_config
@@ -62,13 +63,26 @@ app_commands = discord.app_commands
 
 
 log = logging.getLogger("dmw.runtime")
-PRIVILEGED_USER_ID = 403988960638009347
+DEFAULT_PRIVILEGED_USER_ID = 403988960638009347
 NANOMON_IMAGE_URL = "https://wikimon.net/images/thumb/c/cc/Nanomon_New_Century.png/200px-Nanomon_New_Century.png"
 APPROVED_GIF_URL = "https://c.tenor.com/l8waltLHrxcAAAAC/tenor.gif"
 STALE_RAID_HOURS = 7 * 24
 STALE_RAID_CHECK_SECONDS = 15 * 60
 VOICE_XP_CHECK_SECONDS = 60
+LEVEL_PERSIST_WORKER_POLL_SECONDS = 5
 LOG_CHANNEL_LOGGER_NAMES = ("dmw.runtime", "dmw.db")
+FEATURE_SETTINGS_KIND = "feature_settings"
+FEATURE_SETTINGS_CACHE_PREFIX = "feature_settings"
+FEATURE_FLAG_LEVELING = 1 << 0
+FEATURE_FLAG_LEVELUP_MESSAGES = 1 << 1
+FEATURE_FLAG_NANOMON_REPLY = 1 << 2
+FEATURE_FLAG_APPROVED_REPLY = 1 << 3
+FEATURE_FLAG_MASK = 0xFF
+FEATURE_MESSAGE_XP_SHIFT = 8
+FEATURE_LEVELUP_COOLDOWN_SHIFT = 24
+FEATURE_INTERVAL_MASK = 0xFFFF
+BOT_MESSAGE_KIND = "bot_message"
+BOT_MESSAGE_CACHE_PREFIX = "botmsg"
 PRIVILEGED_ONLY_HELP_COMMANDS = frozenset(
     {
         "restart",
@@ -92,6 +106,20 @@ class MemberlistRebuildStats:
     created: int
     updated: int
     deleted: int
+
+
+@dataclass(slots=True)
+class GuildFeatureSettings:
+    leveling_enabled: bool
+    levelup_messages_enabled: bool
+    nanomon_reply_enabled: bool
+    approved_reply_enabled: bool
+    message_xp_interval_seconds: int
+    levelup_message_cooldown_seconds: int
+
+
+def _on_off(value: bool) -> str:
+    return "an" if value else "aus"
 
 
 def _is_response_error(exc: Exception) -> bool:
@@ -203,8 +231,13 @@ def _member_name(member: Any) -> str | None:
 
 
 async def _is_admin_or_privileged(interaction) -> bool:
-    user_id = getattr(interaction.user, "id", None)
-    if user_id == PRIVILEGED_USER_ID:
+    user_id = getattr(getattr(interaction, "user", None), "id", None)
+    client = getattr(interaction, "client", None)
+    if user_id is not None and client is not None:
+        check_fn = getattr(client, "_is_privileged_user", None)
+        if callable(check_fn) and check_fn(user_id):
+            return True
+    if user_id == DEFAULT_PRIVILEGED_USER_ID:
         return True
     perms = getattr(interaction.user, "guild_permissions", None)
     return bool(perms and getattr(perms, "administrator", False))
@@ -214,15 +247,15 @@ def _admin_or_privileged_check():
     return app_commands.check(_is_admin_or_privileged)
 
 
-def _settings_embed(settings, guild_name: str):
+def _settings_embed(settings, guild_name: str, feature_settings: GuildFeatureSettings | None = None):
     embed = discord.Embed(title=f"Settings: {guild_name}", color=discord.Color.blurple())
     embed.add_field(
-        name="Planner Channel",
+        name="Umfragen Channel",
         value=f"`{settings.planner_channel_id}`" if settings.planner_channel_id else "nicht gesetzt",
         inline=False,
     )
     embed.add_field(
-        name="Participants Channel",
+        name="Raid Teilnehmerlisten Channel",
         value=f"`{settings.participants_channel_id}`" if settings.participants_channel_id else "nicht gesetzt",
         inline=False,
     )
@@ -233,7 +266,38 @@ def _settings_embed(settings, guild_name: str):
     )
     embed.add_field(name="Default Min Players", value=str(settings.default_min_players), inline=True)
     embed.add_field(name="Templates Enabled", value="ja" if settings.templates_enabled else "nein", inline=True)
-    embed.set_footer(text="Channel-Auswahl unten aendern und speichern.")
+    if feature_settings is not None:
+        embed.add_field(
+            name="Levelsystem",
+            value=_on_off(feature_settings.leveling_enabled),
+            inline=True,
+        )
+        embed.add_field(
+            name="Levelup Nachrichten",
+            value=_on_off(feature_settings.levelup_messages_enabled),
+            inline=True,
+        )
+        embed.add_field(
+            name="Nanomon Reply",
+            value=_on_off(feature_settings.nanomon_reply_enabled),
+            inline=True,
+        )
+        embed.add_field(
+            name="Approved Reply",
+            value=_on_off(feature_settings.approved_reply_enabled),
+            inline=True,
+        )
+        embed.add_field(
+            name="Message XP Intervall (s)",
+            value=str(int(feature_settings.message_xp_interval_seconds)),
+            inline=True,
+        )
+        embed.add_field(
+            name="Levelup Cooldown (s)",
+            value=str(int(feature_settings.levelup_message_cooldown_seconds)),
+            inline=True,
+        )
+    embed.set_footer(text="Settings unten konfigurieren und speichern.")
     return embed
 
 
@@ -332,29 +396,155 @@ class RaidCreateModal(discord.ui.Modal, title="Raid erstellen"):
         )
 
 
+class SettingsIntervalsModal(discord.ui.Modal, title="Allgemeine Feature Settings"):
+    message_xp_interval = discord.ui.TextInput(
+        label="Message XP Intervall (Sekunden)",
+        required=True,
+        max_length=5,
+    )
+    levelup_cooldown = discord.ui.TextInput(
+        label="Levelup Cooldown (Sekunden)",
+        required=True,
+        max_length=5,
+    )
+
+    def __init__(self, bot: "RewriteDiscordBot", view: "SettingsView"):
+        super().__init__()
+        self.bot = bot
+        self._view_ref = view
+        self.message_xp_interval.default = str(int(view.message_xp_interval_seconds))
+        self.levelup_cooldown.default = str(int(view.levelup_message_cooldown_seconds))
+
+    async def on_submit(self, interaction):
+        view = self._view_ref
+        if not isinstance(view, SettingsView):
+            await self.bot._reply(interaction, "Settings View nicht verfuegbar.", ephemeral=True)
+            return
+        if not interaction.guild or interaction.guild.id != view.guild_id:
+            await self.bot._reply(interaction, "Ungueltiger Guild-Kontext.", ephemeral=True)
+            return
+
+        try:
+            message_interval = int(str(self.message_xp_interval.value).strip())
+            levelup_cooldown = int(str(self.levelup_cooldown.value).strip())
+        except ValueError:
+            await self.bot._reply(interaction, "Bitte gueltige Zahlen eingeben.", ephemeral=True)
+            return
+
+        if message_interval < 1 or levelup_cooldown < 1:
+            await self.bot._reply(interaction, "Werte muessen >= 1 sein.", ephemeral=True)
+            return
+        if message_interval > FEATURE_INTERVAL_MASK or levelup_cooldown > FEATURE_INTERVAL_MASK:
+            await self.bot._reply(
+                interaction,
+                f"Werte muessen <= {FEATURE_INTERVAL_MASK} sein.",
+                ephemeral=True,
+            )
+            return
+
+        view.message_xp_interval_seconds = message_interval
+        view.levelup_message_cooldown_seconds = levelup_cooldown
+        await self.bot._reply(interaction, "Intervall-Einstellungen vorgemerkt.", ephemeral=True)
+
+
+class SettingsToggleButton(discord.ui.Button):
+    def __init__(
+        self,
+        bot: "RewriteDiscordBot",
+        *,
+        guild_id: int,
+        attr_name: str,
+        label_prefix: str,
+    ):
+        super().__init__(style=discord.ButtonStyle.secondary, label=label_prefix, row=3)
+        self.bot = bot
+        self.guild_id = guild_id
+        self.attr_name = attr_name
+        self.label_prefix = label_prefix
+
+    def _refresh_appearance(self, view: "SettingsView") -> None:
+        value = bool(getattr(view, self.attr_name))
+        self.style = discord.ButtonStyle.success if value else discord.ButtonStyle.danger
+        self.label = f"{self.label_prefix}: {'AN' if value else 'AUS'}"
+
+    async def callback(self, interaction):
+        if not interaction.guild or interaction.guild.id != self.guild_id:
+            await self.bot._reply(interaction, "Ungueltiger Guild-Kontext.", ephemeral=True)
+            return
+
+        view = self.view
+        if not isinstance(view, SettingsView):
+            await self.bot._reply(interaction, "Settings View nicht verfuegbar.", ephemeral=True)
+            return
+
+        current = bool(getattr(view, self.attr_name))
+        setattr(view, self.attr_name, not current)
+        self._refresh_appearance(view)
+        await _safe_edit_message(interaction.message, view=view)
+        await self.bot._reply(
+            interaction,
+            f"{self.label_prefix} ist jetzt {'aktiviert' if not current else 'deaktiviert'}.",
+            ephemeral=True,
+        )
+
+
+class SettingsIntervalsButton(discord.ui.Button):
+    def __init__(self, bot: "RewriteDiscordBot", *, guild_id: int):
+        super().__init__(
+            style=discord.ButtonStyle.primary,
+            label="Intervalle einstellen",
+            custom_id=f"settings:{guild_id}:intervals",
+            row=4,
+        )
+        self.bot = bot
+        self.guild_id = guild_id
+
+    async def callback(self, interaction):
+        if not interaction.guild or interaction.guild.id != self.guild_id:
+            await self.bot._reply(interaction, "Ungueltiger Guild-Kontext.", ephemeral=True)
+            return
+        view = self.view
+        if not isinstance(view, SettingsView):
+            await self.bot._reply(interaction, "Settings View nicht verfuegbar.", ephemeral=True)
+            return
+        try:
+            await interaction.response.send_modal(SettingsIntervalsModal(self.bot, view))
+        except Exception:
+            await self.bot._reply(interaction, "Modal konnte nicht geoeffnet werden.", ephemeral=True)
+
+
 class SettingsView(discord.ui.View):
     def __init__(self, bot: "RewriteDiscordBot", *, guild_id: int):
         super().__init__(timeout=300)
         self.bot = bot
         self.guild_id = guild_id
         settings = bot.repo.ensure_settings(guild_id)
+        feature_settings = bot._get_guild_feature_settings(guild_id)
         self.planner_channel_id: int | None = settings.planner_channel_id
         self.participants_channel_id: int | None = settings.participants_channel_id
         self.raidlist_channel_id: int | None = settings.raidlist_channel_id
+        self.leveling_enabled: bool = feature_settings.leveling_enabled
+        self.levelup_messages_enabled: bool = feature_settings.levelup_messages_enabled
+        self.nanomon_reply_enabled: bool = feature_settings.nanomon_reply_enabled
+        self.approved_reply_enabled: bool = feature_settings.approved_reply_enabled
+        self.message_xp_interval_seconds: int = feature_settings.message_xp_interval_seconds
+        self.levelup_message_cooldown_seconds: int = feature_settings.levelup_message_cooldown_seconds
 
         planner_select = discord.ui.ChannelSelect(
-            placeholder="Planner Channel waehlen",
+            placeholder="Umfragen Channel waehlen",
             channel_types=[discord.ChannelType.text, discord.ChannelType.news],
             min_values=0,
             max_values=1,
             custom_id=f"settings:{guild_id}:planner",
+            row=0,
         )
         participants_select = discord.ui.ChannelSelect(
-            placeholder="Participants Channel waehlen",
+            placeholder="Raid Teilnehmerlisten Channel waehlen",
             channel_types=[discord.ChannelType.text, discord.ChannelType.news],
             min_values=0,
             max_values=1,
             custom_id=f"settings:{guild_id}:participants",
+            row=1,
         )
         raidlist_select = discord.ui.ChannelSelect(
             placeholder="Raidlist Channel waehlen",
@@ -362,6 +552,7 @@ class SettingsView(discord.ui.View):
             min_values=0,
             max_values=1,
             custom_id=f"settings:{guild_id}:raidlist",
+            row=2,
         )
 
         planner_select.callback = self._on_planner_select
@@ -371,19 +562,51 @@ class SettingsView(discord.ui.View):
         self.add_item(planner_select)
         self.add_item(participants_select)
         self.add_item(raidlist_select)
+
+        toggle_items = [
+            SettingsToggleButton(
+                bot,
+                guild_id=guild_id,
+                attr_name="leveling_enabled",
+                label_prefix="Levelsystem",
+            ),
+            SettingsToggleButton(
+                bot,
+                guild_id=guild_id,
+                attr_name="levelup_messages_enabled",
+                label_prefix="Levelup Msg",
+            ),
+            SettingsToggleButton(
+                bot,
+                guild_id=guild_id,
+                attr_name="nanomon_reply_enabled",
+                label_prefix="Nanomon Reply",
+            ),
+            SettingsToggleButton(
+                bot,
+                guild_id=guild_id,
+                attr_name="approved_reply_enabled",
+                label_prefix="Approved Reply",
+            ),
+        ]
+        for item in toggle_items:
+            item._refresh_appearance(self)
+            self.add_item(item)
+
+        self.add_item(SettingsIntervalsButton(bot, guild_id=guild_id))
         self.add_item(SettingsSaveButton(bot, guild_id))
 
     async def _on_planner_select(self, interaction):
         selected = ((interaction.data or {}).get("values") or [])
         self.planner_channel_id = int(selected[0]) if selected else None
         await self.bot._defer(interaction, ephemeral=True)
-        await _safe_followup(interaction, "Planner Channel vorgemerkt.", ephemeral=True)
+        await _safe_followup(interaction, "Umfragen Channel vorgemerkt.", ephemeral=True)
 
     async def _on_participants_select(self, interaction):
         selected = ((interaction.data or {}).get("values") or [])
         self.participants_channel_id = int(selected[0]) if selected else None
         await self.bot._defer(interaction, ephemeral=True)
-        await _safe_followup(interaction, "Participants Channel vorgemerkt.", ephemeral=True)
+        await _safe_followup(interaction, "Raid Teilnehmerlisten Channel vorgemerkt.", ephemeral=True)
 
     async def _on_raidlist_select(self, interaction):
         selected = ((interaction.data or {}).get("values") or [])
@@ -398,6 +621,7 @@ class SettingsSaveButton(discord.ui.Button):
             style=discord.ButtonStyle.success,
             label="Speichern",
             custom_id=f"settings:{guild_id}:save",
+            row=4,
         )
         self.bot = bot
         self.guild_id = guild_id
@@ -422,6 +646,17 @@ class SettingsSaveButton(discord.ui.Button):
                 participants_channel_id=view.participants_channel_id,
                 raidlist_channel_id=view.raidlist_channel_id,
             )
+            feature_row = self.bot._set_guild_feature_settings(
+                interaction.guild.id,
+                GuildFeatureSettings(
+                    leveling_enabled=view.leveling_enabled,
+                    levelup_messages_enabled=view.levelup_messages_enabled,
+                    nanomon_reply_enabled=view.nanomon_reply_enabled,
+                    approved_reply_enabled=view.approved_reply_enabled,
+                    message_xp_interval_seconds=view.message_xp_interval_seconds,
+                    levelup_message_cooldown_seconds=view.levelup_message_cooldown_seconds,
+                ),
+            )
             await self.bot._refresh_raidlist_for_guild(interaction.guild.id, force=True)
             persisted = await self.bot._persist()
 
@@ -432,9 +667,15 @@ class SettingsSaveButton(discord.ui.Button):
             interaction,
             (
                 "Settings gespeichert:\n"
-                f"Planner: `{row.planner_channel_id}`\n"
-                f"Participants: `{row.participants_channel_id}`\n"
-                f"Raidlist: `{row.raidlist_channel_id}`"
+                f"Umfragen: `{row.planner_channel_id}`\n"
+                f"Teilnehmerlisten: `{row.participants_channel_id}`\n"
+                f"Raidlist: `{row.raidlist_channel_id}`\n"
+                f"Levelsystem: `{_on_off(feature_row.leveling_enabled)}`\n"
+                f"Levelup Msg: `{_on_off(feature_row.levelup_messages_enabled)}`\n"
+                f"Nanomon Reply: `{_on_off(feature_row.nanomon_reply_enabled)}`\n"
+                f"Approved Reply: `{_on_off(feature_row.approved_reply_enabled)}`\n"
+                f"Message XP Intervall: `{feature_row.message_xp_interval_seconds}`\n"
+                f"Levelup Cooldown: `{feature_row.levelup_message_cooldown_seconds}`"
             ),
             ephemeral=True,
         )
@@ -574,8 +815,12 @@ class RewriteDiscordBot(discord.Client):
 
         self._ack_lock = asyncio.Lock()
         self._state_lock = asyncio.Lock()
+        self._application_owner_ids: set[int] = set()
+        self._guild_feature_settings: dict[int, GuildFeatureSettings] = {}
         self._acked_interactions: set[int] = set()
         self._raidlist_hash_by_guild: dict[int, str] = {}
+        self._level_state_dirty = False
+        self._last_level_persist_monotonic = time.monotonic()
         self._discord_log_handler = self._build_discord_log_handler()
         self._discord_loggers: list[logging.Logger] = []
         self._attach_discord_log_handler()
@@ -621,6 +866,8 @@ class RewriteDiscordBot(discord.Client):
             log.info("Restored %s persistent raid vote views", restored)
 
     async def on_ready(self) -> None:
+        await self._refresh_application_owner_ids()
+
         if not self._commands_synced:
             synced: list[int] = []
             for guild in self.guilds:
@@ -661,7 +908,7 @@ class RewriteDiscordBot(discord.Client):
     async def _restore_runtime_messages(self) -> None:
         for raid in list(self.repo.list_open_raids()):
             await self._refresh_planner_message(raid.id)
-            await self._sync_memberlist_messages_for_raid(raid.id)
+            await self._sync_memberlist_messages_for_raid(raid.id, recreate_existing=True)
         await self._refresh_raidlists_for_all_guilds(force=True)
         await self._persist()
 
@@ -679,6 +926,7 @@ class RewriteDiscordBot(discord.Client):
     def _start_background_loops(self) -> None:
         self.task_registry.start_once("stale_raid_worker", self._stale_raid_worker)
         self.task_registry.start_once("voice_xp_worker", self._voice_xp_worker)
+        self.task_registry.start_once("level_persist_worker", self._level_persist_worker)
         self.task_registry.start_once("self_test_worker", self._self_test_worker)
         self.task_registry.start_once("backup_worker", self._backup_worker)
         self.task_registry.start_once("log_forwarder_worker", self._log_forwarder_worker)
@@ -696,6 +944,7 @@ class RewriteDiscordBot(discord.Client):
 
     async def on_guild_remove(self, guild) -> None:
         async with self._state_lock:
+            self._guild_feature_settings.pop(int(guild.id), None)
             self.repo.purge_guild_data(guild.id)
             await self._persist()
 
@@ -714,31 +963,69 @@ class RewriteDiscordBot(discord.Client):
                 return
 
         if message.guild is not None:
-            async with self._state_lock:
-                result = self.leveling_service.update_message_xp(
-                    self.repo,
-                    guild_id=message.guild.id,
-                    user_id=message.author.id,
-                    username=_member_name(message.author),
-                )
-                await self._persist()
-            if result.current_level > result.previous_level:
-                try:
-                    await message.channel.send(
-                        f"🎉 {message.author.mention} ist auf **Level {result.current_level}** aufgestiegen! "
-                        f"(XP: {result.xp})"
+            feature_settings = self._get_guild_feature_settings(message.guild.id)
+            now = datetime.now(UTC)
+            if feature_settings.leveling_enabled:
+                async with self._state_lock:
+                    result = self.leveling_service.update_message_xp(
+                        self.repo,
+                        guild_id=message.guild.id,
+                        user_id=message.author.id,
+                        username=_member_name(message.author),
+                        now=now,
+                        min_award_interval=timedelta(
+                            seconds=max(1, int(feature_settings.message_xp_interval_seconds))
+                        ),
                     )
-                except Exception:
-                    log.exception("Failed to send level-up message")
+                    if result.xp_awarded:
+                        self._level_state_dirty = True
+                if (
+                    feature_settings.levelup_messages_enabled
+                    and result.xp_awarded
+                    and result.current_level > result.previous_level
+                ):
+                    should_announce = self.leveling_service.should_announce_levelup(
+                        guild_id=message.guild.id,
+                        user_id=message.author.id,
+                        level=result.current_level,
+                        now=now,
+                        min_announce_interval=timedelta(
+                            seconds=max(1, int(feature_settings.levelup_message_cooldown_seconds))
+                        ),
+                    )
+                    if should_announce:
+                        try:
+                            await self._send_channel_message(
+                                message.channel,
+                                content=(
+                                f"🎉 {message.author.mention} ist auf **Level {result.current_level}** aufgestiegen! "
+                                f"(XP: {result.xp})"
+                                ),
+                            )
+                        except Exception:
+                            log.exception("Failed to send level-up message")
 
-        if contains_nanomon_keyword(message.content):
+        guild_feature_settings = self._get_guild_feature_settings(message.guild.id) if message.guild is not None else None
+        if (
+            guild_feature_settings is not None
+            and guild_feature_settings.nanomon_reply_enabled
+            and contains_nanomon_keyword(message.content)
+        ):
             try:
-                await message.reply(NANOMON_IMAGE_URL, mention_author=False)
+                posted = await message.reply(NANOMON_IMAGE_URL, mention_author=False)
+                if posted is not None:
+                    self._track_bot_message(posted)
             except Exception:
                 log.exception("Failed to send nanomon reply")
-        if contains_approved_keyword(message.content):
+        if (
+            guild_feature_settings is not None
+            and guild_feature_settings.approved_reply_enabled
+            and contains_approved_keyword(message.content)
+        ):
             try:
-                await message.reply(APPROVED_GIF_URL, mention_author=False)
+                posted = await message.reply(APPROVED_GIF_URL, mention_author=False)
+                if posted is not None:
+                    self._track_bot_message(posted)
             except Exception:
                 log.exception("Failed to send approved reply")
 
@@ -762,7 +1049,7 @@ class RewriteDiscordBot(discord.Client):
         if command != "restart":
             return False
         try:
-            await message.channel.send("♻️ Neustart wird eingeleitet ...")
+            await self._send_channel_message(message.channel, content="♻️ Neustart wird eingeleitet ...")
         except Exception:
             pass
         await self.close()
@@ -830,7 +1117,7 @@ class RewriteDiscordBot(discord.Client):
             if channel is None:
                 continue
             try:
-                await channel.send(f"```\n{message}\n```")
+                await self._send_channel_message(channel, content=f"```\n{message}\n```")
             except Exception:
                 continue
 
@@ -894,6 +1181,9 @@ class RewriteDiscordBot(discord.Client):
             now = datetime.now(UTC)
             async with self._state_lock:
                 for guild in self.guilds:
+                    feature_settings = self._get_guild_feature_settings(guild.id)
+                    if not feature_settings.leveling_enabled:
+                        continue
                     for voice_channel in guild.voice_channels:
                         for member in voice_channel.members:
                             if member.bot:
@@ -907,8 +1197,30 @@ class RewriteDiscordBot(discord.Client):
                             )
                             changed = changed or awarded
                 if changed:
-                    await self._persist()
+                    self._level_state_dirty = True
             await asyncio.sleep(VOICE_XP_CHECK_SECONDS)
+
+    async def _flush_level_state_if_due(self, *, force: bool = False) -> bool:
+        if not self._level_state_dirty:
+            return True
+        interval = max(5, int(self.config.level_persist_interval_seconds))
+        now = time.monotonic()
+        if not force and (now - self._last_level_persist_monotonic) < interval:
+            return False
+
+        persisted = await self._persist()
+        if persisted:
+            self._level_state_dirty = False
+            self._last_level_persist_monotonic = now
+            return True
+        return False
+
+    async def _level_persist_worker(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            await asyncio.sleep(LEVEL_PERSIST_WORKER_POLL_SECONDS)
+            async with self._state_lock:
+                await self._flush_level_state_if_due()
 
     async def _cleanup_stale_raids_once(self) -> int:
         cutoff_hours = STALE_RAID_HOURS
@@ -1010,6 +1322,153 @@ class RewriteDiscordBot(discord.Client):
         names = sorted(cmd.name for cmd in self.tree.get_commands())
         return [name for name in names if name not in PRIVILEGED_ONLY_HELP_COMMANDS]
 
+    def _default_guild_feature_settings(self) -> GuildFeatureSettings:
+        return GuildFeatureSettings(
+            leveling_enabled=True,
+            levelup_messages_enabled=True,
+            nanomon_reply_enabled=True,
+            approved_reply_enabled=True,
+            message_xp_interval_seconds=max(1, int(self.config.message_xp_interval_seconds)),
+            levelup_message_cooldown_seconds=max(1, int(self.config.levelup_message_cooldown_seconds)),
+        )
+
+    @staticmethod
+    def _feature_settings_cache_key(guild_id: int) -> str:
+        return f"{FEATURE_SETTINGS_CACHE_PREFIX}:{int(guild_id)}"
+
+    @staticmethod
+    def _pack_feature_settings(settings: GuildFeatureSettings) -> int:
+        flags = 0
+        if settings.leveling_enabled:
+            flags |= FEATURE_FLAG_LEVELING
+        if settings.levelup_messages_enabled:
+            flags |= FEATURE_FLAG_LEVELUP_MESSAGES
+        if settings.nanomon_reply_enabled:
+            flags |= FEATURE_FLAG_NANOMON_REPLY
+        if settings.approved_reply_enabled:
+            flags |= FEATURE_FLAG_APPROVED_REPLY
+
+        message_interval = max(1, min(FEATURE_INTERVAL_MASK, int(settings.message_xp_interval_seconds)))
+        levelup_cooldown = max(1, min(FEATURE_INTERVAL_MASK, int(settings.levelup_message_cooldown_seconds)))
+
+        return (
+            (flags & FEATURE_FLAG_MASK)
+            | (message_interval << FEATURE_MESSAGE_XP_SHIFT)
+            | (levelup_cooldown << FEATURE_LEVELUP_COOLDOWN_SHIFT)
+        )
+
+    def _unpack_feature_settings(self, packed: int, defaults: GuildFeatureSettings) -> GuildFeatureSettings:
+        value = int(packed)
+        flags = value & FEATURE_FLAG_MASK
+        raw_message_interval = (value >> FEATURE_MESSAGE_XP_SHIFT) & FEATURE_INTERVAL_MASK
+        raw_levelup_cooldown = (value >> FEATURE_LEVELUP_COOLDOWN_SHIFT) & FEATURE_INTERVAL_MASK
+
+        message_interval = raw_message_interval if raw_message_interval > 0 else defaults.message_xp_interval_seconds
+        levelup_cooldown = (
+            raw_levelup_cooldown if raw_levelup_cooldown > 0 else defaults.levelup_message_cooldown_seconds
+        )
+
+        return GuildFeatureSettings(
+            leveling_enabled=bool(flags & FEATURE_FLAG_LEVELING),
+            levelup_messages_enabled=bool(flags & FEATURE_FLAG_LEVELUP_MESSAGES),
+            nanomon_reply_enabled=bool(flags & FEATURE_FLAG_NANOMON_REPLY),
+            approved_reply_enabled=bool(flags & FEATURE_FLAG_APPROVED_REPLY),
+            message_xp_interval_seconds=max(1, int(message_interval)),
+            levelup_message_cooldown_seconds=max(1, int(levelup_cooldown)),
+        )
+
+    @staticmethod
+    def _feature_settings_payload(settings: GuildFeatureSettings) -> str:
+        return (
+            f"leveling={int(settings.leveling_enabled)}|"
+            f"levelup_messages={int(settings.levelup_messages_enabled)}|"
+            f"nanomon={int(settings.nanomon_reply_enabled)}|"
+            f"approved={int(settings.approved_reply_enabled)}|"
+            f"xp_interval={int(settings.message_xp_interval_seconds)}|"
+            f"levelup_cooldown={int(settings.levelup_message_cooldown_seconds)}"
+        )
+
+    def _get_guild_feature_settings(self, guild_id: int) -> GuildFeatureSettings:
+        normalized_guild_id = int(guild_id)
+        cached = self._guild_feature_settings.get(normalized_guild_id)
+        if cached is not None:
+            return cached
+
+        defaults = self._default_guild_feature_settings()
+        row = self.repo.get_debug_cache(self._feature_settings_cache_key(normalized_guild_id))
+        if row is None or row.kind != FEATURE_SETTINGS_KIND:
+            self._guild_feature_settings[normalized_guild_id] = defaults
+            return defaults
+
+        try:
+            loaded = self._unpack_feature_settings(int(row.message_id), defaults)
+        except Exception:
+            loaded = defaults
+        self._guild_feature_settings[normalized_guild_id] = loaded
+        return loaded
+
+    def _set_guild_feature_settings(self, guild_id: int, settings: GuildFeatureSettings) -> GuildFeatureSettings:
+        normalized_guild_id = int(guild_id)
+        defaults = self._default_guild_feature_settings()
+        packed = self._pack_feature_settings(settings)
+        normalized = self._unpack_feature_settings(packed, defaults)
+        packed = self._pack_feature_settings(normalized)
+        payload_hash = sha256_text(self._feature_settings_payload(normalized))
+
+        self.repo.upsert_debug_cache(
+            cache_key=self._feature_settings_cache_key(normalized_guild_id),
+            kind=FEATURE_SETTINGS_KIND,
+            guild_id=normalized_guild_id,
+            raid_id=None,
+            message_id=packed,
+            payload_hash=payload_hash,
+        )
+        self._guild_feature_settings[normalized_guild_id] = normalized
+        return normalized
+
+    async def _refresh_application_owner_ids(self) -> None:
+        if self._application_owner_ids:
+            return
+        try:
+            app_info = await self.application_info()
+        except Exception:
+            log.exception("Failed to load application owner IDs for privileged checks.")
+            return
+
+        owner_ids: set[int] = set()
+        owner = getattr(app_info, "owner", None)
+        owner_id = getattr(owner, "id", None)
+        if owner_id is not None:
+            owner_ids.add(int(owner_id))
+
+        team = getattr(app_info, "team", None)
+        members = getattr(team, "members", None) if team is not None else None
+        if members:
+            for member in members:
+                member_id = getattr(member, "id", None)
+                if member_id is not None:
+                    owner_ids.add(int(member_id))
+
+        self._application_owner_ids = owner_ids
+        log.info(
+            "Privileged access configured_user_id=%s owner_ids=%s",
+            int(getattr(self.config, "privileged_user_id", DEFAULT_PRIVILEGED_USER_ID)),
+            sorted(owner_ids),
+        )
+
+    def _is_privileged_user(self, user_id: int | None) -> bool:
+        if user_id is None:
+            return False
+        try:
+            parsed_user_id = int(user_id)
+        except (TypeError, ValueError):
+            return False
+
+        configured = int(getattr(self.config, "privileged_user_id", DEFAULT_PRIVILEGED_USER_ID))
+        if parsed_user_id == configured:
+            return True
+        return parsed_user_id in self._application_owner_ids
+
     def _current_bot_user_id(self) -> int:
         connection = getattr(self, "_connection", None)
         user = getattr(connection, "user", None) if connection is not None else None
@@ -1020,6 +1479,53 @@ class RewriteDiscordBot(discord.Client):
             return int(raw_user_id)
         except (TypeError, ValueError):
             return 0
+
+    @staticmethod
+    def _bot_message_cache_key(guild_id: int, channel_id: int, bot_user_id: int, message_id: int) -> str:
+        return (
+            f"{BOT_MESSAGE_CACHE_PREFIX}:{int(guild_id)}:{int(channel_id)}:"
+            f"{int(bot_user_id)}:{int(message_id)}"
+        )
+
+    def _track_bot_message(self, message: Any) -> None:
+        message_id = int(getattr(message, "id", 0) or 0)
+        if message_id <= 0:
+            return
+
+        channel = getattr(message, "channel", None)
+        channel_id = int(getattr(channel, "id", 0) or 0)
+        if channel_id <= 0:
+            return
+
+        guild = getattr(message, "guild", None)
+        if guild is None and channel is not None:
+            guild = getattr(channel, "guild", None)
+        guild_id = int(getattr(guild, "id", 0) or 0)
+        if guild_id <= 0:
+            return
+
+        author = getattr(message, "author", None)
+        bot_user_id = int(getattr(author, "id", 0) or 0)
+        if bot_user_id <= 0:
+            bot_user_id = self._current_bot_user_id()
+        if bot_user_id <= 0:
+            return
+
+        payload_hash = sha256_text(f"{bot_user_id}:{message_id}")
+        self.repo.upsert_debug_cache(
+            cache_key=self._bot_message_cache_key(guild_id, channel_id, bot_user_id, message_id),
+            kind=BOT_MESSAGE_KIND,
+            guild_id=guild_id,
+            raid_id=channel_id,
+            message_id=message_id,
+            payload_hash=payload_hash,
+        )
+
+    async def _send_channel_message(self, channel: Any, **kwargs: Any) -> Any | None:
+        posted = await _safe_send_channel_message(channel, **kwargs)
+        if posted is not None:
+            self._track_bot_message(posted)
+        return posted
 
     def _resolve_remote_target_by_name(self, raw_value: str) -> tuple[int | None, str | None]:
         value = (raw_value or "").strip()
@@ -1123,7 +1629,7 @@ class RewriteDiscordBot(discord.Client):
                     )
                     return
 
-        posted = await _safe_send_channel_message(channel, content=payload)
+        posted = await self._send_channel_message(channel, content=payload)
         if posted is None:
             return
         self.repo.upsert_debug_cache(
@@ -1212,7 +1718,7 @@ class RewriteDiscordBot(discord.Client):
                 if edited:
                     return existing
 
-        posted = await _safe_send_channel_message(channel, embed=embed, view=view)
+        posted = await self._send_channel_message(channel, embed=embed, view=view)
         if posted is None:
             return None
         self.repo.set_raid_message_id(raid.id, posted.id)
@@ -1255,29 +1761,140 @@ class RewriteDiscordBot(discord.Client):
             return False
         return await _safe_delete_message(message)
 
-    async def _delete_bot_messages_in_channel(self, channel: Any, *, history_limit: int = 5000) -> int:
+    def _indexed_bot_message_ids_for_channel(self, guild_id: int, channel_id: int) -> set[int]:
+        message_ids: set[int] = set()
+        for raid in self.repo.list_open_raids(guild_id):
+            if raid.channel_id == channel_id and raid.message_id:
+                message_ids.add(int(raid.message_id))
+
+        for row in self.repo.raid_posted_slots.values():
+            if row.channel_id == channel_id and row.message_id:
+                message_ids.add(int(row.message_id))
+
+        settings = self.repo.settings.get(int(guild_id))
+        if settings and settings.raidlist_channel_id == channel_id and settings.raidlist_message_id:
+            message_ids.add(int(settings.raidlist_message_id))
+
+        for row in self.repo.list_debug_cache(kind=BOT_MESSAGE_KIND, guild_id=guild_id, raid_id=channel_id):
+            if row.message_id:
+                message_ids.add(int(row.message_id))
+        return message_ids
+
+    def _clear_bot_message_index_for_id(self, *, guild_id: int, channel_id: int, message_id: int) -> None:
+        bot_user_id = self._current_bot_user_id()
+        cache_key = self._bot_message_cache_key(guild_id, channel_id, bot_user_id, message_id)
+        self.repo.delete_debug_cache(cache_key)
+
+    def _clear_known_message_refs_for_id(self, *, guild_id: int, channel_id: int, message_id: int) -> None:
+        for raid in self.repo.list_open_raids(guild_id):
+            if raid.channel_id == channel_id and int(raid.message_id or 0) == int(message_id):
+                raid.message_id = None
+
+        for row in self.repo.raid_posted_slots.values():
+            if row.channel_id == channel_id and int(row.message_id or 0) == int(message_id):
+                row.message_id = None
+
+        settings = self.repo.settings.get(int(guild_id))
+        if (
+            settings is not None
+            and settings.raidlist_channel_id == channel_id
+            and int(settings.raidlist_message_id or 0) == int(message_id)
+        ):
+            settings.raidlist_message_id = None
+
+    async def _delete_indexed_bot_messages_in_channel(self, channel: Any, *, history_limit: int = 5000) -> int:
+        guild = getattr(channel, "guild", None)
+        guild_id = int(getattr(guild, "id", 0) or 0)
+        channel_id = int(getattr(channel, "id", 0) or 0)
+        if guild_id <= 0 or channel_id <= 0:
+            return 0
+
         bot_user_id = self._current_bot_user_id()
         if bot_user_id <= 0:
             return 0
 
         limit = max(1, min(5000, int(history_limit)))
-        deleted = 0
-        history = getattr(channel, "history", None)
-        if history is None:
+        indexed_ids = self._indexed_bot_message_ids_for_channel(guild_id, channel_id)
+        if not indexed_ids:
             return 0
 
-        try:
-            async for message in history(limit=limit):
-                if getattr(getattr(message, "author", None), "id", None) != bot_user_id:
+        deleted = 0
+        for message_id in sorted(indexed_ids, reverse=True)[:limit]:
+            try:
+                message = await _safe_fetch_message(channel, int(message_id))
+                if message is None:
+                    self._clear_bot_message_index_for_id(guild_id=guild_id, channel_id=channel_id, message_id=message_id)
+                    self._clear_known_message_refs_for_id(guild_id=guild_id, channel_id=channel_id, message_id=message_id)
                     continue
+
+                author_id = int(getattr(getattr(message, "author", None), "id", 0) or 0)
+                if author_id > 0 and author_id != bot_user_id:
+                    self._clear_bot_message_index_for_id(guild_id=guild_id, channel_id=channel_id, message_id=message_id)
+                    continue
+
                 if await _safe_delete_message(message):
                     deleted += 1
+                self._clear_bot_message_index_for_id(guild_id=guild_id, channel_id=channel_id, message_id=message_id)
+                self._clear_known_message_refs_for_id(guild_id=guild_id, channel_id=channel_id, message_id=message_id)
+            except Exception:
+                log.exception(
+                    "Failed indexed bot-message delete channel_id=%s message_id=%s",
+                    channel_id,
+                    int(message_id),
+                )
+                self._clear_bot_message_index_for_id(guild_id=guild_id, channel_id=channel_id, message_id=message_id)
+        return deleted
+
+    async def _delete_bot_messages_in_channel(
+        self,
+        channel: Any,
+        *,
+        history_limit: int = 5000,
+        scan_history: bool = True,
+    ) -> int:
+        bot_user_id = self._current_bot_user_id()
+        if bot_user_id <= 0:
+            return 0
+
+        limit = max(1, min(5000, int(history_limit)))
+        deleted = await self._delete_indexed_bot_messages_in_channel(channel, history_limit=limit)
+        if not scan_history or deleted >= limit:
+            return min(limit, deleted)
+
+        remaining = max(0, limit - deleted)
+        if remaining <= 0:
+            return min(limit, deleted)
+
+        history = getattr(channel, "history", None)
+        if history is None:
+            return min(limit, deleted)
+
+        guild_id = int(getattr(getattr(channel, "guild", None), "id", 0) or 0)
+        channel_id = int(getattr(channel, "id", 0) or 0)
+        try:
+            async for message in history(limit=remaining):
+                if getattr(getattr(message, "author", None), "id", None) != bot_user_id:
+                    continue
+                message_id = int(getattr(message, "id", 0) or 0)
+                if await _safe_delete_message(message):
+                    deleted += 1
+                if guild_id > 0 and channel_id > 0 and message_id > 0:
+                    self._clear_bot_message_index_for_id(
+                        guild_id=guild_id,
+                        channel_id=channel_id,
+                        message_id=message_id,
+                    )
+                    self._clear_known_message_refs_for_id(
+                        guild_id=guild_id,
+                        channel_id=channel_id,
+                        message_id=message_id,
+                    )
         except Exception:
             log.exception(
                 "Failed to sweep bot-authored messages in channel_id=%s",
                 getattr(channel, "id", None),
             )
-        return deleted
+        return min(limit, deleted)
 
     async def _rebuild_memberlists_for_guild(self, guild_id: int, *, participants_channel: Any) -> MemberlistRebuildStats:
         raids = list(self.repo.list_open_raids(guild_id))
@@ -1363,7 +1980,12 @@ class RewriteDiscordBot(discord.Client):
             except Exception:
                 pass
 
-    async def _sync_memberlist_messages_for_raid(self, raid_id: int) -> tuple[int, int, int]:
+    async def _sync_memberlist_messages_for_raid(
+        self,
+        raid_id: int,
+        *,
+        recreate_existing: bool = False,
+    ) -> tuple[int, int, int]:
         raid = self.repo.get_raid(raid_id)
         if raid is None or raid.status != "open":
             return (0, 0, 0)
@@ -1402,9 +2024,10 @@ class RewriteDiscordBot(discord.Client):
                 content = f"{content}\n{role.mention}"
             debug_lines.append(f"- {day_label} {time_label}: {', '.join(f'<@{u}>' for u in users)}")
             row = existing_rows.get((day_label, time_label))
+            old_msg_for_recreate = None
 
             edited = False
-            if row is not None and row.message_id is not None:
+            if row is not None and row.message_id is not None and not recreate_existing:
                 existing_channel = await self._get_text_channel(row.channel_id or participants_channel.id)
                 if existing_channel is not None:
                     old_msg = await _safe_fetch_message(existing_channel, row.message_id)
@@ -1424,10 +2047,15 @@ class RewriteDiscordBot(discord.Client):
                             )
                             updated += 1
 
+            if row is not None and row.message_id is not None and recreate_existing:
+                existing_channel = await self._get_text_channel(row.channel_id or participants_channel.id)
+                if existing_channel is not None:
+                    old_msg_for_recreate = await _safe_fetch_message(existing_channel, row.message_id)
+
             if edited:
                 continue
 
-            new_msg = await _safe_send_channel_message(
+            new_msg = await self._send_channel_message(
                 participants_channel,
                 content=content,
                 allowed_mentions=discord.AllowedMentions(users=True, roles=True),
@@ -1441,7 +2069,13 @@ class RewriteDiscordBot(discord.Client):
                 channel_id=participants_channel.id,
                 message_id=new_msg.id,
             )
-            created += 1
+            if row is None:
+                created += 1
+            else:
+                updated += 1
+
+            if old_msg_for_recreate is not None and getattr(old_msg_for_recreate, "id", None) != getattr(new_msg, "id", None):
+                await _safe_delete_message(old_msg_for_recreate)
 
         for key, row in list(existing_rows.items()):
             if key in active_keys:
@@ -1506,7 +2140,7 @@ class RewriteDiscordBot(discord.Client):
                     )
                     return True
 
-        posted = await _safe_send_channel_message(channel, content=content)
+        posted = await self._send_channel_message(channel, content=content)
         if posted is None:
             return False
         settings.raidlist_message_id = posted.id
@@ -1619,7 +2253,27 @@ class RewriteDiscordBot(discord.Client):
         return count
 
     def _register_commands(self) -> None:
-        @self.tree.command(name="settings", description="Setzt Planner/Participants/Raidlist auf diesen Channel.")
+        def _can_use_privileged(interaction: Any) -> bool:
+            return self._is_privileged_user(getattr(getattr(interaction, "user", None), "id", None))
+
+        async def _require_privileged(interaction: Any) -> bool:
+            if _can_use_privileged(interaction):
+                return True
+            user_id = getattr(getattr(interaction, "user", None), "id", None)
+            log.warning(
+                "Privileged command denied user_id=%s configured_user_id=%s owner_ids=%s command=%s",
+                user_id,
+                int(getattr(self.config, "privileged_user_id", DEFAULT_PRIVILEGED_USER_ID)),
+                sorted(self._application_owner_ids),
+                getattr(getattr(interaction, "command", None), "name", None),
+            )
+            await self._reply(interaction, "❌ Nur für den Debug-Owner erlaubt.", ephemeral=True)
+            return False
+
+        @self.tree.command(
+            name="settings",
+            description="Setzt Umfragen-/Teilnehmerlisten-/Raidlist-Channel und Feature-Toggles.",
+        )
         @_admin_or_privileged_check()
         async def settings_cmd(interaction):
             if not interaction.guild:
@@ -1628,12 +2282,13 @@ class RewriteDiscordBot(discord.Client):
 
             async with self._state_lock:
                 settings = self.repo.ensure_settings(interaction.guild.id, interaction.guild.name)
+                feature_settings = self._get_guild_feature_settings(interaction.guild.id)
             view = SettingsView(self, guild_id=interaction.guild.id)
             sent = await _safe_send_initial(
                 interaction,
                 "Settings",
                 ephemeral=True,
-                embed=_settings_embed(settings, interaction.guild.name),
+                embed=_settings_embed(settings, interaction.guild.name, feature_settings),
                 view=view,
             )
             if not sent:
@@ -1646,6 +2301,7 @@ class RewriteDiscordBot(discord.Client):
                 return
 
             settings = self.repo.ensure_settings(interaction.guild.id, interaction.guild.name)
+            feature_settings = self._get_guild_feature_settings(interaction.guild.id)
             open_raids = self.repo.list_open_raids(interaction.guild.id)
             self_test_ok = self.last_self_test_ok_at.isoformat() if self.last_self_test_ok_at else "-"
             self_test_err = self.last_self_test_error or "-"
@@ -1653,8 +2309,16 @@ class RewriteDiscordBot(discord.Client):
                 interaction,
                 (
                     f"Guild: **{interaction.guild.name}**\n"
-                    f"Planner Channel: `{settings.planner_channel_id}`\n"
-                    f"Participants Channel: `{settings.participants_channel_id}`\n"
+                    f"Privileged User ID (configured): `{int(getattr(self.config, 'privileged_user_id', DEFAULT_PRIVILEGED_USER_ID))}`\n"
+                    f"Level Persist Interval (s): `{int(self.config.level_persist_interval_seconds)}`\n"
+                    f"Levelsystem: `{_on_off(feature_settings.leveling_enabled)}`\n"
+                    f"Levelup Nachrichten: `{_on_off(feature_settings.levelup_messages_enabled)}`\n"
+                    f"Nanomon Reply: `{_on_off(feature_settings.nanomon_reply_enabled)}`\n"
+                    f"Approved Reply: `{_on_off(feature_settings.approved_reply_enabled)}`\n"
+                    f"Message XP Interval (s): `{int(feature_settings.message_xp_interval_seconds)}`\n"
+                    f"Levelup Cooldown (s): `{int(feature_settings.levelup_message_cooldown_seconds)}`\n"
+                    f"Umfragen Channel: `{settings.planner_channel_id}`\n"
+                    f"Raid Teilnehmerlisten Channel: `{settings.participants_channel_id}`\n"
                     f"Raidlist Channel: `{settings.raidlist_channel_id}`\n"
                     f"Raidlist Message: `{settings.raidlist_message_id}`\n"
                     f"Open Raids: `{len(open_raids)}`\n"
@@ -1678,20 +2342,22 @@ class RewriteDiscordBot(discord.Client):
             if not isinstance(interaction.channel, discord.TextChannel):
                 await self._reply(interaction, "Nur im Textchannel nutzbar.", ephemeral=True)
                 return
-            await interaction.channel.send(
-                "1) /settings\n"
-                "2) /raidplan\n"
-                "3) Abstimmung im Raid-Post per Selects\n"
-                "4) /raidlist fuer Live-Refresh\n"
-                "5) Raid beenden ueber Button oder /raid_finish\n"
-                "6) /purgebot scope=channel|server fuer Bot-Nachrichten-Reset"
+            await self._send_channel_message(
+                interaction.channel,
+                content=(
+                    "1) /settings\n"
+                    "2) /raidplan\n"
+                    "3) Abstimmung im Raid-Post per Selects\n"
+                    "4) /raidlist fuer Live-Refresh\n"
+                    "5) Raid beenden ueber Button oder /raid_finish\n"
+                    "6) /purgebot scope=channel|server fuer Bot-Nachrichten-Reset"
+                ),
             )
             await self._reply(interaction, "Anleitung gepostet.", ephemeral=True)
 
         @self.tree.command(name="restart", description="Stoppt den Prozess (Runner startet neu)")
         async def restart_cmd(interaction):
-            if interaction.user.id != PRIVILEGED_USER_ID:
-                await self._reply(interaction, "Nur privileged.", ephemeral=True)
+            if not await _require_privileged(interaction):
                 return
             await self._reply(interaction, "Neustart wird eingeleitet.", ephemeral=True)
             await self.close()
@@ -1716,7 +2382,7 @@ class RewriteDiscordBot(discord.Client):
                 if not settings.planner_channel_id or not settings.participants_channel_id:
                     await self._reply(
                         interaction,
-                        "Bitte zuerst /settings konfigurieren (Planner + Participants Channel).",
+                        "Bitte zuerst /settings konfigurieren (Umfragen + Teilnehmerlisten Channel).",
                         ephemeral=True,
                     )
                     return
@@ -1812,12 +2478,14 @@ class RewriteDiscordBot(discord.Client):
         @self.tree.command(name="purge", description="Loescht letzte N Nachrichten")
         @_admin_or_privileged_check()
         async def purge_cmd(interaction, amount: int = 10):
-            if not isinstance(interaction.channel, discord.TextChannel):
+            channel = interaction.channel
+            purge_fn = getattr(channel, "purge", None)
+            if channel is None or not callable(purge_fn):
                 await self._reply(interaction, "Nur im Textchannel nutzbar.", ephemeral=True)
                 return
             await self._defer(interaction, ephemeral=True)
             amount = max(1, min(100, int(amount)))
-            deleted = await interaction.channel.purge(limit=amount)
+            deleted = await purge_fn(limit=amount)
             await _safe_followup(interaction, f"{len(deleted)} Nachrichten geloescht.", ephemeral=True)
 
         @self.tree.command(name="purgebot", description="Loescht Bot-Nachrichten im Channel oder serverweit")
@@ -1859,37 +2527,42 @@ class RewriteDiscordBot(discord.Client):
 
             total_deleted = 0
             touched_channels = 0
-            bot_user_id = getattr(self.user, "id", 0)
+            scan_history = scope.value == "channel"
+            scan_limit = limit if scan_history else min(limit, 150)
             for channel in channels:
-                perms = channel.permissions_for(me)
-                if not (perms.read_message_history and perms.manage_messages):
+                try:
+                    perms = channel.permissions_for(me)
+                    if not (perms.read_message_history and perms.manage_messages):
+                        continue
+                    deleted_here = await self._delete_bot_messages_in_channel(
+                        channel,
+                        history_limit=scan_limit,
+                        scan_history=scan_history,
+                    )
+                    if deleted_here > 0:
+                        total_deleted += deleted_here
+                        touched_channels += 1
+                except Exception:
+                    log.exception(
+                        "purgebot failed for channel_id=%s guild_id=%s",
+                        getattr(channel, "id", None),
+                        getattr(interaction.guild, "id", None),
+                    )
                     continue
-
-                deleted_here = 0
-                async for msg in channel.history(limit=limit):
-                    if msg.author.id != bot_user_id:
-                        continue
-                    try:
-                        await msg.delete()
-                        deleted_here += 1
-                    except Exception:
-                        continue
-
-                if deleted_here > 0:
-                    total_deleted += deleted_here
-                    touched_channels += 1
 
             where = "aktueller Channel" if scope.value == "channel" else f"{touched_channels} Channel(s)"
             await _safe_followup(
                 interaction,
-                f"{total_deleted} Bot-Nachrichten geloescht ({where}, Limit je Channel: {limit}).",
+                (
+                    f"{total_deleted} Bot-Nachrichten geloescht ({where}, "
+                    f"Limit je Channel: {scan_limit}, History-Scan: {'an' if scan_history else 'reduziert'})."
+                ),
                 ephemeral=True,
             )
 
         @self.tree.command(name="remote_guilds", description="Zeigt bekannte Server für Fernwartung an (privileged).")
         async def remote_guilds_cmd(interaction):
-            if interaction.user.id != PRIVILEGED_USER_ID:
-                await self._reply(interaction, "❌ Nur für den Debug-Owner erlaubt.", ephemeral=True)
+            if not await _require_privileged(interaction):
                 return
             await self._defer(interaction, ephemeral=True)
             guilds = sorted(self.guilds, key=lambda guild: ((guild.name or "").casefold(), int(guild.id)))
@@ -1905,8 +2578,7 @@ class RewriteDiscordBot(discord.Client):
         @self.tree.command(name="remote_cancel_all_raids", description="Fernwartung: Alle offenen Raids eines Servers abbrechen.")
         @app_commands.describe(guild_name="Zielservername (Autocomplete)")
         async def remote_cancel_all_raids_cmd(interaction, guild_name: str):
-            if interaction.user.id != PRIVILEGED_USER_ID:
-                await self._reply(interaction, "❌ Nur für den Debug-Owner erlaubt.", ephemeral=True)
+            if not await _require_privileged(interaction):
                 return
             target, err = self._resolve_remote_target_by_name(guild_name)
             if target is None:
@@ -1931,15 +2603,14 @@ class RewriteDiscordBot(discord.Client):
 
         @remote_cancel_all_raids_cmd.autocomplete("guild_name")
         async def remote_cancel_all_raids_autocomplete(interaction, current: str):
-            if interaction.user.id != PRIVILEGED_USER_ID:
+            if not _can_use_privileged(interaction):
                 return []
             return self._remote_guild_autocomplete_choices(current)
 
         @self.tree.command(name="remote_raidlist", description="Fernwartung: Raidlist eines Zielservers neu aufbauen.")
         @app_commands.describe(guild_name="Zielservername (Autocomplete)")
         async def remote_raidlist_cmd(interaction, guild_name: str):
-            if interaction.user.id != PRIVILEGED_USER_ID:
-                await self._reply(interaction, "❌ Nur für den Debug-Owner erlaubt.", ephemeral=True)
+            if not await _require_privileged(interaction):
                 return
             target, err = self._resolve_remote_target_by_name(guild_name)
             if target is None:
@@ -1961,7 +2632,7 @@ class RewriteDiscordBot(discord.Client):
 
         @remote_raidlist_cmd.autocomplete("guild_name")
         async def remote_raidlist_autocomplete(interaction, current: str):
-            if interaction.user.id != PRIVILEGED_USER_ID:
+            if not _can_use_privileged(interaction):
                 return []
             return self._remote_guild_autocomplete_choices(current)
 
@@ -1971,8 +2642,7 @@ class RewriteDiscordBot(discord.Client):
         )
         @app_commands.describe(guild_name="Zielservername (Autocomplete)")
         async def remote_rebuild_memberlists_cmd(interaction, guild_name: str):
-            if interaction.user.id != PRIVILEGED_USER_ID:
-                await self._reply(interaction, "❌ Nur für den Debug-Owner erlaubt.", ephemeral=True)
+            if not await _require_privileged(interaction):
                 return
             target, err = self._resolve_remote_target_by_name(guild_name)
             if target is None:
@@ -2026,14 +2696,13 @@ class RewriteDiscordBot(discord.Client):
 
         @remote_rebuild_memberlists_cmd.autocomplete("guild_name")
         async def remote_rebuild_memberlists_autocomplete(interaction, current: str):
-            if interaction.user.id != PRIVILEGED_USER_ID:
+            if not _can_use_privileged(interaction):
                 return []
             return self._remote_guild_autocomplete_choices(current)
 
         @self.tree.command(name="backup_db", description="Schreibt ein SQL Backup")
         async def backup_db_cmd(interaction):
-            if interaction.user.id != PRIVILEGED_USER_ID:
-                await self._reply(interaction, "Nur privileged.", ephemeral=True)
+            if not await _require_privileged(interaction):
                 return
             await self._defer(interaction, ephemeral=True)
             log.info(
@@ -2055,6 +2724,11 @@ class RewriteDiscordBot(discord.Client):
             await _safe_followup(interaction, f"Backup geschrieben: {out.as_posix()}", ephemeral=True)
 
     async def close(self) -> None:
+        try:
+            async with self._state_lock:
+                await self._flush_level_state_if_due(force=True)
+        except Exception:
+            log.exception("Failed to flush pending level state during shutdown.")
         try:
             await self.task_registry.cancel_all()
         except Exception:
