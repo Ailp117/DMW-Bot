@@ -1,9 +1,12 @@
 from __future__ import annotations
 import re
 from sqlalchemy import select, delete, func
+import json
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import GuildSettings, Raid, RaidOption, RaidVote, RaidPostedSlot, Dungeon, UserLevel
+from models import GuildSettings, Raid, RaidOption, RaidVote, RaidPostedSlot, Dungeon, UserLevel, RaidTemplate, RaidAttendance
+
+AUTO_DUNGEON_TEMPLATE_NAME = "_auto_dungeon_default"
 
 def normalize_list(text: str) -> list[str]:
     parts = re.split(r"[,;\n]+", (text or "").strip())
@@ -144,6 +147,122 @@ async def upsert_posted_slot(session: AsyncSession, raid_id: int, day_label: str
             message_id=message_id,
         ))
 
+
+
+
+async def get_template_by_name(session: AsyncSession, guild_id: int, dungeon_id: int, template_name: str) -> RaidTemplate | None:
+    return (await session.execute(
+        select(RaidTemplate).where(
+            RaidTemplate.guild_id == guild_id,
+            RaidTemplate.dungeon_id == dungeon_id,
+            RaidTemplate.template_name == template_name,
+        )
+    )).scalar_one_or_none()
+
+
+async def list_templates(session: AsyncSession, guild_id: int, dungeon_id: int | None = None) -> list[RaidTemplate]:
+    stmt = select(RaidTemplate).where(RaidTemplate.guild_id == guild_id)
+    if dungeon_id is not None:
+        stmt = stmt.where(RaidTemplate.dungeon_id == dungeon_id)
+    stmt = stmt.order_by(RaidTemplate.dungeon_id.asc(), RaidTemplate.template_name.asc())
+    return (await session.execute(stmt)).scalars().all()
+
+
+def dump_template_data(days: list[str], times: list[str], min_players: int) -> str:
+    return json.dumps({"days": days, "times": times, "min_players": min_players}, ensure_ascii=False)
+
+
+def load_template_data(template_data: str) -> tuple[list[str], list[str], int]:
+    payload = json.loads(template_data or "{}")
+    days = normalize_list(",".join(payload.get("days") or []))
+    times = normalize_list(",".join(payload.get("times") or []))
+    try:
+        min_players = max(0, int(payload.get("min_players", 0)))
+    except (TypeError, ValueError):
+        min_players = 0
+    return days, times, min_players
+
+
+def compute_qualified_slot_users(
+    days: list[str],
+    times: list[str],
+    day_users: dict[str, set[int]],
+    time_users: dict[str, set[int]],
+    threshold: int,
+) -> tuple[dict[tuple[str, str], list[int]], set[int]]:
+    qualified_slots: dict[tuple[str, str], list[int]] = {}
+    all_users: set[int] = set()
+
+    for day in days:
+        for time in times:
+            users = sorted(day_users.get(day, set()).intersection(time_users.get(time, set())))
+            if len(users) < threshold:
+                continue
+            qualified_slots[(day, time)] = users
+            all_users.update(users)
+
+    return qualified_slots, all_users
+
+
+
+
+async def upsert_auto_dungeon_template(
+    session: AsyncSession,
+    *,
+    guild_id: int,
+    dungeon_id: int,
+    days: list[str],
+    times: list[str],
+    min_players: int,
+) -> RaidTemplate:
+    """Create/update the per-guild per-dungeon auto template used as planning default."""
+    row = await get_template_by_name(session, guild_id, dungeon_id, AUTO_DUNGEON_TEMPLATE_NAME)
+    payload = dump_template_data(days, times, min_players)
+
+    if row is None:
+        row = RaidTemplate(
+            guild_id=guild_id,
+            dungeon_id=dungeon_id,
+            template_name=AUTO_DUNGEON_TEMPLATE_NAME,
+            template_data=payload,
+        )
+        session.add(row)
+        await session.flush()
+        return row
+
+    row.template_data = payload
+    return row
+
+async def create_attendance_snapshot(
+    session: AsyncSession,
+    *,
+    guild_id: int,
+    raid_display_id: int,
+    dungeon: str,
+    user_ids: set[int],
+) -> int:
+    existing_user_ids = set((await session.execute(
+        select(RaidAttendance.user_id).where(
+            RaidAttendance.guild_id == guild_id,
+            RaidAttendance.raid_display_id == raid_display_id,
+        )
+    )).scalars().all())
+
+    new_user_ids = sorted(set(user_ids) - {int(uid) for uid in existing_user_ids})
+    if not new_user_ids:
+        return 0
+
+    session.add_all([
+        RaidAttendance(
+            guild_id=guild_id,
+            raid_display_id=raid_display_id,
+            dungeon=dungeon,
+            user_id=user_id,
+            status="pending",
+        )
+        for user_id in new_user_ids
+    ])
+    return len(new_user_ids)
 
 async def purge_guild_data(session: AsyncSession, guild_id: int) -> dict[str, int]:
     deleted_raids = await session.execute(delete(Raid).where(Raid.guild_id == guild_id))

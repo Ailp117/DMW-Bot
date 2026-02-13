@@ -11,6 +11,7 @@ from sqlalchemy import (
     func,
     ForeignKey,
     Index,
+    UniqueConstraint,
 )
 
 class Base(DeclarativeBase):
@@ -49,6 +50,9 @@ class GuildSettings(Base):
 
     guild_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     guild_name: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
+    default_min_players: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    templates_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    template_manager_role_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     planner_channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     participants_channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     raidlist_channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -171,6 +175,40 @@ class UserLevel(Base):
     updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
 Index("ix_user_levels_guild_level", UserLevel.guild_id, UserLevel.level)
+
+
+class RaidTemplate(Base):
+    __tablename__ = "raid_templates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("guild_settings.guild_id", ondelete="CASCADE"), nullable=False, index=True)
+    dungeon_id: Mapped[int] = mapped_column(Integer, ForeignKey("dungeons.id", ondelete="CASCADE"), nullable=False, index=True)
+    template_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    template_data: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("guild_id", "dungeon_id", "template_name", name="uq_raid_templates_guild_dungeon_name"),
+    )
+
+
+class RaidAttendance(Base):
+    __tablename__ = "raid_attendance"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    raid_display_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    dungeon: Mapped[str] = mapped_column(Text, nullable=False)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", index=True)
+    marked_by_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+Index("ix_raid_attendance_lookup", RaidAttendance.guild_id, RaidAttendance.raid_display_id)
+Index("ix_raid_attendance_unique_user", RaidAttendance.guild_id, RaidAttendance.raid_display_id, RaidAttendance.user_id, unique=True)
 
 
 # === debug_mirror_cache ===
