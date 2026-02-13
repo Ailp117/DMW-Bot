@@ -31,6 +31,7 @@ class CommandSyncResilienceTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(main, "ensure_schema", AsyncMock()),
             patch.object(main, "try_acquire_singleton_lock", AsyncMock(return_value=True)),
+            patch.object(self.bot, "_run_boot_smoke_checks", AsyncMock(return_value={"required_tables": 7, "open_raids": 0, "guild_settings_rows": 0})),
             patch.object(self.bot, "restore_persistent_raid_views", AsyncMock()),
             patch("main.asyncio.create_task", side_effect=lambda coro: (coro.close(), dummy_task)[1]),
         ):
@@ -136,6 +137,7 @@ class CommandSyncResilienceTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(main, "ensure_schema", AsyncMock()),
             patch.object(main, "try_acquire_singleton_lock", AsyncMock(return_value=True)),
+            patch.object(self.bot, "_run_boot_smoke_checks", AsyncMock(return_value={"required_tables": 7, "open_raids": 0, "guild_settings_rows": 0})),
             patch.object(self.bot, "restore_persistent_raid_views", AsyncMock()),
             patch("main.asyncio.create_task", side_effect=_create_task),
         ):
@@ -228,6 +230,63 @@ class CommandSyncResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(self.bot.last_self_test_ok_at)
         self.assertIsNone(self.bot.last_self_test_error)
 
+
+    async def test_setup_hook_runs_boot_smoke_checks(self):
+        dummy_task = _DummyTask()
+
+        with (
+            patch.object(main, "ensure_schema", AsyncMock()),
+            patch.object(main, "try_acquire_singleton_lock", AsyncMock(return_value=True)),
+            patch.object(self.bot, "_run_boot_smoke_checks", AsyncMock(return_value={"required_tables": 7, "open_raids": 0, "guild_settings_rows": 1})) as smoke_mock,
+            patch.object(self.bot, "restore_persistent_raid_views", AsyncMock()),
+            patch("main.asyncio.create_task", side_effect=lambda coro: (coro.close(), dummy_task)[1]),
+        ):
+            await self.bot.setup_hook()
+
+        smoke_mock.assert_awaited_once()
+        self.assertIsInstance(self.bot.boot_smoke_stats, dict)
+
+    async def test_run_boot_smoke_checks_returns_stats(self):
+        class _Result:
+            def __init__(self, rows=None, scalar=None):
+                self._rows = rows or []
+                self._scalar = scalar
+
+            def scalars(self):
+                return self
+
+            def all(self):
+                return self._rows
+
+            def scalar_one(self):
+                return self._scalar
+
+        class _Session:
+            def __init__(self):
+                self.calls = 0
+
+            async def execute(self, _query):
+                self.calls += 1
+                if self.calls == 1:
+                    return _Result(scalar=1)
+                if self.calls == 2:
+                    return _Result(rows=list(main.REQUIRED_BOOT_TABLES))
+                if self.calls == 3:
+                    return _Result(scalar=2)
+                return _Result(scalar=4)
+
+        fake_session = _Session()
+
+        @asynccontextmanager
+        async def _fake_session_scope():
+            yield fake_session
+
+        with patch.object(main, "session_scope", _fake_session_scope):
+            stats = await self.bot._run_boot_smoke_checks()
+
+        self.assertEqual(stats["required_tables"], len(main.REQUIRED_BOOT_TABLES))
+        self.assertEqual(stats["open_raids"], 2)
+        self.assertEqual(stats["guild_settings_rows"], 4)
 
 
 if __name__ == "__main__":

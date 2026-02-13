@@ -12,6 +12,7 @@ Ein Discord-Bot zur Planung, Verwaltung und Nachverfolgung von Raids inkl. persi
 - Level-/XP-System inkl. Voice-XP-Intervallen.
 - Automatische Datenbank-Schema-Sicherung beim Start.
 - Self-Tests, Logging und Health-Checks für den Betrieb.
+- Boot-Smoke-Checks beim Start (DB erreichbar, Pflichttabellen, offene Raids).
 - Automatische und manuelle SQL-Backups.
 
 ## Voraussetzungen
@@ -36,7 +37,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-## Konfiguration (.env)
+## Konfiguration (.env / GitHub Secrets)
 
 Mindestens erforderlich:
 
@@ -61,6 +62,24 @@ BACKUP_INTERVAL_SECONDS=21600
 RAIDLIST_DEBUG_CHANNEL_ID=0
 MEMBERLIST_DEBUG_CHANNEL_ID=0
 ```
+
+Für GitHub Actions (`.github/workflows/bot.yml`) werden mindestens diese Secrets erwartet:
+
+- `DISCORD_TOKEN`
+- `DATABASE_URL`
+
+Zusätzlich unterstützt der Bot (optional) diese Secrets/ENVs aus `config.py`:
+
+- `DB_ECHO`
+- `ENABLE_MESSAGE_CONTENT_INTENT`
+- `LOG_GUILD_ID`
+- `LOG_CHANNEL_ID`
+- `DISCORD_LOG_LEVEL`
+- `SELF_TEST_INTERVAL_SECONDS`
+- `BACKUP_INTERVAL_SECONDS`
+- `RAIDLIST_DEBUG_CHANNEL_ID`
+- `MEMBERLIST_DEBUG_CHANNEL_ID`
+
 
 ## Wichtige Commands (Auszug)
 
@@ -100,9 +119,17 @@ Die Tests decken u. a. Command-Registrierung, Berechtigungen, Konfigurationslogi
 - `ensure_schema.py` – Schema-Initialisierung/-Migration
 - `backup_sql.py` – SQL-Export/Backup
 - `tests/` – automatisierte Tests
+- `FEATURE_MATRIX.md` – Zuordnung Feature → Code → DB → Tests
 
 ## Hinweise für den Betrieb
 
 - Der Bot nutzt einen Singleton-Lock in Postgres, um Doppel-Instanzen zu vermeiden.
 - Stelle sicher, dass der Bot die nötigen Channel- und Rollenrechte im Discord-Server besitzt.
 - Bei Produktionsbetrieb sollten Logs und Backups regelmäßig überwacht werden.
+
+## CI / 24-7-Strategie
+
+- Der Workflow startet alle 5 Stunden neu (`schedule`) und zusätzlich manuell via `workflow_dispatch`.
+- Vor dem Start des Bots läuft immer `pytest -q`; bei Fehlern startet der Bot nicht (fail-fast).
+- Durch `concurrency.cancel-in-progress` wird nur eine Instanz des Workflows aktiv gehalten.
+- Ein harter 24/7-Betrieb ist auf GitHub-Hosted-Runnern nur "24/7-ish" möglich, daher der periodische Neustart als Stabilitätsstrategie.
