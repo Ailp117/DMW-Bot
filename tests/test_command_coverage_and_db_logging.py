@@ -10,6 +10,7 @@ import db
 from commands_admin import register_admin_commands
 from commands_purge import register_purge_commands
 from commands_raid import register_raid_commands
+from commands_remote import register_remote_commands
 from models import UserLevel
 
 
@@ -48,6 +49,7 @@ class CommandCoverageAndDbLoggingTests(unittest.TestCase):
         register_admin_commands(tree)
         register_raid_commands(tree)
         register_purge_commands(tree)
+        register_remote_commands(tree)
 
         self.assertEqual(
             set(tree.commands.keys()),
@@ -58,6 +60,9 @@ class CommandCoverageAndDbLoggingTests(unittest.TestCase):
                 "cancel_all_raids",
                 "purge",
                 "purgebot",
+                "remote_guilds",
+                "remote_cancel_all_raids",
+                "remote_raidlist",
             },
         )
 
