@@ -31,6 +31,7 @@ from models import Raid, UserLevel, GuildSettings
 from roles import cleanup_temp_role
 from views_raid import RaidVoteView, cleanup_posted_slot_messages
 from leveling import calculate_level_from_xp
+from permissions import admin_or_privileged_check
 
 def setup_logging() -> None:
     level_name = os.getenv("LOG_LEVEL", "DEBUG").upper()
@@ -254,7 +255,7 @@ class RaidBot(discord.Client):
         await self.restore_persistent_raid_views()
 
         @self.tree.command(name="settings", description="Settings öffnen")
-        @app_commands.checks.has_permissions(manage_guild=True)
+        @admin_or_privileged_check()
         async def settings_cmd(interaction: discord.Interaction):
             if not interaction.guild:
                 return await interaction.response.send_message("Nur im Server.", ephemeral=True)
@@ -322,7 +323,7 @@ class RaidBot(discord.Client):
             await interaction.response.send_message(text, ephemeral=True)
 
         @self.tree.command(name="restart", description="Startet den Bot-Prozess neu")
-        @app_commands.checks.has_permissions(administrator=True)
+        @admin_or_privileged_check()
         async def restart_cmd(interaction: discord.Interaction):
             await interaction.response.send_message("♻️ Neustart wird ausgeführt …", ephemeral=True)
             asyncio.create_task(self._restart_process())
