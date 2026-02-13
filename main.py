@@ -65,6 +65,14 @@ STALE_RAID_CHECK_SECONDS = 15 * 60
 VOICE_XP_CHECK_SECONDS = 60
 VOICE_XP_AWARD_INTERVAL = timedelta(hours=1)
 
+EXPECTED_SLASH_COMMANDS = {
+    "settings", "status", "help", "help2", "restart",
+    "raidplan", "raidlist", "dungeonlist", "cancel_all_raids", "purge", "purgebot",
+    "remote_guilds", "remote_cancel_all_raids", "remote_raidlist",
+    "template_config",
+    "attendance_list", "attendance_mark", "backup_db",
+}
+
 
 def contains_nanomon_keyword(content: str) -> bool:
     return bool(NANOMON_PATTERN.search((content or "").casefold()))
@@ -186,6 +194,30 @@ class RaidBot(discord.Client):
 
         log.info("Startup guild cleanup processed %s removed guild(s).", cleaned)
 
+    def _command_registry_health(self) -> tuple[list[str], list[str], list[str]]:
+        registered = sorted(cmd.name for cmd in self.tree.get_commands())
+        registered_set = set(registered)
+        missing = sorted(EXPECTED_SLASH_COMMANDS - registered_set)
+        unexpected = sorted(registered_set - EXPECTED_SLASH_COMMANDS)
+        return registered, missing, unexpected
+
+    def _log_command_registry_health(self) -> None:
+        registered, missing, unexpected = self._command_registry_health()
+        if missing or unexpected:
+            log.error(
+                "Command registry mismatch (registered=%s missing=%s unexpected=%s)",
+                ", ".join(registered) or "-",
+                ", ".join(missing) or "-",
+                ", ".join(unexpected) or "-",
+            )
+            return
+
+        log.info(
+            "Slash commands registered correctly (%s): %s",
+            len(registered),
+            ", ".join(registered),
+        )
+
     async def _sync_commands_for_known_guilds(self) -> None:
         guild_ids = await self._get_configured_guild_ids()
         connected_guild_ids = {guild.id for guild in self.guilds}
@@ -227,6 +259,14 @@ class RaidBot(discord.Client):
                 len(failed_ids),
                 ", ".join(str(gid) for gid in failed_ids),
             )
+
+        try:
+            await self.tree.sync()
+            log.info(
+                "Global command sync completed as fallback (Discord propagation can still take up to ~1h)."
+            )
+        except Exception:
+            log.exception("Global command sync failed")
 
     async def _restart_process(self) -> None:
         log.warning("Restart requested. Restarting bot process now.")
@@ -337,6 +377,7 @@ class RaidBot(discord.Client):
         register_template_commands(self.tree)
         register_attendance_commands(self.tree)
         register_backup_commands(self.tree)
+        self._log_command_registry_health()
 
         await self.restore_persistent_raid_views()
 
@@ -547,17 +588,13 @@ class RaidBot(discord.Client):
             await asyncio.sleep(VOICE_XP_CHECK_SECONDS)
 
     async def _run_self_tests_once(self):
-        registered_commands = {cmd.name for cmd in self.tree.get_commands()}
-        expected_commands = {
-            "settings", "status", "help", "help2", "restart",
-            "raidplan", "raidlist", "dungeonlist", "cancel_all_raids", "purge", "purgebot",
-            "remote_guilds", "remote_cancel_all_raids", "remote_raidlist",
-            "template_config",
-            "attendance_list", "attendance_mark", "backup_db",
-        }
-        missing = sorted(expected_commands - registered_commands)
+        registered, missing, unexpected = self._command_registry_health()
         if missing:
             raise RuntimeError(f"Missing commands: {', '.join(missing)}")
+        if unexpected:
+            raise RuntimeError(f"Unexpected commands: {', '.join(unexpected)}")
+
+        registered_commands = set(registered)
 
         async with session_scope() as session:
             guild_count = int((await session.execute(select(func.count()).select_from(GuildSettings))).scalar_one())
