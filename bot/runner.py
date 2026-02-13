@@ -15,7 +15,7 @@ log = logging.getLogger("dmw.runner")
 
 @dataclass(slots=True)
 class RunnerConfig:
-    target_script: str
+    target: str
     max_runtime_seconds: int
     restart_delay_seconds: int
     max_backoff_seconds: int
@@ -63,7 +63,11 @@ class BotRunner:
                 self._terminate_child()
                 return 0
 
-            cmd = [sys.executable, self.config.target_script]
+            try:
+                cmd = self._build_child_command()
+            except ValueError as exc:
+                log.error("Invalid BOT_RUNNER_TARGET: %s", exc)
+                return 1
             log.info("Starting child bot process: %s", " ".join(cmd))
             child_started_at = time.monotonic()
             self._child = subprocess.Popen(cmd)
@@ -103,6 +107,17 @@ class BotRunner:
         self._terminate_child()
         return 0
 
+    def _build_child_command(self) -> list[str]:
+        target = self.config.target.strip()
+        if not target:
+            raise ValueError("Runner target must not be empty.")
+        if target.startswith("module:"):
+            module = target.split(":", 1)[1].strip()
+            if not module:
+                raise ValueError("Module target must be in format 'module:<dotted.path>'.")
+            return [sys.executable, "-m", module]
+        return [sys.executable, target]
+
     def _wait_for_child_or_timeout(self, started_at: float) -> int:
         assert self._child is not None
 
@@ -130,8 +145,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="DMW bot runner with auto-restart.")
     parser.add_argument(
         "--target-script",
-        default=os.getenv("BOT_RUNNER_TARGET", "bot/runtime.py"),
-        help="Python script to execute as bot process.",
+        default=os.getenv("BOT_RUNNER_TARGET", "module:bot.runtime"),
+        help="Child target: module:<dotted.path> or script path.",
     )
     parser.add_argument(
         "--max-runtime-seconds",
@@ -181,7 +196,7 @@ def main() -> int:
     )
 
     config = RunnerConfig(
-        target_script=args.target_script,
+        target=args.target_script,
         max_runtime_seconds=max(0, args.max_runtime_seconds),
         restart_delay_seconds=max(1, args.restart_delay_seconds),
         max_backoff_seconds=max(1, args.max_backoff_seconds),
