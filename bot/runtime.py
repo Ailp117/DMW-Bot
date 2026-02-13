@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 import importlib.machinery
 import importlib.util
@@ -75,11 +75,23 @@ PRIVILEGED_ONLY_HELP_COMMANDS = frozenset(
         "remote_guilds",
         "remote_cancel_all_raids",
         "remote_raidlist",
+        "remote_rebuild_memberlists",
         "backup_db",
     }
 )
 
 _RESPONSE_ERRORS = {"InteractionResponded", "HTTPException", "NotFound", "Forbidden"}
+
+
+@dataclass(slots=True)
+class MemberlistRebuildStats:
+    raids: int
+    cleared_slot_rows: int
+    deleted_slot_messages: int
+    deleted_legacy_messages: int
+    created: int
+    updated: int
+    deleted: int
 
 
 def _is_response_error(exc: Exception) -> bool:
@@ -998,6 +1010,17 @@ class RewriteDiscordBot(discord.Client):
         names = sorted(cmd.name for cmd in self.tree.get_commands())
         return [name for name in names if name not in PRIVILEGED_ONLY_HELP_COMMANDS]
 
+    def _current_bot_user_id(self) -> int:
+        connection = getattr(self, "_connection", None)
+        user = getattr(connection, "user", None) if connection is not None else None
+        raw_user_id = getattr(user, "id", None)
+        if raw_user_id is None:
+            return 0
+        try:
+            return int(raw_user_id)
+        except (TypeError, ValueError):
+            return 0
+
     def _resolve_remote_target_by_name(self, raw_value: str) -> tuple[int | None, str | None]:
         value = (raw_value or "").strip()
         if not value:
@@ -1221,16 +1244,74 @@ class RewriteDiscordBot(discord.Client):
         embed = discord.Embed(title=title, description=description, color=discord.Color.red())
         await _safe_edit_message(message, embed=embed, view=None, content=None)
 
-    async def _delete_slot_message(self, row: RaidPostedSlotRecord) -> None:
+    async def _delete_slot_message(self, row: RaidPostedSlotRecord) -> bool:
         if row.channel_id is None or row.message_id is None:
-            return
+            return False
         channel = await self._get_text_channel(row.channel_id)
         if channel is None:
-            return
+            return False
         message = await _safe_fetch_message(channel, row.message_id)
         if message is None:
-            return
-        await _safe_delete_message(message)
+            return False
+        return await _safe_delete_message(message)
+
+    async def _delete_bot_messages_in_channel(self, channel: Any, *, history_limit: int = 5000) -> int:
+        bot_user_id = self._current_bot_user_id()
+        if bot_user_id <= 0:
+            return 0
+
+        limit = max(1, min(5000, int(history_limit)))
+        deleted = 0
+        history = getattr(channel, "history", None)
+        if history is None:
+            return 0
+
+        try:
+            async for message in history(limit=limit):
+                if getattr(getattr(message, "author", None), "id", None) != bot_user_id:
+                    continue
+                if await _safe_delete_message(message):
+                    deleted += 1
+        except Exception:
+            log.exception(
+                "Failed to sweep bot-authored messages in channel_id=%s",
+                getattr(channel, "id", None),
+            )
+        return deleted
+
+    async def _rebuild_memberlists_for_guild(self, guild_id: int, *, participants_channel: Any) -> MemberlistRebuildStats:
+        raids = list(self.repo.list_open_raids(guild_id))
+        cleared_slot_rows = 0
+        deleted_slot_messages = 0
+
+        for raid in raids:
+            slot_rows = list(self.repo.list_posted_slots(raid.id).values())
+            for row in slot_rows:
+                if await self._delete_slot_message(row):
+                    deleted_slot_messages += 1
+                self.repo.delete_posted_slot(row.id)
+                cleared_slot_rows += 1
+
+        deleted_legacy_messages = await self._delete_bot_messages_in_channel(participants_channel, history_limit=5000)
+
+        created = 0
+        updated = 0
+        deleted = 0
+        for raid in raids:
+            c_count, u_count, d_count = await self._sync_memberlist_messages_for_raid(raid.id)
+            created += c_count
+            updated += u_count
+            deleted += d_count
+
+        return MemberlistRebuildStats(
+            raids=len(raids),
+            cleared_slot_rows=cleared_slot_rows,
+            deleted_slot_messages=deleted_slot_messages,
+            deleted_legacy_messages=deleted_legacy_messages,
+            created=created,
+            updated=updated,
+            deleted=deleted,
+        )
 
     async def _ensure_temp_role(self, raid: RaidRecord):
         if raid.min_players <= 0:
@@ -1880,6 +1961,71 @@ class RewriteDiscordBot(discord.Client):
 
         @remote_raidlist_cmd.autocomplete("guild_name")
         async def remote_raidlist_autocomplete(interaction, current: str):
+            if interaction.user.id != PRIVILEGED_USER_ID:
+                return []
+            return self._remote_guild_autocomplete_choices(current)
+
+        @self.tree.command(
+            name="remote_rebuild_memberlists",
+            description="Fernwartung: Teilnehmerlisten eines Zielservers vollständig neu aufbauen.",
+        )
+        @app_commands.describe(guild_name="Zielservername (Autocomplete)")
+        async def remote_rebuild_memberlists_cmd(interaction, guild_name: str):
+            if interaction.user.id != PRIVILEGED_USER_ID:
+                await self._reply(interaction, "❌ Nur für den Debug-Owner erlaubt.", ephemeral=True)
+                return
+            target, err = self._resolve_remote_target_by_name(guild_name)
+            if target is None:
+                await self._reply(interaction, err or "❌ Zielserver konnte nicht aufgelöst werden.", ephemeral=True)
+                return
+
+            await self._defer(interaction, ephemeral=True)
+            async with self._state_lock:
+                settings = self.repo.ensure_settings(target)
+                if not settings.participants_channel_id:
+                    await _safe_followup(
+                        interaction,
+                        "❌ Zielserver hat keinen Participants-Channel konfiguriert.",
+                        ephemeral=True,
+                    )
+                    return
+                participants_channel = await self._get_text_channel(settings.participants_channel_id)
+                if participants_channel is None:
+                    await _safe_followup(
+                        interaction,
+                        "❌ Participants-Channel des Zielservers ist nicht erreichbar.",
+                        ephemeral=True,
+                    )
+                    return
+
+                stats = await self._rebuild_memberlists_for_guild(target, participants_channel=participants_channel)
+                persisted = await self._persist()
+
+            if not persisted:
+                await _safe_followup(
+                    interaction,
+                    "Remote-Rebuild ausgeführt, aber DB-Speicherung fehlgeschlagen.",
+                    ephemeral=True,
+                )
+                return
+
+            target_guild = self.get_guild(target)
+            target_name = (target_guild.name if target_guild else None) or guild_name
+            await _safe_followup(
+                interaction,
+                (
+                    f"✅ Teilnehmerlisten für **{target_name}** neu aufgebaut.\n"
+                    f"Raids: `{stats.raids}`\n"
+                    f"Cleared Slot Rows: `{stats.cleared_slot_rows}`\n"
+                    f"Deleted Slot Messages: `{stats.deleted_slot_messages}`\n"
+                    f"Deleted Legacy Bot Messages: `{stats.deleted_legacy_messages}`\n"
+                    f"Created: `{stats.created}` Updated: `{stats.updated}` Deleted: `{stats.deleted}`"
+                ),
+                ephemeral=True,
+            )
+
+        @remote_rebuild_memberlists_cmd.autocomplete("guild_name")
+        async def remote_rebuild_memberlists_autocomplete(interaction, current: str):
             if interaction.user.id != PRIVILEGED_USER_ID:
                 return []
             return self._remote_guild_autocomplete_choices(current)
