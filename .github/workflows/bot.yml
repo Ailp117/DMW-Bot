@@ -242,7 +242,7 @@ jobs:
             echo "DISCORD_TOKEN or DATABASE_URL missing, skipping bot runtime."
             exit 0
           fi
-          python -m bot.runner --target-script bot/runtime.py 2>&1 | tee bot_runtime.log
+          python -m bot.runner --target-script module:bot.runtime 2>&1 | tee bot_runtime.log
 
       - name: Upload runtime log on failure
         if: failure()
