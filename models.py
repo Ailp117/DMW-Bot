@@ -48,6 +48,7 @@ class GuildSettings(Base):
     __tablename__ = "guild_settings"
 
     guild_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    guild_name: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
     planner_channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     participants_channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     raidlist_channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
