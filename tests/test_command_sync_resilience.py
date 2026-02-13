@@ -43,6 +43,7 @@ class CommandSyncResilienceTests(unittest.IsolatedAsyncioTestCase):
                 "settings",
                 "status",
                 "help",
+                "help2",
                 "restart",
                 "raidplan",
                 "raidlist",
@@ -50,6 +51,9 @@ class CommandSyncResilienceTests(unittest.IsolatedAsyncioTestCase):
                 "cancel_all_raids",
                 "purge",
                 "purgebot",
+                "remote_guilds",
+                "remote_cancel_all_raids",
+                "remote_raidlist",
             },
         )
 
@@ -122,8 +126,9 @@ class CommandSyncResilienceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_run_self_tests_once_queries_same_database_session_scope(self):
         fake_commands = [SimpleNamespace(name=n) for n in [
-            "settings", "status", "help", "restart",
+            "settings", "status", "help", "help2", "restart",
             "raidplan", "raidlist", "dungeonlist", "cancel_all_raids", "purge", "purgebot",
+            "remote_guilds", "remote_cancel_all_raids", "remote_raidlist",
         ]]
 
         class _Result:

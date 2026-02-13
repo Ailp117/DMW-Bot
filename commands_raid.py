@@ -28,7 +28,7 @@ def register_raid_commands(tree: app_commands.CommandTree):
 
             # settings check
             from helpers import get_settings
-            s = await get_settings(session, interaction.guild.id)
+            s = await get_settings(session, interaction.guild.id, interaction.guild.name)
             if not s.planner_channel_id or not s.participants_channel_id:
                 return await interaction.response.send_message(
                     "❌ Bitte zuerst `/settings` konfigurieren (Planner + Participants Channel).",

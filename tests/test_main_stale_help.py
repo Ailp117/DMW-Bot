@@ -16,6 +16,14 @@ class MainStaleAndHelpSourceTests(unittest.TestCase):
         self.assertIn('@self.tree.command(name="help"', self.src)
         self.assertIn('`/raidplan`', self.src)
         self.assertIn('`/purgebot`', self.src)
+        self.assertIn('`/help2`', self.src)
+        self.assertNotIn('`/remote_guilds`', self.src)
+        self.assertNotIn('`/remote_cancel_all_raids`', self.src)
+        self.assertNotIn('`/remote_raidlist`', self.src)
+
+    def test_help2_command_registered(self):
+        self.assertIn('@self.tree.command(name="help2"', self.src)
+        self.assertIn('Anleitung wurde in diesen Channel gepostet', self.src)
 
     def test_restart_command_registered(self):
         self.assertIn('@self.tree.command(name="restart"', self.src)
