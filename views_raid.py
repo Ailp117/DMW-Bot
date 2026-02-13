@@ -275,6 +275,11 @@ class RaidVoteView(View):
             for v in values:
                 await toggle_vote(session, self.raid_id, "day", v, interaction.user.id)
         await self.refresh_view(interaction)
+        voter_name = interaction.user.display_name
+        await interaction.followup.send(
+            f"✅ Stimme aktualisiert für **{voter_name}**.",
+            ephemeral=True,
+        )
 
     async def on_time_select(self, interaction: discord.Interaction):
         await interaction.response.defer()
@@ -283,3 +288,8 @@ class RaidVoteView(View):
             for v in values:
                 await toggle_vote(session, self.raid_id, "time", v, interaction.user.id)
         await self.refresh_view(interaction)
+        voter_name = interaction.user.display_name
+        await interaction.followup.send(
+            f"✅ Stimme aktualisiert für **{voter_name}**.",
+            ephemeral=True,
+        )
