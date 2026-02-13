@@ -144,7 +144,7 @@ async def refresh_raidlist_for_guild(client: discord.Client, guild_id: int) -> N
         lines = []
         for r in raids[:25]:
             lines.append(
-                f"• **{r.dungeon}** | 🆔 `{r.id}` | Min/Slot `{r.min_players}` | {_jump(r.guild_id, r.channel_id, r.message_id)}"
+                f"• **{r.dungeon}** | 🆔 `{r.display_id}` | Min/Slot `{r.min_players}` | {_jump(r.guild_id, r.channel_id, r.message_id)}"
             )
         e.add_field(name="Liste", value="\n".join(lines)[:1024], inline=False)
     e.set_footer(text="Auto-Update aktiv.")
