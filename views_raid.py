@@ -290,7 +290,7 @@ class RaidCreateModal(discord.ui.Modal, title="Raid erstellen"):
 
         # create raid + post planner message
         async with session_scope() as session:
-            s = await get_settings(session, interaction.guild.id)
+            s = await get_settings(session, interaction.guild.id, interaction.guild.name)
             if not s.planner_channel_id or not s.participants_channel_id:
                 return await interaction.followup.send(
                     "❌ Settings fehlen. Bitte `/settings` konfigurieren.",

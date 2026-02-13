@@ -14,12 +14,14 @@ def normalize_list(text: str) -> list[str]:
             out.append(s)
     return out[:25]
 
-async def get_settings(session: AsyncSession, guild_id: int) -> GuildSettings:
+async def get_settings(session: AsyncSession, guild_id: int, guild_name: str | None = None) -> GuildSettings:
     s = await session.get(GuildSettings, guild_id)
     if not s:
-        s = GuildSettings(guild_id=guild_id)
+        s = GuildSettings(guild_id=guild_id, guild_name=guild_name)
         session.add(s)
         await session.flush()
+    elif guild_name and s.guild_name != guild_name:
+        s.guild_name = guild_name
     return s
 
 async def get_active_dungeons(session: AsyncSession) -> list[Dungeon]:

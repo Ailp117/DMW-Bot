@@ -29,6 +29,7 @@ from helpers import get_settings, delete_raid_cascade, get_options, purge_guild_
 from commands_admin import register_admin_commands
 from commands_raid import register_raid_commands
 from commands_purge import register_purge_commands
+from commands_remote import register_remote_commands
 from models import Raid, UserLevel, GuildSettings
 from roles import cleanup_temp_role
 from views_raid import RaidVoteView, cleanup_posted_slot_messages, sync_memberlists_for_raid
@@ -320,6 +321,7 @@ class RaidBot(discord.Client):
         register_admin_commands(self.tree)
         register_raid_commands(self.tree)
         register_purge_commands(self.tree)
+        register_remote_commands(self.tree)
 
         await self.restore_persistent_raid_views()
 
@@ -330,7 +332,7 @@ class RaidBot(discord.Client):
                 return await interaction.response.send_message("Nur im Server.", ephemeral=True)
 
             async with session_scope() as session:
-                s = await get_settings(session, interaction.guild.id)
+                s = await get_settings(session, interaction.guild.id, interaction.guild.name)
 
             view = SettingsView(interaction.guild.id)
             await interaction.response.send_message(embed=settings_embed(s, interaction.guild), view=view, ephemeral=True)
@@ -344,7 +346,7 @@ class RaidBot(discord.Client):
                 return await interaction.response.send_message("Nur im Server.", ephemeral=True)
 
             async with session_scope() as session:
-                settings = await get_settings(session, interaction.guild.id)
+                settings = await get_settings(session, interaction.guild.id, interaction.guild.name)
 
             me = interaction.guild.me or interaction.guild.get_member(self.user.id if self.user else 0)
             planner_ch = interaction.guild.get_channel(int(settings.planner_channel_id)) if settings.planner_channel_id else None
@@ -395,10 +397,35 @@ class RaidBot(discord.Client):
                 "`/cancel_all_raids` - alle offenen Raids stoppen (Admin)\n"
                 "`/purge` - letzte N Nachrichten löschen\n"
                 "`/purgebot` - Bot-Nachrichten channelweit/serverweit löschen\n"
+                "`/help2` - Schritt-für-Schritt Raid-Anleitung im Channel posten\n"
                 "\n"
                 f"Stale-Raid Auto-Cleanup: offen > {STALE_RAID_HOURS}h wird automatisch beendet."
             )
             await interaction.response.send_message(text, ephemeral=True)
+
+        @self.tree.command(name="help2", description="Postet eine Schritt-für-Schritt Raid-Anleitung in diesen Channel")
+        async def help2_cmd(interaction: discord.Interaction):
+            if interaction.channel is None:
+                return await interaction.response.send_message("❌ Kein Channel gefunden.", ephemeral=True)
+
+            guide = (
+                "## 🧭 DMW Raid Bot – Schritt-für-Schritt\n"
+                "1. **Settings setzen**: Nutze `/settings` und wähle mindestens Planner + Participants Channel.\n"
+                "2. **Dungeon prüfen**: Mit `/dungeonlist` siehst du alle aktiven Dungeons.\n"
+                "3. **Raid erstellen**: Starte `/raidplan`, wähle Dungeon, Tage, Uhrzeiten und Mindestspieler.\n"
+                "4. **Abstimmen lassen**: Mitglieder stimmen im Raid-Post per Auswahlfeldern für Tage/Uhrzeiten ab.\n"
+                "5. **Raid verwalten**: Der Bot aktualisiert Teilnehmer-/Slot-Listen automatisch anhand der Votes.\n"
+                "6. **Raidliste aktualisieren**: Bei Bedarf `/raidlist` ausführen.\n"
+                "7. **Raid beenden**: Der Ersteller klickt auf **\"Raid beenden\"** im Raid-Post.\n"
+                "8. **Admin-Notfall**: `/cancel_all_raids` bricht alle offenen Raids im aktuellen Server ab."
+            )
+
+            try:
+                await interaction.channel.send(guide)
+            except discord.Forbidden:
+                return await interaction.response.send_message("❌ Ich darf in diesem Channel nicht schreiben.", ephemeral=True)
+
+            await interaction.response.send_message("✅ Anleitung wurde in diesen Channel gepostet.", ephemeral=True)
 
         @self.tree.command(name="restart", description="Startet den Bot-Prozess neu")
         @admin_or_privileged_check()
@@ -487,8 +514,9 @@ class RaidBot(discord.Client):
     async def _run_self_tests_once(self):
         registered_commands = {cmd.name for cmd in self.tree.get_commands()}
         expected_commands = {
-            "settings", "status", "help", "restart",
+            "settings", "status", "help", "help2", "restart",
             "raidplan", "raidlist", "dungeonlist", "cancel_all_raids", "purge", "purgebot",
+            "remote_guilds", "remote_cancel_all_raids", "remote_raidlist",
         }
         missing = sorted(expected_commands - registered_commands)
         if missing:
@@ -638,6 +666,12 @@ class RaidBot(discord.Client):
             log.exception("Failed to remove database data for removed guild %s", guild.id)
 
     async def on_guild_join(self, guild: discord.Guild):
+        try:
+            async with session_scope() as session:
+                await get_settings(session, guild.id, guild.name)
+        except Exception:
+            log.exception("Failed to update guild settings name for guild %s", guild.id)
+
         try:
             await self.tree.sync(guild=discord.Object(id=guild.id))
             log.info("Synced commands for newly joined guild %s", guild.id)

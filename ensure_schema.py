@@ -11,6 +11,14 @@ def _ensure_user_levels_username_column(sync_conn) -> None:
         sync_conn.execute(text("ALTER TABLE user_levels ADD COLUMN username TEXT"))
 
 
+
+
+def _ensure_guild_settings_name_column(sync_conn) -> None:
+    inspector = inspect(sync_conn)
+    columns = {col["name"] for col in inspector.get_columns("guild_settings")}
+    if "guild_name" not in columns:
+        sync_conn.execute(text("ALTER TABLE guild_settings ADD COLUMN guild_name TEXT"))
+
 def _ensure_raids_display_id_column(sync_conn) -> None:
     inspector = inspect(sync_conn)
     columns = {col["name"] for col in inspector.get_columns("raids")}
@@ -39,4 +47,5 @@ async def ensure_schema():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_ensure_user_levels_username_column)
+        await conn.run_sync(_ensure_guild_settings_name_column)
         await conn.run_sync(_ensure_raids_display_id_column)
