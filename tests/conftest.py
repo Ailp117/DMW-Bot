@@ -12,8 +12,12 @@ def config() -> BotConfig:
     return BotConfig(
         discord_token="token",
         database_url="postgresql+asyncpg://user:pass@localhost:5432/db",
+        privileged_user_id=403988960638009347,
         db_echo=False,
         enable_message_content_intent=True,
+        level_persist_interval_seconds=120,
+        message_xp_interval_seconds=15,
+        levelup_message_cooldown_seconds=20,
         log_guild_id=0,
         log_channel_id=0,
         self_test_interval_seconds=900,
