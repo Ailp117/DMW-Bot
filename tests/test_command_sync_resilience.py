@@ -156,6 +156,32 @@ class CommandSyncResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(missing, [])
         self.assertEqual(unexpected, ["unexpected_demo"])
 
+    def test_build_ready_announcement_mentions_priority_user_when_configured(self):
+        with patch.object(main, "LOG_PRIORITY_USER_ID", 987654321):
+            message = self.bot._build_ready_announcement()
+
+        self.assertIn("<@987654321>", message)
+        self.assertIn("in Bereitschaft", message)
+
+    async def test_on_ready_sends_ready_announcement_only_once(self):
+        self.bot.log_channel = object()
+        self.bot.log_forwarder_task = _DummyTask()
+
+        self.bot._cleanup_removed_guild_data_on_startup = AsyncMock()
+        self.bot._sync_commands_for_known_guilds = AsyncMock()
+        self.bot._refresh_raidlists_for_all_guilds = AsyncMock()
+        self.bot._restore_memberlists_for_all_guilds = AsyncMock()
+
+        await self.bot.on_ready()
+        await self.bot.on_ready()
+
+        queued = []
+        while not self.bot.log_forward_queue.empty():
+            queued.append(self.bot.log_forward_queue.get_nowait())
+
+        ready_messages = [m for m in queued if "in Bereitschaft" in m]
+        self.assertEqual(len(ready_messages), 1)
+
     async def test_run_self_tests_once_queries_same_database_session_scope(self):
         fake_commands = [SimpleNamespace(name=n) for n in [
             "settings", "status", "help", "help2", "restart",

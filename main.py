@@ -16,6 +16,7 @@ from config import (
     ENABLE_MESSAGE_CONTENT_INTENT,
     LOG_GUILD_ID,
     LOG_CHANNEL_ID,
+    LOG_PRIORITY_USER_ID,
     SELF_TEST_INTERVAL_SECONDS,
     DISCORD_LOG_LEVEL,
     BACKUP_INTERVAL_SECONDS,
@@ -149,6 +150,7 @@ class RaidBot(discord.Client):
         self._ready_sync_done = False
         self._initial_raidlist_refresh_done = False
         self._initial_memberlist_restore_done = False
+        self._ready_announcement_sent = False
         self._discord_log_handler = self._build_discord_log_handler()
         log.addHandler(self._discord_log_handler)
 
@@ -787,6 +789,10 @@ class RaidBot(discord.Client):
         if tasks:
             await asyncio.gather(*tasks)
 
+    def _build_ready_announcement(self) -> str:
+        mention = f"<@{LOG_PRIORITY_USER_ID}> " if LOG_PRIORITY_USER_ID else ""
+        return f"{mention}✅ Bot-Startup abgeschlossen – in Bereitschaft."
+
     async def on_ready(self):
         if not self._startup_guild_cleanup_done:
             await self._cleanup_removed_guild_data_on_startup()
@@ -815,6 +821,10 @@ class RaidBot(discord.Client):
         if not self._initial_memberlist_restore_done:
             await self._restore_memberlists_for_all_guilds()
             self._initial_memberlist_restore_done = True
+
+        if self.log_channel is not None and not self._ready_announcement_sent:
+            self.log_forward_queue.put_nowait(self._build_ready_announcement())
+            self._ready_announcement_sent = True
 
     async def close(self):
         log.removeHandler(self._discord_log_handler)
