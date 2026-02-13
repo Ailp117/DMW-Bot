@@ -1,35 +1,101 @@
-# AGENTS.md — Discord Bot Rewrite Rules (Binding)
+# AGENTS.md — Discord Bot Rewrite Execution Rules (Binding)
 
-Codex: These rules are binding for EVERY step you take in this repo.
+These rules are binding for every step taken in this repository.
 
-## Goal
-Complete a full rewrite-from-scratch of the Discord bot with 100% feature parity and the existing DB schema unchanged. The work is not done until all checks pass and code is shipped (not just documentation).
+######################################################################
+# PRIMARY GOAL
+######################################################################
 
-## Non-negotiables
-- Do NOT stop after listing required inputs. Continue using the provided inputs.
-- Do NOT "only update README/DELIVERY_REPORT". The primary deliverable is working code.
-- DB schema must remain unchanged. No renames. No new columns/constraints unless explicitly requested.
-- If any info is missing, ask targeted questions, then immediately continue implementation once answered.
+Perform a complete rewrite-from-scratch of the Discord bot
+with 100% feature parity and the existing database schema unchanged.
 
-## Must-run commands (always)
-- `pip install -r requirements.txt`
-- `pytest -q`
+The task is NOT documentation.
+The task is NOT a report.
+The task is WORKING, TESTED, CI-READY SOURCE CODE.
 
-## Proof requirement
-In your final response, include:
-- command list executed
-- full `pytest -q` output (copied)
-- checklist of Definition of Done marked complete
+######################################################################
+# NON-NEGOTIABLE RULES
+######################################################################
 
-## Iteration loop
+1. Do NOT stop after listing required inputs.
+2. Do NOT only edit README.md or DELIVERY_REPORT.md.
+3. Primary deliverable is WORKING SOURCE CODE.
+4. Database schema must remain unchanged.
+5. No renaming tables, columns, constraints.
+6. No adding constraints unless explicitly requested.
+7. If information is missing:
+   - Ask specifically what is missing.
+   - After receiving it, immediately continue implementation.
+
+######################################################################
+# ANTI-REPORT RULE
+######################################################################
+
+You are not allowed to complete this task by only:
+
+- editing README.md
+- editing DELIVERY_REPORT.md
+- updating bot.yml
+- summarizing actions
+
+If core application files (main.py, commands/, views/, services/, repositories/, db/, etc.)
+are not created or modified, the task is incomplete.
+
+######################################################################
+# EXECUTION LOOP
+######################################################################
+
 If tests fail:
-1) fix code
-2) rerun `pytest -q`
-3) repeat until green
 
-## Deliverables
-- Full project tree
-- Full code for all changed/new files
-- Updated `.github/workflows/bot.yml` aligned with the new codebase
-- README with setup + GH Actions + uptime strategy + troubleshooting
-- Tests included and passing
+1. Fix the code.
+2. Rerun `pytest -q`.
+3. Repeat until all tests pass.
+
+Never declare completion while tests are failing.
+
+######################################################################
+# REQUIRED COMMANDS
+######################################################################
+
+You must execute and show output for:
+
+pip install -r requirements.txt
+pytest -q
+
+The full pytest output must be displayed.
+
+######################################################################
+# EXECUTION ENFORCEMENT
+######################################################################
+
+Before declaring completion, verify:
+
+- At least one core application file changed
+- tests/ directory exists with real test cases
+- pytest output is shown
+- GitHub Actions workflow runs pytest
+- No interaction response errors remain
+- Persistent views work
+- Feature parity verified
+
+If any condition is false → continue working.
+
+######################################################################
+# DEFINITION OF DONE
+######################################################################
+
+The task is complete only if:
+
+[ ] Feature Matrix created  
+[ ] Rewrite complete  
+[ ] DB schema unchanged  
+[ ] Persistent views restored  
+[ ] Voting logic preserved  
+[ ] Cleanup logic preserved  
+[ ] No interaction double responses  
+[ ] Tests green  
+[ ] CI workflow aligned  
+[ ] README complete  
+[ ] Full pytest output shown  
+
+If any box unchecked → continue implementation.
