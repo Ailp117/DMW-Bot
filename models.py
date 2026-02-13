@@ -73,6 +73,7 @@ class Raid(Base):
     __tablename__ = "raids"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    display_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
     channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False)   # planner channel
     creator_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
@@ -86,6 +87,7 @@ class Raid(Base):
     temp_role_created: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 Index("ix_raids_guild_status_created", Raid.guild_id, Raid.status, Raid.created_at)
+Index("ix_raids_guild_display_id_unique", Raid.guild_id, Raid.display_id, unique=True)
 
 
 # === raid_options ===

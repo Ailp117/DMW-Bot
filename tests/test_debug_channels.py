@@ -76,7 +76,7 @@ class DebugChannelTests(unittest.IsolatedAsyncioTestCase):
         client = _FakeClient(channel)
         guild = SimpleNamespace(id=views_raid.LOG_GUILD_ID, name="Debug")
         interaction = SimpleNamespace(guild=guild, client=client)
-        raid = SimpleNamespace(id=1, dungeon="Test")
+        raid = SimpleNamespace(id=1, display_id=1, dungeon="Test")
 
         await views_raid._mirror_memberlist_debug(interaction, raid, ["line"])
         self.assertEqual(channel.sent, [])
@@ -110,7 +110,7 @@ class DebugChannelTests(unittest.IsolatedAsyncioTestCase):
         client = _FakeClient(channel)
         guild = SimpleNamespace(id=888888, name="Guild")
         interaction = SimpleNamespace(guild=guild, client=client)
-        raid = SimpleNamespace(id=1, dungeon="Test")
+        raid = SimpleNamespace(id=1, display_id=1, dungeon="Test")
         cache_store = {}
 
         @asynccontextmanager
