@@ -66,8 +66,9 @@ async def test_debounced_raidlist_refresh_persists_state():
         calls.append(("refresh", guild_id, force))
         return True
 
-    async def fake_persist():
+    async def fake_persist(*, dirty_tables=None):
         calls.append(("persist",))
+        assert dirty_tables == {"settings", "debug_cache"}
         return True
 
     bot._refresh_raidlist_for_guild = fake_refresh

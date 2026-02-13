@@ -210,7 +210,7 @@ def sync_memberlist_slots(
             day_label=day,
             time_label=time_label,
             channel_id=participants_channel_id,
-            message_id=row.message_id,
+            message_id=int(row.message_id) if row.message_id is not None else (raid_id * 100000) + len(active_slots),
         )
         updated += 1
 

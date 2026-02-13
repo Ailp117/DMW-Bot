@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
-from datetime import date, datetime, time
-import hashlib
-import json
+from dataclasses import dataclass
+from typing import Any, Iterable, Mapping
 
-from sqlalchemy import delete, select
+from sqlalchemy import and_, delete, select, tuple_, update
 
 from bot.config import BotConfig
 from db.models import (
@@ -37,52 +35,211 @@ from db.repository import (
 from db.session import SessionManager
 
 
+@dataclass(frozen=True)
+class _TableSpec:
+    name: str
+    model: type[Any]
+    pk_columns: tuple[str, ...]
+
+
 class RepositoryPersistence:
+    _DELETE_CHUNK_SIZE = 500
+    _INSERT_CHUNK_SIZE = 500
+    _FULL_SCAN_EVERY_HINTED_FLUSHES = 25
+    _TABLE_SPECS: dict[str, _TableSpec] = {
+        "settings": _TableSpec("settings", GuildSettings, ("guild_id",)),
+        "dungeons": _TableSpec("dungeons", Dungeon, ("id",)),
+        "raids": _TableSpec("raids", Raid, ("id",)),
+        "raid_options": _TableSpec("raid_options", RaidOption, ("id",)),
+        "raid_votes": _TableSpec("raid_votes", RaidVote, ("id",)),
+        "raid_posted_slots": _TableSpec("raid_posted_slots", RaidPostedSlot, ("id",)),
+        "raid_templates": _TableSpec("raid_templates", RaidTemplate, ("id",)),
+        "raid_attendance": _TableSpec("raid_attendance", RaidAttendance, ("id",)),
+        "user_levels": _TableSpec("user_levels", UserLevel, ("guild_id", "user_id")),
+        "debug_cache": _TableSpec("debug_cache", DebugMirrorCache, ("cache_key",)),
+    }
+    _INSERT_UPDATE_ORDER: tuple[str, ...] = (
+        "settings",
+        "dungeons",
+        "raids",
+        "raid_options",
+        "raid_votes",
+        "raid_posted_slots",
+        "raid_templates",
+        "raid_attendance",
+        "user_levels",
+        "debug_cache",
+    )
+    _DELETE_ORDER: tuple[str, ...] = (
+        "raid_votes",
+        "raid_options",
+        "raid_posted_slots",
+        "raid_templates",
+        "raids",
+        "raid_attendance",
+        "user_levels",
+        "debug_cache",
+        "dungeons",
+        "settings",
+    )
+    _TABLE_FIELDS: dict[str, tuple[str, ...]] = {
+        "dungeons": ("id", "name", "short_code", "is_active", "sort_order"),
+        "settings": (
+            "guild_id",
+            "guild_name",
+            "participants_channel_id",
+            "raidlist_channel_id",
+            "raidlist_message_id",
+            "planner_channel_id",
+            "default_min_players",
+            "templates_enabled",
+            "template_manager_role_id",
+        ),
+        "raids": (
+            "id",
+            "display_id",
+            "guild_id",
+            "channel_id",
+            "creator_id",
+            "dungeon",
+            "status",
+            "created_at",
+            "message_id",
+            "min_players",
+            "participants_posted",
+            "temp_role_id",
+            "temp_role_created",
+        ),
+        "raid_options": ("id", "raid_id", "kind", "label"),
+        "raid_votes": ("id", "raid_id", "kind", "option_label", "user_id"),
+        "raid_posted_slots": ("id", "raid_id", "day_label", "time_label", "channel_id", "message_id"),
+        "raid_templates": ("id", "guild_id", "dungeon_id", "template_name", "template_data"),
+        "raid_attendance": ("id", "guild_id", "raid_display_id", "dungeon", "user_id", "status", "marked_by_user_id"),
+        "user_levels": ("guild_id", "user_id", "xp", "level", "username"),
+        "debug_cache": ("cache_key", "kind", "guild_id", "raid_id", "message_id", "payload_hash"),
+    }
+
     def __init__(self, config: BotConfig) -> None:
         self.session_manager = SessionManager(config)
         self._lock = asyncio.Lock()
-        self._last_flush_fingerprint: str | None = None
+        self._last_flush_rows: dict[str, dict[object, dict[str, object]]] | None = None
+        self._hinted_flushes_since_full_scan = 0
 
     @staticmethod
-    def _normalize_fingerprint_value(value: object) -> object:
-        if isinstance(value, datetime):
-            return value.isoformat()
-        if isinstance(value, date):
-            return value.isoformat()
-        if isinstance(value, time):
-            return value.isoformat()
-        return value
+    def _table_rows_map(repo: InMemoryRepository, table_name: str) -> Mapping[Any, Any]:
+        if table_name == "dungeons":
+            return repo.dungeons
+        if table_name == "settings":
+            return repo.settings
+        if table_name == "raids":
+            return repo.raids
+        if table_name == "raid_options":
+            return repo.raid_options
+        if table_name == "raid_votes":
+            return repo.raid_votes
+        if table_name == "raid_posted_slots":
+            return repo.raid_posted_slots
+        if table_name == "raid_templates":
+            return repo.raid_templates
+        if table_name == "raid_attendance":
+            return repo.raid_attendance
+        if table_name == "user_levels":
+            return repo.user_levels
+        if table_name == "debug_cache":
+            return repo.debug_cache
+        raise KeyError(f"Unsupported table name: {table_name}")
 
-    def _snapshot_fingerprint(self, repo: InMemoryRepository) -> str:
-        def _rows_signature(rows: list[object]) -> list[dict[str, object]]:
-            normalized_rows: list[dict[str, object]] = []
-            for row in rows:
-                data = asdict(row)
-                normalized_rows.append(
-                    {
-                        key: self._normalize_fingerprint_value(value)
-                        for key, value in sorted(data.items(), key=lambda item: item[0])
-                    }
-                )
-            normalized_rows.sort(
-                key=lambda payload: json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-            )
-            return normalized_rows
+    def _snapshot_rows_for_tables(
+        self,
+        repo: InMemoryRepository,
+        table_names: set[str] | tuple[str, ...] | list[str],
+    ) -> dict[str, dict[object, dict[str, object]]]:
+        snapshot: dict[str, dict[object, dict[str, object]]] = {}
+        for table_name in table_names:
+            rows = self._table_rows_map(repo, table_name)
+            fields = self._TABLE_FIELDS[table_name]
+            snapshot[table_name] = {
+                key: {field: getattr(row, field) for field in fields}
+                for key, row in rows.items()
+            }
+        return snapshot
 
-        payload = {
-            "dungeons": _rows_signature(list(repo.dungeons.values())),
-            "settings": _rows_signature(list(repo.settings.values())),
-            "raids": _rows_signature(list(repo.raids.values())),
-            "raid_options": _rows_signature(list(repo.raid_options.values())),
-            "raid_votes": _rows_signature(list(repo.raid_votes.values())),
-            "raid_posted_slots": _rows_signature(list(repo.raid_posted_slots.values())),
-            "raid_templates": _rows_signature(list(repo.raid_templates.values())),
-            "raid_attendance": _rows_signature(list(repo.raid_attendance.values())),
-            "user_levels": _rows_signature(list(repo.user_levels.values())),
-            "debug_cache": _rows_signature(list(repo.debug_cache.values())),
-        }
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
+    def _snapshot_rows(self, repo: InMemoryRepository) -> dict[str, dict[object, dict[str, object]]]:
+        return self._snapshot_rows_for_tables(repo, list(self._TABLE_SPECS.keys()))
+
+    @classmethod
+    def _normalize_dirty_table_hints(cls, dirty_tables: Iterable[str] | None) -> set[str]:
+        if dirty_tables is None:
+            return set()
+        return {str(table_name) for table_name in dirty_tables if str(table_name) in cls._TABLE_SPECS}
+
+    @staticmethod
+    def _stable_sort_key(value: object) -> str:
+        return repr(value)
+
+    @staticmethod
+    def _pk_clause(spec: _TableSpec, key: object):
+        if len(spec.pk_columns) == 1:
+            return getattr(spec.model, spec.pk_columns[0]) == key
+        if not isinstance(key, tuple):
+            raise ValueError(f"Composite key expected for table {spec.name}")
+        if len(key) != len(spec.pk_columns):
+            raise ValueError(f"Invalid key shape for table {spec.name}")
+        return and_(*[getattr(spec.model, column) == key[index] for index, column in enumerate(spec.pk_columns)])
+
+    @staticmethod
+    def _iter_chunks(values: list[object], chunk_size: int):
+        for index in range(0, len(values), chunk_size):
+            yield values[index : index + chunk_size]
+
+    async def _apply_table_deletes(
+        self,
+        session: Any,
+        spec: _TableSpec,
+        previous_rows: dict[object, dict[str, object]],
+        current_rows: dict[object, dict[str, object]],
+    ) -> None:
+        removed_keys = sorted(set(previous_rows) - set(current_rows), key=self._stable_sort_key)
+        if not removed_keys:
+            return
+
+        if len(spec.pk_columns) == 1:
+            pk_column = getattr(spec.model, spec.pk_columns[0])
+            for key_chunk in self._iter_chunks(removed_keys, self._DELETE_CHUNK_SIZE):
+                await session.execute(delete(spec.model).where(pk_column.in_(key_chunk)))
+            return
+
+        pk_expr = tuple_(*[getattr(spec.model, column) for column in spec.pk_columns])
+        for key_chunk in self._iter_chunks(removed_keys, self._DELETE_CHUNK_SIZE):
+            await session.execute(delete(spec.model).where(pk_expr.in_(key_chunk)))
+
+    async def _apply_table_upserts(
+        self,
+        session: Any,
+        spec: _TableSpec,
+        previous_rows: dict[object, dict[str, object]],
+        current_rows: dict[object, dict[str, object]],
+    ) -> None:
+        previous_keys = set(previous_rows)
+        current_keys = set(current_rows)
+        changed_keys = sorted(
+            [key for key in (current_keys & previous_keys) if current_rows[key] != previous_rows[key]],
+            key=self._stable_sort_key,
+        )
+        for key in changed_keys:
+            previous_row = previous_rows[key]
+            values = {
+                column: value
+                for column, value in current_rows[key].items()
+                if column not in spec.pk_columns and previous_row.get(column) != value
+            }
+            if not values:
+                continue
+            await session.execute(update(spec.model).where(self._pk_clause(spec, key)).values(**values))
+
+        added_keys = sorted(current_keys - previous_keys, key=self._stable_sort_key)
+        for key_chunk in self._iter_chunks(added_keys, self._INSERT_CHUNK_SIZE):
+            session.add_all([spec.model(**current_rows[key]) for key in key_chunk])
 
     async def load(self, repo: InMemoryRepository) -> None:
         async with self._lock:
@@ -205,169 +362,68 @@ class RepositoryPersistence:
                 )
 
             repo.recalculate_counters()
-            self._last_flush_fingerprint = self._snapshot_fingerprint(repo)
+            snapshot = self._snapshot_rows(repo)
+            self._last_flush_rows = snapshot
+            self._hinted_flushes_since_full_scan = 0
 
-    async def flush(self, repo: InMemoryRepository) -> None:
+    async def flush(self, repo: InMemoryRepository, *, dirty_tables: Iterable[str] | None = None) -> None:
         async with self._lock:
-            fingerprint = self._snapshot_fingerprint(repo)
-            if fingerprint == self._last_flush_fingerprint:
+            if self._last_flush_rows is None:
+                previous_snapshot = {table_name: {} for table_name in self._TABLE_SPECS}
+                candidate_tables = set(self._TABLE_SPECS)
+                self._hinted_flushes_since_full_scan = 0
+            else:
+                previous_snapshot = self._last_flush_rows
+                hinted_tables = self._normalize_dirty_table_hints(dirty_tables)
+                if not hinted_tables:
+                    candidate_tables = set(self._TABLE_SPECS)
+                    self._hinted_flushes_since_full_scan = 0
+                else:
+                    self._hinted_flushes_since_full_scan += 1
+                    if self._hinted_flushes_since_full_scan >= self._FULL_SCAN_EVERY_HINTED_FLUSHES:
+                        candidate_tables = set(self._TABLE_SPECS)
+                        self._hinted_flushes_since_full_scan = 0
+                    else:
+                        candidate_tables = hinted_tables
+
+            candidate_snapshot = self._snapshot_rows_for_tables(repo, candidate_tables)
+            changed_tables = {
+                table_name
+                for table_name in candidate_tables
+                if candidate_snapshot.get(table_name, {}) != previous_snapshot.get(table_name, {})
+            }
+            if not changed_tables:
+                if self._last_flush_rows is None:
+                    self._last_flush_rows = {
+                        table_name: candidate_snapshot.get(table_name, {})
+                        for table_name in self._TABLE_SPECS
+                    }
                 return
+            snapshot = {
+                table_name: previous_snapshot.get(table_name, {})
+                for table_name in self._TABLE_SPECS
+            }
+            snapshot.update({table_name: candidate_snapshot[table_name] for table_name in changed_tables})
 
             async with self.session_manager.session_scope() as session:
-                # Delete dependent rows first.
-                await session.execute(delete(RaidVote))
-                await session.execute(delete(RaidOption))
-                await session.execute(delete(RaidPostedSlot))
-                await session.execute(delete(RaidAttendance))
-                await session.execute(delete(RaidTemplate))
-                await session.execute(delete(Raid))
-                await session.execute(delete(UserLevel))
-                await session.execute(delete(DebugMirrorCache))
-                await session.execute(delete(Dungeon))
-                await session.execute(delete(GuildSettings))
-
-                session.add_all(
-                    [
-                        GuildSettings(
-                            guild_id=row.guild_id,
-                            guild_name=row.guild_name,
-                            participants_channel_id=row.participants_channel_id,
-                            raidlist_channel_id=row.raidlist_channel_id,
-                            raidlist_message_id=row.raidlist_message_id,
-                            planner_channel_id=row.planner_channel_id,
-                            default_min_players=row.default_min_players,
-                            templates_enabled=row.templates_enabled,
-                            template_manager_role_id=row.template_manager_role_id,
-                        )
-                        for row in repo.settings.values()
-                    ]
-                )
-
-                session.add_all(
-                    [
-                        Dungeon(
-                            id=row.id,
-                            name=row.name,
-                            short_code=row.short_code,
-                            is_active=row.is_active,
-                            sort_order=row.sort_order,
-                        )
-                        for row in repo.dungeons.values()
-                    ]
-                )
-
-                session.add_all(
-                    [
-                        Raid(
-                            id=row.id,
-                            display_id=row.display_id,
-                            guild_id=row.guild_id,
-                            channel_id=row.channel_id,
-                            creator_id=row.creator_id,
-                            dungeon=row.dungeon,
-                            status=row.status,
-                            created_at=row.created_at,
-                            message_id=row.message_id,
-                            min_players=row.min_players,
-                            participants_posted=row.participants_posted,
-                            temp_role_id=row.temp_role_id,
-                            temp_role_created=row.temp_role_created,
-                        )
-                        for row in repo.raids.values()
-                    ]
-                )
-
-                session.add_all(
-                    [
-                        RaidOption(
-                            id=row.id,
-                            raid_id=row.raid_id,
-                            kind=row.kind,
-                            label=row.label,
-                        )
-                        for row in repo.raid_options.values()
-                    ]
-                )
-
-                session.add_all(
-                    [
-                        RaidVote(
-                            id=row.id,
-                            raid_id=row.raid_id,
-                            kind=row.kind,
-                            option_label=row.option_label,
-                            user_id=row.user_id,
-                        )
-                        for row in repo.raid_votes.values()
-                    ]
-                )
-
-                session.add_all(
-                    [
-                        RaidPostedSlot(
-                            id=row.id,
-                            raid_id=row.raid_id,
-                            day_label=row.day_label,
-                            time_label=row.time_label,
-                            channel_id=row.channel_id,
-                            message_id=row.message_id,
-                        )
-                        for row in repo.raid_posted_slots.values()
-                    ]
-                )
-
-                session.add_all(
-                    [
-                        RaidTemplate(
-                            id=row.id,
-                            guild_id=row.guild_id,
-                            dungeon_id=row.dungeon_id,
-                            template_name=row.template_name,
-                            template_data=row.template_data,
-                        )
-                        for row in repo.raid_templates.values()
-                    ]
-                )
-
-                session.add_all(
-                    [
-                        RaidAttendance(
-                            id=row.id,
-                            guild_id=row.guild_id,
-                            raid_display_id=row.raid_display_id,
-                            dungeon=row.dungeon,
-                            user_id=row.user_id,
-                            status=row.status,
-                            marked_by_user_id=row.marked_by_user_id,
-                        )
-                        for row in repo.raid_attendance.values()
-                    ]
-                )
-
-                session.add_all(
-                    [
-                        UserLevel(
-                            guild_id=row.guild_id,
-                            user_id=row.user_id,
-                            xp=row.xp,
-                            level=row.level,
-                            username=row.username,
-                        )
-                        for row in repo.user_levels.values()
-                    ]
-                )
-
-                session.add_all(
-                    [
-                        DebugMirrorCache(
-                            cache_key=row.cache_key,
-                            kind=row.kind,
-                            guild_id=row.guild_id,
-                            raid_id=row.raid_id,
-                            message_id=row.message_id,
-                            payload_hash=row.payload_hash,
-                        )
-                        for row in repo.debug_cache.values()
-                    ]
-                )
-            self._last_flush_fingerprint = fingerprint
+                for table_name in self._DELETE_ORDER:
+                    if table_name not in changed_tables:
+                        continue
+                    spec = self._TABLE_SPECS[table_name]
+                    await self._apply_table_deletes(
+                        session,
+                        spec,
+                        previous_snapshot.get(table_name, {}),
+                        snapshot.get(table_name, {}),
+                    )
+                for table_name in self._INSERT_UPDATE_ORDER:
+                    if table_name not in changed_tables:
+                        continue
+                    spec = self._TABLE_SPECS[table_name]
+                    await self._apply_table_upserts(
+                        session,
+                        spec,
+                        previous_snapshot.get(table_name, {}),
+                        snapshot.get(table_name, {}),
+                    )
+            self._last_flush_rows = snapshot

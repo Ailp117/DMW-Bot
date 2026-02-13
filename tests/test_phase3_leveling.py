@@ -42,6 +42,56 @@ def test_message_xp_gain_is_normalized_to_integer(repo):
     assert isinstance(result.xp, int)
 
 
+def test_message_xp_default_gain_is_five(repo):
+    service = LevelingService()
+    result = service.update_message_xp(
+        repo,
+        guild_id=1,
+        user_id=43,
+        username="User43",
+        now=datetime(2026, 2, 13, 21, 1, 0, tzinfo=UTC),
+    )
+
+    assert result.xp_awarded is True
+    assert result.xp == 5
+
+
+def test_message_xp_invalid_gain_is_ignored(repo):
+    service = LevelingService()
+    result = service.update_message_xp(
+        repo,
+        guild_id=1,
+        user_id=44,
+        username="User44",
+        gained_xp="abc",  # type: ignore[arg-type]
+        now=datetime(2026, 2, 13, 21, 2, 0, tzinfo=UTC),
+    )
+
+    assert result.xp_awarded is False
+    assert result.xp == 0
+
+
+def test_message_xp_has_no_internal_cap(repo):
+    service = LevelingService()
+    row = repo.get_or_create_user_level(1, 45, "User45")
+    row.xp = 2_147_483_646
+    row.level = calculate_level_from_xp(row.xp)
+
+    result = service.update_message_xp(
+        repo,
+        guild_id=1,
+        user_id=45,
+        username="User45",
+        gained_xp=100,
+        now=datetime(2026, 2, 13, 21, 3, 0, tzinfo=UTC),
+    )
+
+    assert result.xp_awarded is True
+    assert result.xp == 2_147_483_746
+    assert row.xp == 2_147_483_746
+    assert row.level == result.current_level
+
+
 def test_keyword_helpers_word_boundary():
     assert contains_nanomon_keyword("nanomon") is True
     assert contains_nanomon_keyword("xnanomonx") is False

@@ -5,6 +5,7 @@ import os
 
 
 TRUTHY_VALUES = {"1", "true", "yes", "on"}
+VALID_DISCORD_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
 
 def env_bool(name: str, *, default: bool = False) -> bool:
@@ -65,6 +66,9 @@ class BotConfig:
             raise ValueError("LOG_GUILD_ID/LOG_CHANNEL_ID must be >= 0")
         if self.raidlist_debug_channel_id < 0 or self.memberlist_debug_channel_id < 0:
             raise ValueError("Debug channel IDs must be >= 0")
+        if self.discord_log_level not in VALID_DISCORD_LOG_LEVELS:
+            valid = ", ".join(sorted(VALID_DISCORD_LOG_LEVELS))
+            raise ValueError(f"DISCORD_LOG_LEVEL must be one of: {valid}")
 
 
 def load_config() -> BotConfig:
@@ -83,7 +87,7 @@ def load_config() -> BotConfig:
         backup_interval_seconds=env_int("BACKUP_INTERVAL_SECONDS", default=21600),
         raidlist_debug_channel_id=env_int("RAIDLIST_DEBUG_CHANNEL_ID", default=0),
         memberlist_debug_channel_id=env_int("MEMBERLIST_DEBUG_CHANNEL_ID", default=0),
-        discord_log_level=os.getenv("DISCORD_LOG_LEVEL", "DEBUG").strip().upper(),
+        discord_log_level=os.getenv("DISCORD_LOG_LEVEL", "INFO").strip().upper(),
     )
     cfg.validate()
     return cfg

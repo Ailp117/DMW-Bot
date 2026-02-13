@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Any, Iterable
 
-from sqlalchemy import text
+from sqlalchemy import Table, text
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncConnection
 
@@ -14,6 +14,11 @@ CRITICAL_INDEX_DDLS = (
     "CREATE UNIQUE INDEX IF NOT EXISTS ix_raid_attendance_unique_user ON public.raid_attendance (guild_id, raid_display_id, user_id)",
     "CREATE UNIQUE INDEX IF NOT EXISTS uq_raid_votes_unique ON public.raid_votes (raid_id, kind, option_label, user_id)",
     "CREATE UNIQUE INDEX IF NOT EXISTS uq_raid_options_raid_kind_label ON public.raid_options (raid_id, kind, label)",
+)
+BIGINT_COLUMN_UDT_NAMES = frozenset({"int8", "bigint"})
+REQUIRED_BIGINT_COLUMNS = (
+    ("user_levels", "xp"),
+    ("user_levels", "level"),
 )
 
 
@@ -41,7 +46,40 @@ async def fetch_public_columns(connection: AsyncConnection) -> dict[str, set[str
     return columns_by_table
 
 
-def _model_table_map() -> dict[str, object]:
+async def fetch_public_column_udt_names(connection: AsyncConnection) -> dict[tuple[str, str], str]:
+    result = await connection.execute(
+        text(
+            """
+            SELECT table_name, column_name, udt_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+            """
+        )
+    )
+    rows = result.fetchall()
+    udt_names_by_column: dict[tuple[str, str], str] = {}
+    for table_name, column_name, udt_name in rows:
+        udt_names_by_column[(str(table_name), str(column_name))] = str(udt_name or "").lower()
+    return udt_names_by_column
+
+
+async def fetch_public_rls_enabled_tables(connection: AsyncConnection) -> set[str]:
+    result = await connection.execute(
+        text(
+            """
+            SELECT cls.relname
+            FROM pg_class AS cls
+            JOIN pg_namespace AS ns ON ns.oid = cls.relnamespace
+            WHERE ns.nspname = 'public'
+              AND cls.relkind = 'r'
+              AND cls.relrowsecurity = true
+            """
+        )
+    )
+    return set(result.scalars().all())
+
+
+def _model_table_map() -> dict[str, Table]:
     return {table.name: table for table in Base.metadata.sorted_tables}
 
 
@@ -71,7 +109,7 @@ def _sql_literal(value: object) -> str:
     return f"'{text_value}'"
 
 
-def _column_default_sql(column) -> str | None:
+def _column_default_sql(column: Any) -> str | None:
     if column.server_default is not None and column.server_default.arg is not None:
         arg = column.server_default.arg
         if hasattr(arg, "compile"):
@@ -90,7 +128,7 @@ def _column_default_sql(column) -> str | None:
     return None
 
 
-def _build_add_column_sql(table_name: str, column) -> str:
+def _build_add_column_sql(table_name: str, column: Any) -> str:
     type_sql = column.type.compile(dialect=postgresql.dialect())
     default_sql = _column_default_sql(column)
 
@@ -102,6 +140,13 @@ def _build_add_column_sql(table_name: str, column) -> str:
     return (
         f'ALTER TABLE public."{table_name}" '
         f'ADD COLUMN IF NOT EXISTS "{column.name}" {type_sql}{default_clause}{not_null_clause}'
+    )
+
+
+def _build_alter_column_bigint_sql(table_name: str, column_name: str) -> str:
+    return (
+        f'ALTER TABLE public."{table_name}" '
+        f'ALTER COLUMN "{column_name}" TYPE BIGINT USING "{column_name}"::BIGINT'
     )
 
 
@@ -120,7 +165,7 @@ async def ensure_required_schema(
     existing_tables = await fetch_public_tables(connection)
     missing_tables = [table for table in required_list if table not in existing_tables]
     if missing_tables:
-        create_tables = [table_map[name] for name in missing_tables]
+        create_tables: list[Table] = [table_map[name] for name in missing_tables]
 
         def _sync_create(sync_connection):
             Base.metadata.create_all(sync_connection, tables=create_tables, checkfirst=True)
@@ -141,8 +186,28 @@ async def ensure_required_schema(
             known_columns.add(column.name)
         existing_columns[table_name] = known_columns
 
+    column_udt_names = await fetch_public_column_udt_names(connection)
+    for table_name, column_name in REQUIRED_BIGINT_COLUMNS:
+        if table_name not in required_list:
+            continue
+        udt_name = column_udt_names.get((table_name, column_name))
+        if udt_name in BIGINT_COLUMN_UDT_NAMES:
+            continue
+        if udt_name is None:
+            continue
+        ddl = _build_alter_column_bigint_sql(table_name, column_name)
+        await connection.execute(text(ddl))
+        changes.append(f"alter_column_type:{table_name}.{column_name}:bigint")
+
     for ddl in CRITICAL_INDEX_DDLS:
         await connection.execute(text(ddl))
+
+    rls_enabled_tables = await fetch_public_rls_enabled_tables(connection)
+    for table_name in required_list:
+        if table_name in rls_enabled_tables:
+            continue
+        await connection.execute(text(f'ALTER TABLE public."{table_name}" ENABLE ROW LEVEL SECURITY'))
+        changes.append(f"enable_rls:{table_name}")
 
     return changes
 
@@ -165,3 +230,16 @@ async def validate_required_tables(connection: AsyncConnection, required_tables:
 
     if missing_columns:
         raise RuntimeError(f"Missing required DB columns: {'; '.join(missing_columns)}")
+
+    udt_names = await fetch_public_column_udt_names(connection)
+    invalid_types: list[str] = []
+    for table_name, column_name in REQUIRED_BIGINT_COLUMNS:
+        if table_name not in required_list:
+            continue
+        udt_name = udt_names.get((table_name, column_name))
+        if udt_name is None:
+            continue
+        if udt_name not in BIGINT_COLUMN_UDT_NAMES:
+            invalid_types.append(f"{table_name}.{column_name}={udt_name}")
+    if invalid_types:
+        raise RuntimeError(f"Invalid required DB column types: {', '.join(invalid_types)}")

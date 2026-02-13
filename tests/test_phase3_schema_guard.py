@@ -39,8 +39,12 @@ async def test_validate_required_tables_detects_missing_table(monkeypatch):
     async def fake_columns(_connection):
         return {}
 
+    async def fake_column_types(_connection):
+        return {}
+
     monkeypatch.setattr("db.schema_guard.fetch_public_tables", fake_tables)
     monkeypatch.setattr("db.schema_guard.fetch_public_columns", fake_columns)
+    monkeypatch.setattr("db.schema_guard.fetch_public_column_udt_names", fake_column_types)
 
     with pytest.raises(RuntimeError, match="Missing required DB tables"):
         await validate_required_tables(connection=None)
@@ -59,8 +63,15 @@ async def test_validate_required_tables_detects_missing_columns(monkeypatch):
         out["raids"].remove("display_id")
         return out
 
+    async def fake_column_types(_connection):
+        return {
+            ("user_levels", "xp"): "int8",
+            ("user_levels", "level"): "int8",
+        }
+
     monkeypatch.setattr("db.schema_guard.fetch_public_tables", fake_tables)
     monkeypatch.setattr("db.schema_guard.fetch_public_columns", fake_columns)
+    monkeypatch.setattr("db.schema_guard.fetch_public_column_udt_names", fake_column_types)
 
     with pytest.raises(RuntimeError, match="Missing required DB columns"):
         await validate_required_tables(connection=None)
@@ -77,8 +88,15 @@ async def test_validate_required_tables_passes_for_complete_schema(monkeypatch):
     async def fake_columns(_connection):
         return {table: set(columns) for table, columns in expected_columns.items()}
 
+    async def fake_column_types(_connection):
+        return {
+            ("user_levels", "xp"): "int8",
+            ("user_levels", "level"): "int8",
+        }
+
     monkeypatch.setattr("db.schema_guard.fetch_public_tables", fake_tables)
     monkeypatch.setattr("db.schema_guard.fetch_public_columns", fake_columns)
+    monkeypatch.setattr("db.schema_guard.fetch_public_column_udt_names", fake_column_types)
 
     await validate_required_tables(connection=None)
 
@@ -97,8 +115,19 @@ async def test_ensure_required_schema_applies_missing_table_and_column(monkeypat
         out["raids"].remove("display_id")
         return out
 
+    async def fake_rls(_connection):
+        return set()
+
+    async def fake_column_types(_connection):
+        return {
+            ("user_levels", "xp"): "int8",
+            ("user_levels", "level"): "int8",
+        }
+
     monkeypatch.setattr("db.schema_guard.fetch_public_tables", fake_tables)
     monkeypatch.setattr("db.schema_guard.fetch_public_columns", fake_columns)
+    monkeypatch.setattr("db.schema_guard.fetch_public_rls_enabled_tables", fake_rls)
+    monkeypatch.setattr("db.schema_guard.fetch_public_column_udt_names", fake_column_types)
 
     connection = DummyConnection()
     changes = await ensure_required_schema(connection=connection)
@@ -120,11 +149,124 @@ async def test_ensure_required_schema_no_structural_change_when_complete(monkeyp
     async def fake_columns(_connection):
         return {table: set(columns) for table, columns in expected_columns.items()}
 
+    async def fake_rls(_connection):
+        return set(required)
+
+    async def fake_column_types(_connection):
+        return {
+            ("user_levels", "xp"): "int8",
+            ("user_levels", "level"): "int8",
+        }
+
     monkeypatch.setattr("db.schema_guard.fetch_public_tables", fake_tables)
     monkeypatch.setattr("db.schema_guard.fetch_public_columns", fake_columns)
+    monkeypatch.setattr("db.schema_guard.fetch_public_rls_enabled_tables", fake_rls)
+    monkeypatch.setattr("db.schema_guard.fetch_public_column_udt_names", fake_column_types)
 
     connection = DummyConnection()
     changes = await ensure_required_schema(connection=connection)
 
     assert connection.run_sync_calls == 0
     assert changes == []
+
+
+@pytest.mark.asyncio
+async def test_ensure_required_schema_enables_rls_when_missing(monkeypatch):
+    required = list(REQUIRED_BOOT_TABLES)
+    expected_columns = _required_model_columns(required)
+    already_enabled = {"raids"}
+
+    async def fake_tables(_connection):
+        return set(required)
+
+    async def fake_columns(_connection):
+        return {table: set(columns) for table, columns in expected_columns.items()}
+
+    async def fake_rls(_connection):
+        return set(already_enabled)
+
+    async def fake_column_types(_connection):
+        return {
+            ("user_levels", "xp"): "int8",
+            ("user_levels", "level"): "int8",
+        }
+
+    monkeypatch.setattr("db.schema_guard.fetch_public_tables", fake_tables)
+    monkeypatch.setattr("db.schema_guard.fetch_public_columns", fake_columns)
+    monkeypatch.setattr("db.schema_guard.fetch_public_rls_enabled_tables", fake_rls)
+    monkeypatch.setattr("db.schema_guard.fetch_public_column_udt_names", fake_column_types)
+
+    connection = DummyConnection()
+    changes = await ensure_required_schema(connection=connection)
+
+    assert connection.run_sync_calls == 0
+    for table in required:
+        if table in already_enabled:
+            continue
+        assert f"enable_rls:{table}" in changes
+        assert any(f'ALTER TABLE public."{table}" ENABLE ROW LEVEL SECURITY' in ddl for ddl in connection.ddl)
+
+
+@pytest.mark.asyncio
+async def test_validate_required_tables_detects_invalid_user_level_column_type(monkeypatch):
+    required = list(REQUIRED_BOOT_TABLES)
+    expected_columns = _required_model_columns(required)
+
+    async def fake_tables(_connection):
+        return set(required)
+
+    async def fake_columns(_connection):
+        return {table: set(columns) for table, columns in expected_columns.items()}
+
+    async def fake_column_types(_connection):
+        return {
+            ("user_levels", "xp"): "int4",
+            ("user_levels", "level"): "int8",
+        }
+
+    monkeypatch.setattr("db.schema_guard.fetch_public_tables", fake_tables)
+    monkeypatch.setattr("db.schema_guard.fetch_public_columns", fake_columns)
+    monkeypatch.setattr("db.schema_guard.fetch_public_column_udt_names", fake_column_types)
+
+    with pytest.raises(RuntimeError, match="Invalid required DB column types"):
+        await validate_required_tables(connection=None)
+
+
+@pytest.mark.asyncio
+async def test_ensure_required_schema_migrates_user_level_columns_to_bigint(monkeypatch):
+    required = list(REQUIRED_BOOT_TABLES)
+    expected_columns = _required_model_columns(required)
+
+    async def fake_tables(_connection):
+        return set(required)
+
+    async def fake_columns(_connection):
+        return {table: set(columns) for table, columns in expected_columns.items()}
+
+    async def fake_column_types(_connection):
+        return {
+            ("user_levels", "xp"): "int4",
+            ("user_levels", "level"): "int4",
+        }
+
+    async def fake_rls(_connection):
+        return set(required)
+
+    monkeypatch.setattr("db.schema_guard.fetch_public_tables", fake_tables)
+    monkeypatch.setattr("db.schema_guard.fetch_public_columns", fake_columns)
+    monkeypatch.setattr("db.schema_guard.fetch_public_column_udt_names", fake_column_types)
+    monkeypatch.setattr("db.schema_guard.fetch_public_rls_enabled_tables", fake_rls)
+
+    connection = DummyConnection()
+    changes = await ensure_required_schema(connection=connection)
+
+    assert "alter_column_type:user_levels.xp:bigint" in changes
+    assert "alter_column_type:user_levels.level:bigint" in changes
+    assert any(
+        'ALTER TABLE public."user_levels" ALTER COLUMN "xp" TYPE BIGINT USING "xp"::BIGINT' in ddl
+        for ddl in connection.ddl
+    )
+    assert any(
+        'ALTER TABLE public."user_levels" ALTER COLUMN "level" TYPE BIGINT USING "level"::BIGINT' in ddl
+        for ddl in connection.ddl
+    )

@@ -3,16 +3,20 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from functools import lru_cache
 import importlib.machinery
 import importlib.util
+import inspect
 import logging
+import math
 import os
 from pathlib import Path
 import re
 import sys
 import time
-from typing import Any
+from typing import Any, AsyncIterable, Awaitable, cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from bot.config import load_config
 from bot.logging import setup_logging
@@ -27,15 +31,13 @@ from services.raid_service import (
     create_raid_from_modal,
     finish_raid,
     planner_counts,
-    slot_text,
     toggle_vote,
 )
-from services.raidlist_service import render_raidlist
 from services.settings_service import save_channel_settings, set_templates_enabled
 from services.startup_service import EXPECTED_SLASH_COMMANDS
 from discord.task_registry import DebouncedGuildUpdater, SingletonTaskRegistry
 from utils.hashing import sha256_text
-from utils.slots import compute_qualified_slot_users, memberlist_threshold
+from utils.slots import compute_qualified_slot_users, memberlist_target_label, memberlist_threshold
 from utils.text import contains_approved_keyword, contains_nanomon_keyword
 
 
@@ -77,6 +79,7 @@ FEATURE_FLAG_LEVELING = 1 << 0
 FEATURE_FLAG_LEVELUP_MESSAGES = 1 << 1
 FEATURE_FLAG_NANOMON_REPLY = 1 << 2
 FEATURE_FLAG_APPROVED_REPLY = 1 << 3
+FEATURE_FLAG_RAID_REMINDER = 1 << 4
 FEATURE_FLAG_MASK = 0xFF
 FEATURE_MESSAGE_XP_SHIFT = 8
 FEATURE_LEVELUP_COOLDOWN_SHIFT = 24
@@ -84,8 +87,21 @@ FEATURE_INTERVAL_MASK = 0xFFFF
 BOT_MESSAGE_KIND = "bot_message"
 BOT_MESSAGE_CACHE_PREFIX = "botmsg"
 BOT_MESSAGE_INDEX_MAX_PER_CHANNEL = 400
+SLOT_TEMP_ROLE_KIND = "slot_temp_role"
+SLOT_TEMP_ROLE_CACHE_PREFIX = "slotrole"
+RAID_REMINDER_KIND = "raid_reminder"
+RAID_REMINDER_CACHE_PREFIX = "raidrem"
+RAID_REMINDER_ADVANCE_SECONDS = 10 * 60
+RAID_REMINDER_WORKER_SLEEP_SECONDS = 30
+RAID_DATE_LOOKAHEAD_DAYS = 21
+RAID_DATE_CACHE_DAYS_MAX = 25
+INTEGRITY_CLEANUP_SLEEP_SECONDS = 15 * 60
+DEFAULT_TIMEZONE_NAME = "Europe/Berlin"
 USERNAME_SYNC_WORKER_SLEEP_SECONDS = 10 * 60
 USERNAME_SYNC_RESCAN_SECONDS = 12 * 60 * 60
+LOG_FORWARD_QUEUE_MAX_SIZE = 1000
+PERSIST_FLUSH_MAX_ATTEMPTS = 3
+PERSIST_FLUSH_RETRY_BASE_SECONDS = 0.1
 PRIVILEGED_ONLY_HELP_COMMANDS = frozenset(
     {
         "restart",
@@ -98,6 +114,13 @@ PRIVILEGED_ONLY_HELP_COMMANDS = frozenset(
 )
 
 _RESPONSE_ERRORS = {"InteractionResponded", "HTTPException", "NotFound", "Forbidden"}
+_DISCORD_LOG_LINE_PATTERN = re.compile(
+    r"^\[(?P<timestamp>[^\]]+)\]\s+"
+    r"(?P<level>[A-Z]+)\s+"
+    r"src=(?P<source>[^|]+)\s+\|\s+"
+    r"(?P<body>.*)$"
+)
+_SLOT_ROLE_NAME_PATTERN = re.compile(r"^DMW Raid (?P<display_id>\d+)\s+.+$")
 
 
 @dataclass(slots=True)
@@ -119,6 +142,7 @@ class GuildFeatureSettings:
     approved_reply_enabled: bool
     message_xp_interval_seconds: int
     levelup_message_cooldown_seconds: int
+    raid_reminder_enabled: bool = False
 
 
 def _on_off(value: bool) -> str:
@@ -134,6 +158,18 @@ def _extract_slash_command_name(content: str | None) -> str | None:
         return None
     first = command_part.split(maxsplit=1)[0].strip().lower()
     return first or None
+
+
+def _round_xp_for_display(value: Any) -> int:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(parsed):
+        return 0
+    if parsed <= 0:
+        return 0
+    return int(math.floor(parsed + 0.5))
 
 
 def _is_response_error(exc: Exception) -> bool:
@@ -261,6 +297,98 @@ def _admin_or_privileged_check():
     return app_commands.check(_is_admin_or_privileged)
 
 
+def _raid_weekday_short(weekday_index: int) -> str:
+    names = ("Mo", "Di", "Mi", "Do", "Fr", "Sa", "So")
+    if 0 <= int(weekday_index) < len(names):
+        return names[int(weekday_index)]
+    return "??"
+
+
+def _format_raid_date_label(value: date) -> str:
+    return f"{value.isoformat()} ({_raid_weekday_short(value.weekday())})"
+
+
+def _parse_raid_date_from_label(label: str) -> date | None:
+    text = (label or "").strip()
+    match_iso = re.search(r"(\d{4})-(\d{2})-(\d{2})", text)
+    if match_iso is not None:
+        try:
+            return date(int(match_iso.group(1)), int(match_iso.group(2)), int(match_iso.group(3)))
+        except ValueError:
+            return None
+
+    match_dot = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", text)
+    if match_dot is not None:
+        try:
+            return date(int(match_dot.group(3)), int(match_dot.group(2)), int(match_dot.group(1)))
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_raid_time_label(label: str) -> tuple[int, int] | None:
+    text = (label or "").strip()
+    match = re.search(r"^(\d{1,2})[:.](\d{2})$", text)
+    if match is None:
+        return None
+    try:
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+    except ValueError:
+        return None
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return None
+    return (hour, minute)
+
+
+def _normalize_timezone_name(value: str | None) -> str:
+    text = (value or "").strip()
+    if not text:
+        return DEFAULT_TIMEZONE_NAME
+    try:
+        ZoneInfo(text)
+        return text
+    except ZoneInfoNotFoundError:
+        return DEFAULT_TIMEZONE_NAME
+
+
+@lru_cache(maxsize=16)
+def _zoneinfo_for_name(value: str | None) -> ZoneInfo:
+    normalized = _normalize_timezone_name(value)
+    try:
+        return ZoneInfo(normalized)
+    except ZoneInfoNotFoundError:
+        return ZoneInfo(DEFAULT_TIMEZONE_NAME)
+
+
+def _upcoming_raid_date_labels(
+    *,
+    start_date: date | None = None,
+    count: int = RAID_DATE_LOOKAHEAD_DAYS,
+) -> list[str]:
+    timezone = _zoneinfo_for_name(DEFAULT_TIMEZONE_NAME)
+    if start_date is None:
+        first = datetime.now(timezone).date()
+    else:
+        first = start_date
+    total = max(1, min(RAID_DATE_CACHE_DAYS_MAX, int(count)))
+    return [_format_raid_date_label(first + timedelta(days=offset)) for offset in range(total)]
+
+
+def _normalize_raid_date_selection(values: list[str], *, allowed: list[str]) -> list[str]:
+    order = {value: idx for idx, value in enumerate(allowed)}
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        value = str(raw).strip()
+        if not value or value in seen or value not in order:
+            continue
+        seen.add(value)
+        out.append(value)
+    out.sort(key=lambda item: order.get(item, 0))
+    return out
+
+
 def _settings_embed(settings, guild_name: str, feature_settings: GuildFeatureSettings | None = None):
     embed = discord.Embed(title=f"Settings: {guild_name}", color=discord.Color.blurple())
     embed.add_field(
@@ -302,6 +430,11 @@ def _settings_embed(settings, guild_name: str, feature_settings: GuildFeatureSet
             inline=True,
         )
         embed.add_field(
+            name="Raid 10min Reminder",
+            value=_on_off(feature_settings.raid_reminder_enabled),
+            inline=True,
+        )
+        embed.add_field(
             name="Message XP Intervall (s)",
             value=str(int(feature_settings.message_xp_interval_seconds)),
             inline=True,
@@ -315,8 +448,7 @@ def _settings_embed(settings, guild_name: str, feature_settings: GuildFeatureSet
     return embed
 
 
-class RaidCreateModal(discord.ui.Modal, title="Raid erstellen"):
-    days = discord.ui.TextInput(label="Tage (Komma/Zeilen)", required=True, max_length=400)
+class RaidCreateModal(discord.ui.Modal):
     times = discord.ui.TextInput(label="Uhrzeiten (Komma/Zeilen)", required=True, max_length=400)
     min_players = discord.ui.TextInput(label="Min Spieler pro Slot (0=ab 1)", required=True, max_length=3)
 
@@ -328,19 +460,20 @@ class RaidCreateModal(discord.ui.Modal, title="Raid erstellen"):
         guild_name: str,
         channel_id: int,
         dungeon_name: str,
-        default_days: list[str],
+        selected_days: list[str] | None = None,
+        default_days: list[str] | None = None,
         default_times: list[str],
         default_min_players: int,
     ):
-        super().__init__()
+        super().__init__(title="Raid erstellen")
         self.bot = bot
         self.guild_id = guild_id
         self.guild_name = guild_name
         self.channel_id = channel_id
         self.dungeon_name = dungeon_name
 
-        if default_days:
-            self.days.default = ", ".join(default_days)[:400]
+        raw_days = selected_days if selected_days else (default_days or [])
+        self.selected_days = [str(value).strip() for value in raw_days if str(value).strip()]
         if default_times:
             self.times.default = ", ".join(default_times)[:400]
         self.min_players.default = str(max(0, int(default_min_players)))
@@ -351,6 +484,10 @@ class RaidCreateModal(discord.ui.Modal, title="Raid erstellen"):
             return
 
         await self.bot._defer(interaction, ephemeral=True)
+
+        if not self.selected_days:
+            await _safe_followup(interaction, "Bitte mindestens ein Datum auswaehlen.", ephemeral=True)
+            return
 
         try:
             min_players_value = int(str(self.min_players.value).strip())
@@ -369,7 +506,7 @@ class RaidCreateModal(discord.ui.Modal, title="Raid erstellen"):
                     planner_channel_id=self.channel_id,
                     creator_id=interaction.user.id,
                     dungeon_name=self.dungeon_name,
-                    days_input=str(self.days.value),
+                    days_input="\n".join(self.selected_days),
                     times_input=str(self.times.value),
                     min_players_input=str(min_players_value),
                     message_id=0,
@@ -402,6 +539,7 @@ class RaidCreateModal(discord.ui.Modal, title="Raid erstellen"):
             interaction,
             (
                 f"Raid erstellt: `{result.raid.display_id}` {result.raid.dungeon}\n"
+                f"Zeitzone: `{DEFAULT_TIMEZONE_NAME}`\n"
                 f"Day Votes: {counts['day']}\n"
                 f"Time Votes: {counts['time']}\n"
                 f"Planner Post: {jump_url}"
@@ -410,7 +548,180 @@ class RaidCreateModal(discord.ui.Modal, title="Raid erstellen"):
         )
 
 
-class SettingsIntervalsModal(discord.ui.Modal, title="Allgemeine Feature Settings"):
+class RaidDateContinueButton(discord.ui.Button):
+    def __init__(self, bot: "RewriteDiscordBot"):
+        super().__init__(
+            style=discord.ButtonStyle.success,
+            label="Weiter (Uhrzeiten + Min Spieler)",
+            row=1,
+        )
+        self.bot = bot
+
+    async def callback(self, interaction):
+        view = self.view
+        if not isinstance(view, RaidDateSelectionView):
+            await self.bot._reply(interaction, "Date-View nicht verfuegbar.", ephemeral=True)
+            return
+        if not view.is_valid_interaction(interaction):
+            await self.bot._reply(interaction, "Nur der Ersteller kann diese Auswahl fortsetzen.", ephemeral=True)
+            return
+        if not view.selected_days:
+            await self.bot._reply(interaction, "Bitte zuerst mindestens ein Datum waehlen.", ephemeral=True)
+            return
+        modal = RaidCreateModal(
+            self.bot,
+            guild_id=view.guild_id,
+            guild_name=view.guild_name,
+            channel_id=view.channel_id,
+            dungeon_name=view.dungeon_name,
+            selected_days=view.selected_days,
+            default_times=view.default_times,
+            default_min_players=view.default_min_players,
+        )
+        try:
+            await interaction.response.send_modal(modal)
+        except Exception:
+            await self.bot._reply(interaction, "Raid-Modal konnte nicht geoeffnet werden.", ephemeral=True)
+
+
+class RaidDateSelectionView(discord.ui.View):
+    def __init__(
+        self,
+        bot: "RewriteDiscordBot",
+        *,
+        owner_user_id: int,
+        guild_id: int,
+        guild_name: str,
+        channel_id: int,
+        dungeon_name: str,
+        default_days: list[str],
+        default_times: list[str],
+        default_min_players: int,
+    ):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.owner_user_id = int(owner_user_id)
+        self.guild_id = int(guild_id)
+        self.guild_name = guild_name
+        self.channel_id = int(channel_id)
+        self.dungeon_name = dungeon_name
+        self.default_times = list(default_times)
+        self.default_min_players = int(default_min_players)
+
+        self.available_days = _upcoming_raid_date_labels()
+        self.selected_days = self._resolve_default_days(default_days)
+
+        options = [
+            discord.SelectOption(
+                label=label,
+                value=label,
+                default=label in self.selected_days,
+            )
+            for label in self.available_days
+        ]
+        day_select = discord.ui.Select(
+            placeholder="Daten waehlen/abwaehlen...",
+            min_values=1,
+            max_values=min(25, max(1, len(options))),
+            options=options,
+            row=0,
+        )
+        day_select.callback = self._on_day_select
+        self.add_item(day_select)
+        self.add_item(RaidDateContinueButton(bot))
+
+    @staticmethod
+    def _weekday_alias_to_index(label: str) -> int | None:
+        aliases = {
+            "mo": 0,
+            "mon": 0,
+            "montag": 0,
+            "di": 1,
+            "tue": 1,
+            "dienstag": 1,
+            "mi": 2,
+            "wed": 2,
+            "mittwoch": 2,
+            "do": 3,
+            "thu": 3,
+            "donnerstag": 3,
+            "fr": 4,
+            "fri": 4,
+            "freitag": 4,
+            "sa": 5,
+            "sat": 5,
+            "samstag": 5,
+            "so": 6,
+            "sun": 6,
+            "sonntag": 6,
+        }
+        return aliases.get((label or "").strip().lower())
+
+    def _resolve_default_days(self, default_days: list[str]) -> list[str]:
+        if not self.available_days:
+            return []
+        resolved: list[str] = []
+        available_map = {value.casefold(): value for value in self.available_days}
+        by_iso_date = {value[:10]: value for value in self.available_days if len(value) >= 10}
+
+        by_weekday: dict[int, list[str]] = {}
+        for value in self.available_days:
+            parsed = _parse_raid_date_from_label(value)
+            if parsed is None:
+                continue
+            by_weekday.setdefault(parsed.weekday(), []).append(value)
+
+        for raw in default_days:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            direct = available_map.get(text.casefold())
+            if direct and direct not in resolved:
+                resolved.append(direct)
+                continue
+            parsed_date = _parse_raid_date_from_label(text)
+            if parsed_date is not None:
+                mapped = by_iso_date.get(parsed_date.isoformat())
+                if mapped and mapped not in resolved:
+                    resolved.append(mapped)
+                    continue
+            weekday = self._weekday_alias_to_index(text)
+            if weekday is None:
+                continue
+            for candidate in by_weekday.get(weekday, []):
+                if candidate not in resolved:
+                    resolved.append(candidate)
+                    break
+
+        normalized = _normalize_raid_date_selection(resolved, allowed=self.available_days)
+        if normalized:
+            return normalized
+        return [self.available_days[0]]
+
+    def is_valid_interaction(self, interaction: Any) -> bool:
+        interaction_guild_id = int(getattr(getattr(interaction, "guild", None), "id", 0) or 0)
+        interaction_user_id = int(getattr(getattr(interaction, "user", None), "id", 0) or 0)
+        return interaction_guild_id == self.guild_id and interaction_user_id == self.owner_user_id
+
+    async def _on_day_select(self, interaction):
+        if not self.is_valid_interaction(interaction):
+            await self.bot._reply(interaction, "Nur der Ersteller darf die Datumswahl aendern.", ephemeral=True)
+            return
+        raw_values = [str(value) for value in ((interaction.data or {}).get("values") or [])]
+        normalized = _normalize_raid_date_selection(raw_values, allowed=self.available_days)
+        if not normalized:
+            await self.bot._reply(interaction, "Bitte mindestens ein Datum waehlen.", ephemeral=True)
+            return
+        self.selected_days = normalized
+        await self.bot._defer(interaction, ephemeral=True)
+        await _safe_followup(
+            interaction,
+            f"Datumsauswahl vorgemerkt ({len(self.selected_days)}): {', '.join(self.selected_days)}",
+            ephemeral=True,
+        )
+
+
+class SettingsIntervalsModal(discord.ui.Modal):
     message_xp_interval = discord.ui.TextInput(
         label="Message XP Intervall (Sekunden)",
         required=True,
@@ -423,7 +734,7 @@ class SettingsIntervalsModal(discord.ui.Modal, title="Allgemeine Feature Setting
     )
 
     def __init__(self, bot: "RewriteDiscordBot", view: "SettingsView"):
-        super().__init__()
+        super().__init__(title="Allgemeine Feature Settings")
         self.bot = bot
         self._view_ref = view
         self.message_xp_interval.default = str(int(view.message_xp_interval_seconds))
@@ -541,6 +852,7 @@ class SettingsView(discord.ui.View):
         self.levelup_messages_enabled: bool = feature_settings.levelup_messages_enabled
         self.nanomon_reply_enabled: bool = feature_settings.nanomon_reply_enabled
         self.approved_reply_enabled: bool = feature_settings.approved_reply_enabled
+        self.raid_reminder_enabled: bool = feature_settings.raid_reminder_enabled
         self.message_xp_interval_seconds: int = feature_settings.message_xp_interval_seconds
         self.levelup_message_cooldown_seconds: int = feature_settings.levelup_message_cooldown_seconds
 
@@ -601,6 +913,12 @@ class SettingsView(discord.ui.View):
                 guild_id=guild_id,
                 attr_name="approved_reply_enabled",
                 label_prefix="Approved Reply",
+            ),
+            SettingsToggleButton(
+                bot,
+                guild_id=guild_id,
+                attr_name="raid_reminder_enabled",
+                label_prefix="Raid Reminder",
             ),
         ]
         for item in toggle_items:
@@ -667,6 +985,7 @@ class SettingsSaveButton(discord.ui.Button):
                     levelup_messages_enabled=view.levelup_messages_enabled,
                     nanomon_reply_enabled=view.nanomon_reply_enabled,
                     approved_reply_enabled=view.approved_reply_enabled,
+                    raid_reminder_enabled=view.raid_reminder_enabled,
                     message_xp_interval_seconds=view.message_xp_interval_seconds,
                     levelup_message_cooldown_seconds=view.levelup_message_cooldown_seconds,
                 ),
@@ -688,6 +1007,7 @@ class SettingsSaveButton(discord.ui.Button):
                 f"Levelup Msg: `{_on_off(feature_row.levelup_messages_enabled)}`\n"
                 f"Nanomon Reply: `{_on_off(feature_row.nanomon_reply_enabled)}`\n"
                 f"Approved Reply: `{_on_off(feature_row.approved_reply_enabled)}`\n"
+                f"Raid Reminder: `{_on_off(feature_row.raid_reminder_enabled)}`\n"
                 f"Message XP Intervall: `{feature_row.message_xp_interval_seconds}`\n"
                 f"Levelup Cooldown: `{feature_row.levelup_message_cooldown_seconds}`"
             ),
@@ -816,7 +1136,7 @@ class RewriteDiscordBot(discord.Client):
         self.leveling_service = LevelingService()
 
         self.log_channel = None
-        self.log_forward_queue: asyncio.Queue[str] = asyncio.Queue()
+        self.log_forward_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=LOG_FORWARD_QUEUE_MAX_SIZE)
         self.pending_log_buffer: deque[str] = deque(maxlen=250)
         self.log_forwarder_active = False
         self.last_self_test_ok_at: datetime | None = None
@@ -909,7 +1229,7 @@ class RewriteDiscordBot(discord.Client):
                 await self._restore_runtime_messages()
                 self._runtime_restored = True
             elif guild_settings_changed:
-                await self._persist()
+                await self._persist(dirty_tables={"settings"})
 
         if not self._runtime_restored:
             return
@@ -943,6 +1263,8 @@ class RewriteDiscordBot(discord.Client):
 
     def _start_background_loops(self) -> None:
         self.task_registry.start_once("stale_raid_worker", self._stale_raid_worker)
+        self.task_registry.start_once("raid_reminder_worker", self._raid_reminder_worker)
+        self.task_registry.start_once("integrity_cleanup_worker", self._integrity_cleanup_worker)
         self.task_registry.start_once("voice_xp_worker", self._voice_xp_worker)
         self.task_registry.start_once("level_persist_worker", self._level_persist_worker)
         self.task_registry.start_once("username_sync_worker", self._username_sync_worker)
@@ -955,7 +1277,7 @@ class RewriteDiscordBot(discord.Client):
             self.repo.ensure_settings(guild.id, guild.name)
             self._username_sync_next_run_by_guild[int(guild.id)] = 0.0
             await self._force_raidlist_refresh(guild.id)
-            await self._persist()
+            await self._persist(dirty_tables={"settings", "debug_cache"})
 
         try:
             await self._sync_guild_usernames(guild, force=True)
@@ -1064,7 +1386,7 @@ class RewriteDiscordBot(discord.Client):
                                 message.channel,
                                 content=(
                                 f"🎉 {message.author.mention} ist auf **Level {result.current_level}** aufgestiegen! "
-                                f"(XP: {result.xp})"
+                                f"(XP: {_round_xp_for_display(result.xp)})"
                                 ),
                             )
                         except Exception:
@@ -1108,7 +1430,10 @@ class RewriteDiscordBot(discord.Client):
         raw = (getattr(message, "content", "") or "").strip()
         if not raw:
             return False
-        command = raw.lstrip("/").strip().split()[0].lower()
+        command_parts = raw.lstrip("/").strip().split()
+        if not command_parts:
+            return False
+        command = command_parts[0].lower()
         if command != "restart":
             return False
         try:
@@ -1117,6 +1442,17 @@ class RewriteDiscordBot(discord.Client):
             pass
         await self.close()
         return True
+
+    def _enqueue_log_forward_queue(self, message: str) -> None:
+        if self.log_forward_queue.full():
+            try:
+                self.log_forward_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            self.log_forward_queue.put_nowait(message)
+        except asyncio.QueueFull:
+            pass
 
     def _build_discord_log_handler(self) -> logging.Handler:
         bot = self
@@ -1153,13 +1489,55 @@ class RewriteDiscordBot(discord.Client):
             return
         text = message if len(message) <= 1800 else f"{message[:1797]}..."
         if self.log_forwarder_active:
-            self.log_forward_queue.put_nowait(text)
+            self._enqueue_log_forward_queue(text)
             return
         self.pending_log_buffer.append(text)
 
     def _flush_pending_logs(self) -> None:
         while self.pending_log_buffer:
-            self.log_forward_queue.put_nowait(self.pending_log_buffer.popleft())
+            self._enqueue_log_forward_queue(self.pending_log_buffer.popleft())
+
+    @staticmethod
+    def _log_level_presentation(level: str) -> tuple[str, Any]:
+        normalized = (level or "").upper()
+        if normalized == "DEBUG":
+            return ("🛠️ DEBUG", discord.Color.light_grey())
+        if normalized == "INFO":
+            return ("ℹ️ INFO", discord.Color.blurple())
+        if normalized in {"WARNING", "WARN"}:
+            return ("⚠️ WARNING", discord.Color.gold())
+        if normalized == "ERROR":
+            return ("❌ ERROR", discord.Color.red())
+        if normalized == "CRITICAL":
+            return ("🛑 CRITICAL", discord.Color.dark_red())
+        return (f"📌 {normalized or 'LOG'}", discord.Color.dark_grey())
+
+    def _build_discord_log_embed(self, raw_message: str):
+        text = str(raw_message or "").strip()
+        if not text:
+            return None
+
+        match = _DISCORD_LOG_LINE_PATTERN.match(text)
+        if match is None:
+            return None
+
+        timestamp = (match.group("timestamp") or "").strip()
+        level = (match.group("level") or "").strip().upper()
+        source = (match.group("source") or "").strip()
+        body = (match.group("body") or "").strip() or "(leer)"
+        title, color = self._log_level_presentation(level)
+
+        description = body if len(body) <= 3500 else f"{body[:3497]}..."
+        source_field = source if len(source) <= 1000 else f"{source[:997]}..."
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            color=color,
+        )
+        embed.add_field(name="Quelle", value=f"`{source_field}`", inline=False)
+        embed.add_field(name="Zeit", value=f"`{timestamp}`", inline=True)
+        embed.set_footer(text="DMW Log Forwarder")
+        return embed
 
     async def _resolve_log_channel(self):
         if self.config.log_guild_id <= 0 or self.config.log_channel_id <= 0:
@@ -1180,7 +1558,12 @@ class RewriteDiscordBot(discord.Client):
             if channel is None:
                 continue
             try:
-                await self._send_channel_message(channel, content=f"```\n{message}\n```")
+                embed = self._build_discord_log_embed(message)
+                if embed is not None:
+                    await self._send_channel_message(channel, embed=embed)
+                else:
+                    fallback = message if len(message) <= 1800 else f"{message[:1797]}..."
+                    await self._send_channel_message(channel, content=f"```text\n{fallback}\n```")
             except Exception:
                 continue
 
@@ -1237,6 +1620,199 @@ class RewriteDiscordBot(discord.Client):
                 log.exception("Background backup failed")
             await asyncio.sleep(max(300, int(self.config.backup_interval_seconds)))
 
+    @staticmethod
+    def _slot_cache_suffix(day_label: str, time_label: str) -> str:
+        payload = f"{(day_label or '').strip().lower()}|{(time_label or '').strip().lower()}"
+        return sha256_text(payload)[:24]
+
+    @classmethod
+    def _slot_temp_role_cache_key(cls, raid_id: int, day_label: str, time_label: str) -> str:
+        return f"{SLOT_TEMP_ROLE_CACHE_PREFIX}:{int(raid_id)}:{cls._slot_cache_suffix(day_label, time_label)}"
+
+    @classmethod
+    def _raid_reminder_cache_key(cls, raid_id: int, day_label: str, time_label: str) -> str:
+        return f"{RAID_REMINDER_CACHE_PREFIX}:{int(raid_id)}:{cls._slot_cache_suffix(day_label, time_label)}"
+
+    @staticmethod
+    def _parse_slot_start_at_utc(
+        day_label: str,
+        time_label: str,
+        *,
+        timezone_name: str = DEFAULT_TIMEZONE_NAME,
+    ) -> datetime | None:
+        parsed_date = _parse_raid_date_from_label(day_label)
+        parsed_time = _parse_raid_time_label(time_label)
+        if parsed_date is None or parsed_time is None:
+            return None
+        timezone = _zoneinfo_for_name(timezone_name)
+        try:
+            local_start = datetime(
+                parsed_date.year,
+                parsed_date.month,
+                parsed_date.day,
+                parsed_time[0],
+                parsed_time[1],
+                tzinfo=timezone,
+            )
+            return local_start.astimezone(UTC)
+        except ValueError:
+            return None
+
+    async def _run_raid_reminders_once(self, *, now_utc: datetime | None = None) -> int:
+        current = now_utc or datetime.now(UTC)
+        sent = 0
+        participants_channel_by_id: dict[int, Any | None] = {}
+        for raid in self.repo.list_open_raids():
+            feature_settings = self._get_guild_feature_settings(raid.guild_id)
+            if not feature_settings.raid_reminder_enabled:
+                continue
+
+            settings = self.repo.ensure_settings(raid.guild_id)
+            participants_channel_id = int(settings.participants_channel_id or 0)
+            if participants_channel_id <= 0:
+                continue
+            if participants_channel_id not in participants_channel_by_id:
+                participants_channel_by_id[participants_channel_id] = await self._get_text_channel(
+                    participants_channel_id
+                )
+            participants_channel = participants_channel_by_id[participants_channel_id]
+            if participants_channel is None:
+                continue
+
+            days, times = self.repo.list_raid_options(raid.id)
+            day_users, time_users = self.repo.vote_user_sets(raid.id)
+            threshold = memberlist_threshold(raid.min_players)
+            qualified_slots, _ = compute_qualified_slot_users(
+                days=days,
+                times=times,
+                day_users=day_users,
+                time_users=time_users,
+                threshold=threshold,
+            )
+            for (day_label, time_label), users in qualified_slots.items():
+                start_at = self._parse_slot_start_at_utc(
+                    day_label,
+                    time_label,
+                    timezone_name=DEFAULT_TIMEZONE_NAME,
+                )
+                if start_at is None:
+                    continue
+                delta_seconds = (start_at - current).total_seconds()
+                if delta_seconds < 0 or delta_seconds > RAID_REMINDER_ADVANCE_SECONDS:
+                    continue
+
+                reminder_cache_key = self._raid_reminder_cache_key(raid.id, day_label, time_label)
+                if self.repo.get_debug_cache(reminder_cache_key) is not None:
+                    continue
+
+                role = await self._ensure_slot_temp_role(raid, day_label=day_label, time_label=time_label)
+                if role is None:
+                    continue
+                await self._sync_slot_role_members(raid, role=role, user_ids=users)
+
+                content = (
+                    f"⏰ Raid-Erinnerung: **{raid.dungeon}** startet in ca. 10 Minuten.\n"
+                    f"🆔 Raid `{raid.display_id}`\n"
+                    f"📅 {day_label}\n"
+                    f"🕒 {time_label} ({DEFAULT_TIMEZONE_NAME})\n"
+                    f"{role.mention}"
+                )
+                posted = await self._send_channel_message(
+                    participants_channel,
+                    content=content,
+                    allowed_mentions=discord.AllowedMentions(roles=True, users=True),
+                )
+                if posted is None:
+                    continue
+                self.repo.upsert_debug_cache(
+                    cache_key=reminder_cache_key,
+                    kind=RAID_REMINDER_KIND,
+                    guild_id=raid.guild_id,
+                    raid_id=raid.id,
+                    message_id=posted.id,
+                    payload_hash=sha256_text(content),
+                )
+                sent += 1
+        return sent
+
+    async def _raid_reminder_worker(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                async with self._state_lock:
+                    sent = await self._run_raid_reminders_once()
+                    if sent > 0:
+                        await self._persist(dirty_tables={"debug_cache"})
+            except Exception:
+                log.exception("Raid reminder worker failed")
+            await asyncio.sleep(RAID_REMINDER_WORKER_SLEEP_SECONDS)
+
+    async def _run_integrity_cleanup_once(self) -> int:
+        open_raids_by_id = {int(raid.id): raid for raid in self.repo.list_open_raids()}
+        removed_rows = 0
+
+        # Legacy cleanup: remove previously used timezone cache rows.
+        for row in list(self.repo.list_debug_cache(kind="user_timezone")):
+            self.repo.delete_debug_cache(row.cache_key)
+            removed_rows += 1
+        for row in list(self.repo.list_debug_cache(kind="raid_timezone")):
+            self.repo.delete_debug_cache(row.cache_key)
+            removed_rows += 1
+
+        for row in list(self.repo.list_debug_cache(kind=RAID_REMINDER_KIND)):
+            raid_id = int(row.raid_id or 0)
+            raid = open_raids_by_id.get(raid_id)
+            if raid is not None and int(raid.guild_id) == int(row.guild_id):
+                continue
+            self.repo.delete_debug_cache(row.cache_key)
+            removed_rows += 1
+
+        for row in list(self.repo.list_debug_cache(kind=SLOT_TEMP_ROLE_KIND)):
+            raid_id = int(row.raid_id or 0)
+            raid = open_raids_by_id.get(raid_id)
+            if raid is not None and int(raid.guild_id) == int(row.guild_id):
+                continue
+
+            guild = self._safe_get_guild(int(row.guild_id))
+            if guild is not None:
+                role = await self._resolve_role_by_id(guild, int(row.message_id or 0))
+                if role is not None:
+                    await self._cleanup_role_members_and_delete(role, reason="DMW orphan cleanup")
+            self.repo.delete_debug_cache(row.cache_key)
+            removed_rows += 1
+
+        for guild in list(getattr(self, "guilds", []) or []):
+            open_display_ids = {
+                int(raid.display_id)
+                for raid in self.repo.list_open_raids(guild.id)
+                if int(raid.display_id or 0) > 0
+            }
+            for role in list(getattr(guild, "roles", []) or []):
+                role_name = str(getattr(role, "name", "") or "")
+                if not role_name.startswith("DMW Raid "):
+                    continue
+                match = _SLOT_ROLE_NAME_PATTERN.match(role_name)
+                if match is None:
+                    continue
+                display_id = int(match.group("display_id"))
+                if display_id in open_display_ids:
+                    continue
+                await self._cleanup_role_members_and_delete(role, reason="DMW orphan cleanup")
+
+        return removed_rows
+
+    async def _integrity_cleanup_worker(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                async with self._state_lock:
+                    removed_rows = await self._run_integrity_cleanup_once()
+                    if removed_rows > 0:
+                        await self._persist(dirty_tables={"debug_cache"})
+            except Exception:
+                log.exception("Integrity cleanup worker failed")
+            await asyncio.sleep(INTEGRITY_CLEANUP_SLEEP_SECONDS)
+
     async def _voice_xp_worker(self) -> None:
         await self.wait_until_ready()
         while not self.is_closed():
@@ -1271,7 +1847,7 @@ class RewriteDiscordBot(discord.Client):
         if not force and (now - self._last_level_persist_monotonic) < interval:
             return False
 
-        persisted = await self._persist()
+        persisted = await self._persist(dirty_tables={"user_levels"})
         if persisted:
             self._level_state_dirty = False
             self._last_level_persist_monotonic = now
@@ -1381,17 +1957,29 @@ class RewriteDiscordBot(discord.Client):
             return False
         return await _safe_defer(interaction, ephemeral=ephemeral)
 
-    async def _persist(self) -> bool:
-        try:
-            await self.persistence.flush(self.repo)
-            return True
-        except Exception:
-            log.exception("Failed to flush state. Reloading repository snapshot.")
+    async def _persist(self, *, dirty_tables: set[str] | None = None) -> bool:
+        hints = {str(name) for name in (dirty_tables or set()) if str(name).strip()}
+        for attempt in range(1, PERSIST_FLUSH_MAX_ATTEMPTS + 1):
             try:
-                await self.persistence.load(self.repo)
-            except Exception:
-                log.exception("Failed to reload repository after flush error.")
-            return False
+                await self.persistence.flush(self.repo, dirty_tables=hints or None)
+                return True
+            except Exception as exc:
+                if attempt >= PERSIST_FLUSH_MAX_ATTEMPTS:
+                    log.exception(
+                        "Failed to flush state after %s attempts. Keeping in-memory state.",
+                        PERSIST_FLUSH_MAX_ATTEMPTS,
+                    )
+                    return False
+                delay_seconds = PERSIST_FLUSH_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+                log.warning(
+                    "Flush attempt %s/%s failed (%s). Retrying in %.2fs.",
+                    attempt,
+                    PERSIST_FLUSH_MAX_ATTEMPTS,
+                    exc,
+                    delay_seconds,
+                )
+                await asyncio.sleep(delay_seconds)
+        return False
 
     def _find_open_raid_by_display_id(self, guild_id: int, display_id: int) -> RaidRecord | None:
         for raid in self.repo.list_open_raids(guild_id):
@@ -1411,6 +1999,7 @@ class RewriteDiscordBot(discord.Client):
             levelup_messages_enabled=True,
             nanomon_reply_enabled=True,
             approved_reply_enabled=True,
+            raid_reminder_enabled=False,
             message_xp_interval_seconds=max(1, int(self.config.message_xp_interval_seconds)),
             levelup_message_cooldown_seconds=max(1, int(self.config.levelup_message_cooldown_seconds)),
         )
@@ -1430,6 +2019,8 @@ class RewriteDiscordBot(discord.Client):
             flags |= FEATURE_FLAG_NANOMON_REPLY
         if settings.approved_reply_enabled:
             flags |= FEATURE_FLAG_APPROVED_REPLY
+        if settings.raid_reminder_enabled:
+            flags |= FEATURE_FLAG_RAID_REMINDER
 
         message_interval = max(1, min(FEATURE_INTERVAL_MASK, int(settings.message_xp_interval_seconds)))
         levelup_cooldown = max(1, min(FEATURE_INTERVAL_MASK, int(settings.levelup_message_cooldown_seconds)))
@@ -1456,6 +2047,7 @@ class RewriteDiscordBot(discord.Client):
             levelup_messages_enabled=bool(flags & FEATURE_FLAG_LEVELUP_MESSAGES),
             nanomon_reply_enabled=bool(flags & FEATURE_FLAG_NANOMON_REPLY),
             approved_reply_enabled=bool(flags & FEATURE_FLAG_APPROVED_REPLY),
+            raid_reminder_enabled=bool(flags & FEATURE_FLAG_RAID_REMINDER),
             message_xp_interval_seconds=max(1, int(message_interval)),
             levelup_message_cooldown_seconds=max(1, int(levelup_cooldown)),
         )
@@ -1467,6 +2059,7 @@ class RewriteDiscordBot(discord.Client):
             f"levelup_messages={int(settings.levelup_messages_enabled)}|"
             f"nanomon={int(settings.nanomon_reply_enabled)}|"
             f"approved={int(settings.approved_reply_enabled)}|"
+            f"raid_reminder={int(settings.raid_reminder_enabled)}|"
             f"xp_interval={int(settings.message_xp_interval_seconds)}|"
             f"levelup_cooldown={int(settings.levelup_message_cooldown_seconds)}"
         )
@@ -1563,6 +2156,18 @@ class RewriteDiscordBot(discord.Client):
         except (TypeError, ValueError):
             return 0
 
+    def _safe_get_guild(self, guild_id: int):
+        try:
+            return self.get_guild(int(guild_id))
+        except Exception:
+            return None
+
+    @staticmethod
+    async def _await_if_needed(result: Any) -> Any:
+        if inspect.isawaitable(result):
+            return await cast(Awaitable[Any], result)
+        return result
+
     def _is_registered_command_message(self, content: str | None) -> bool:
         command_name = _extract_slash_command_name(content)
         if command_name is None:
@@ -1620,7 +2225,10 @@ class RewriteDiscordBot(discord.Client):
             return users
 
         try:
-            async for member in fetch_members(limit=None):
+            members_iter = fetch_members(limit=None)
+            if not hasattr(members_iter, "__aiter__"):
+                return users
+            async for member in cast(AsyncIterable[Any], members_iter):
                 if getattr(member, "bot", False):
                     continue
                 username = _member_name(member)
@@ -1782,6 +2390,38 @@ class RewriteDiscordBot(discord.Client):
             return fetched
         return None
 
+    def _guild_display_name(self, guild_id: int) -> str:
+        guild = self._safe_get_guild(guild_id)
+        if guild is not None:
+            runtime_name = (getattr(guild, "name", "") or "").strip()
+            if runtime_name:
+                return runtime_name
+        settings = self.repo.settings.get(int(guild_id))
+        stored_name = ((settings.guild_name if settings is not None else None) or "").strip()
+        if stored_name:
+            return stored_name
+        return f"Server {int(guild_id)}"
+
+    def _format_debug_report(
+        self,
+        *,
+        topic: str,
+        guild_id: int,
+        summary: list[str],
+        lines: list[str] | None = None,
+        empty_text: str = "- Keine Eintraege.",
+    ) -> str:
+        guild_name = self._guild_display_name(guild_id)
+        header = [
+            f"[{topic}]",
+            f"Guild: {guild_name}",
+        ]
+        body = [item for item in summary if item]
+        details = [item for item in (lines or []) if item]
+        if not details:
+            details = [empty_text]
+        return "\n".join([*header, "", *body, "", "Details:", *details])
+
     async def _mirror_debug_payload(
         self,
         *,
@@ -1869,7 +2509,7 @@ class RewriteDiscordBot(discord.Client):
         if not user_ids:
             return "—"
 
-        guild = self.get_guild(guild_id)
+        guild = self._safe_get_guild(guild_id)
         labels: list[str] = []
         for user_id in sorted(user_ids):
             label: str | None = None
@@ -1891,6 +2531,27 @@ class RewriteDiscordBot(discord.Client):
         if len(text) > 1024:
             text = text[:1021] + "..."
         return text
+
+    def _memberlist_slot_embed(self, raid: RaidRecord, *, day_label: str, time_label: str, users: list[int]):
+        total_users = len(users)
+        required_label = memberlist_target_label(raid.min_players)
+        user_lines = self._plain_user_list_for_embed(raid.guild_id, set(users), limit=40)
+        guild_name = self._guild_display_name(raid.guild_id)
+
+        embed = discord.Embed(
+            title=f"✅ Teilnehmerliste: {raid.dungeon}",
+            description=(
+                f"Server: **{guild_name}**\n"
+                f"Raid: `{raid.display_id}`"
+            ),
+            color=discord.Color.teal(),
+        )
+        embed.add_field(name="📅 Datum", value=f"`{day_label}`", inline=True)
+        embed.add_field(name="🕒 Uhrzeit", value=f"`{time_label}`", inline=True)
+        embed.add_field(name="👥 Teilnehmer", value=f"`{total_users} / {required_label}`", inline=True)
+        embed.add_field(name="Spielerliste", value=user_lines, inline=False)
+        embed.set_footer(text="Automatisch aktualisiert durch DMW Bot")
+        return embed
 
     async def _refresh_planner_message(self, raid_id: int):
         raid = self.repo.get_raid(raid_id)
@@ -1941,7 +2602,7 @@ class RewriteDiscordBot(discord.Client):
             return
 
         title = f"Raid geschlossen: {reason}"
-        description = f"Guild `{guild_id}`"
+        description = f"Guild `{self._guild_display_name(guild_id)}`"
         if attendance_rows is not None:
             description += f"\nAttendance Rows: `{attendance_rows}`"
         embed = discord.Embed(title=title, description=description, color=discord.Color.red())
@@ -1978,9 +2639,10 @@ class RewriteDiscordBot(discord.Client):
         return message_ids
 
     def _clear_bot_message_index_for_id(self, *, guild_id: int, channel_id: int, message_id: int) -> None:
-        bot_user_id = self._current_bot_user_id()
-        cache_key = self._bot_message_cache_key(guild_id, channel_id, bot_user_id, message_id)
-        self.repo.delete_debug_cache(cache_key)
+        for row in list(self.repo.list_debug_cache(kind=BOT_MESSAGE_KIND, guild_id=guild_id, raid_id=channel_id)):
+            if int(row.message_id or 0) != int(message_id):
+                continue
+            self.repo.delete_debug_cache(row.cache_key)
 
     def _clear_known_message_refs_for_id(self, *, guild_id: int, channel_id: int, message_id: int) -> None:
         for raid in self.repo.list_open_raids(guild_id):
@@ -2099,6 +2761,7 @@ class RewriteDiscordBot(discord.Client):
         deleted_slot_messages = 0
 
         for raid in raids:
+            await self._cleanup_slot_temp_roles_for_raid(raid)
             slot_rows = list(self.repo.list_posted_slots(raid.id).values())
             for row in slot_rows:
                 if await self._delete_slot_message(row):
@@ -2128,9 +2791,10 @@ class RewriteDiscordBot(discord.Client):
         )
 
     async def _ensure_temp_role(self, raid: RaidRecord):
+        # Legacy single-role support for already existing raids.
         if raid.min_players <= 0:
             return None
-        guild = self.get_guild(raid.guild_id)
+        guild = self._safe_get_guild(raid.guild_id)
         if guild is None:
             return None
 
@@ -2155,13 +2819,168 @@ class RewriteDiscordBot(discord.Client):
         raid.temp_role_created = True
         return role
 
+    @staticmethod
+    def _slot_temp_role_name(raid: RaidRecord, *, day_label: str, time_label: str) -> str:
+        base = f"DMW Raid {raid.display_id} {day_label} {time_label}"
+        return base[:95]
+
+    async def _ensure_slot_temp_role(self, raid: RaidRecord, *, day_label: str, time_label: str):
+        guild = self._safe_get_guild(raid.guild_id)
+        if guild is None:
+            return None
+
+        cache_key = self._slot_temp_role_cache_key(raid.id, day_label, time_label)
+        cached = self.repo.get_debug_cache(cache_key)
+        if cached is not None and cached.kind == SLOT_TEMP_ROLE_KIND and cached.message_id:
+            role = guild.get_role(int(cached.message_id))
+            if role is not None:
+                return role
+
+        role_name = self._slot_temp_role_name(raid, day_label=day_label, time_label=time_label)
+        role = discord.utils.get(guild.roles, name=role_name)
+        if role is None:
+            try:
+                role = await guild.create_role(name=role_name, mentionable=True, reason="DMW Raid slot role")
+            except Exception:
+                return None
+
+        self.repo.upsert_debug_cache(
+            cache_key=cache_key,
+            kind=SLOT_TEMP_ROLE_KIND,
+            guild_id=raid.guild_id,
+            raid_id=raid.id,
+            message_id=int(role.id),
+            payload_hash=sha256_text(role_name),
+        )
+        return role
+
+    async def _sync_slot_role_members(self, raid: RaidRecord, *, role: Any, user_ids: list[int]) -> None:
+        guild = self._safe_get_guild(raid.guild_id)
+        if guild is None or role is None:
+            return
+        desired_ids = {int(user_id) for user_id in user_ids if int(user_id) > 0}
+        current_ids = {int(getattr(member, "id", 0) or 0) for member in list(getattr(role, "members", []) or [])}
+        current_ids.discard(0)
+
+        add_ids = sorted(desired_ids - current_ids)
+        remove_ids = sorted(current_ids - desired_ids)
+
+        for member_id in add_ids:
+            member = guild.get_member(member_id)
+            if member is None or getattr(member, "bot", False):
+                continue
+            try:
+                await member.add_roles(role, reason="DMW Raid slot vote")
+            except Exception:
+                continue
+
+        for member_id in remove_ids:
+            member = guild.get_member(member_id)
+            if member is None:
+                continue
+            try:
+                await member.remove_roles(role, reason="DMW Raid slot vote removed")
+            except Exception:
+                continue
+
+    async def _resolve_role_by_id(self, guild: Any, role_id: int | None):
+        normalized_id = int(role_id or 0)
+        if normalized_id <= 0:
+            return None
+        role = guild.get_role(normalized_id)
+        if role is not None:
+            return role
+        fetch_roles = getattr(guild, "fetch_roles", None)
+        if not callable(fetch_roles):
+            return None
+        try:
+            rows_result = fetch_roles()
+            rows = await self._await_if_needed(rows_result)
+        except Exception:
+            return None
+        try:
+            iterator = list(rows or [])
+        except TypeError:
+            return None
+        for candidate in iterator:
+            if int(getattr(candidate, "id", 0) or 0) == normalized_id:
+                return candidate
+        return None
+
+    async def _cleanup_role_members_and_delete(self, role: Any, *, reason: str) -> None:
+        for member in list(getattr(role, "members", []) or []):
+            try:
+                remove_roles = getattr(member, "remove_roles", None)
+                if callable(remove_roles):
+                    await self._await_if_needed(remove_roles(role, reason=reason))
+            except Exception:
+                continue
+        try:
+            delete_role = getattr(role, "delete", None)
+            if callable(delete_role):
+                await self._await_if_needed(delete_role(reason=reason))
+        except Exception:
+            pass
+
+    async def _cleanup_slot_temp_role(self, raid: RaidRecord, *, day_label: str, time_label: str) -> None:
+        cache_key = self._slot_temp_role_cache_key(raid.id, day_label, time_label)
+        reminder_key = self._raid_reminder_cache_key(raid.id, day_label, time_label)
+        row = self.repo.get_debug_cache(cache_key)
+        self.repo.delete_debug_cache(reminder_key)
+        if row is None or row.kind != SLOT_TEMP_ROLE_KIND:
+            return
+        guild = self._safe_get_guild(raid.guild_id)
+        if guild is None:
+            self.repo.delete_debug_cache(cache_key)
+            return
+        role = await self._resolve_role_by_id(guild, int(row.message_id or 0))
+        if role is not None:
+            await self._cleanup_role_members_and_delete(role, reason="DMW Raid slot closed")
+        self.repo.delete_debug_cache(cache_key)
+
+    async def _cleanup_slot_temp_roles_for_raid(self, raid: RaidRecord) -> None:
+        rows = list(self.repo.list_debug_cache(kind=SLOT_TEMP_ROLE_KIND, guild_id=raid.guild_id, raid_id=raid.id))
+        guild = self._safe_get_guild(raid.guild_id)
+        if guild is None:
+            for row in rows:
+                self.repo.delete_debug_cache(row.cache_key)
+            return
+        known_role_ids: set[int] = set()
+        for row in rows:
+            role_id = int(row.message_id or 0)
+            if role_id > 0:
+                known_role_ids.add(role_id)
+            role = await self._resolve_role_by_id(guild, role_id)
+            if role is not None:
+                await self._cleanup_role_members_and_delete(role, reason="DMW Raid finished")
+            self.repo.delete_debug_cache(row.cache_key)
+
+        # Fallback: if cache rows are missing, still remove slot roles that match this raid's role prefix.
+        if not rows and raid.display_id is not None:
+            prefix = f"DMW Raid {raid.display_id} "
+            for role in list(getattr(guild, "roles", []) or []):
+                role_id = int(getattr(role, "id", 0) or 0)
+                role_name = str(getattr(role, "name", "") or "")
+                if role_id <= 0 or role_id in known_role_ids:
+                    continue
+                if not role_name.startswith(prefix):
+                    continue
+                await self._cleanup_role_members_and_delete(role, reason="DMW Raid finished")
+
+    def _clear_raid_reminder_cache(self, raid: RaidRecord) -> None:
+        rows = list(self.repo.list_debug_cache(kind=RAID_REMINDER_KIND, guild_id=raid.guild_id, raid_id=raid.id))
+        for row in rows:
+            self.repo.delete_debug_cache(row.cache_key)
+
     async def _cleanup_temp_role(self, raid: RaidRecord) -> None:
+        await self._cleanup_slot_temp_roles_for_raid(raid)
+        self._clear_raid_reminder_cache(raid)
         if not raid.temp_role_id:
             return
-        guild = self.get_guild(raid.guild_id)
+        guild = self._safe_get_guild(raid.guild_id)
         if guild is None:
             return
-        role = guild.get_role(int(raid.temp_role_id))
+        role = await self._resolve_role_by_id(guild, int(raid.temp_role_id))
         if role is None:
             return
 
@@ -2212,13 +3031,23 @@ class RewriteDiscordBot(discord.Client):
         updated = 0
         deleted = 0
         debug_lines: list[str] = []
-        role = await self._ensure_temp_role(raid)
+        roles_enabled = True
 
         for (day_label, time_label), users in qualified_slots.items():
             active_keys.add((day_label, time_label))
-            content = slot_text(raid, day_label, time_label, users)
-            if role is not None:
-                content = f"{content}\n{role.mention}"
+            embed = self._memberlist_slot_embed(
+                raid,
+                day_label=day_label,
+                time_label=time_label,
+                users=users,
+            )
+            content = None
+            slot_role = None
+            if roles_enabled:
+                slot_role = await self._ensure_slot_temp_role(raid, day_label=day_label, time_label=time_label)
+                if slot_role is not None:
+                    await self._sync_slot_role_members(raid, role=slot_role, user_ids=users)
+                    content = f"🔔 {slot_role.mention}"
             debug_lines.append(f"- {day_label} {time_label}: {', '.join(f'<@{u}>' for u in users)}")
             row = existing_rows.get((day_label, time_label))
             old_msg_for_recreate = None
@@ -2232,6 +3061,7 @@ class RewriteDiscordBot(discord.Client):
                         edited = await _safe_edit_message(
                             old_msg,
                             content=content,
+                            embed=embed,
                             allowed_mentions=discord.AllowedMentions(users=True, roles=True),
                         )
                         if edited:
@@ -2255,6 +3085,7 @@ class RewriteDiscordBot(discord.Client):
             new_msg = await self._send_channel_message(
                 participants_channel,
                 content=content,
+                embed=embed,
                 allowed_mentions=discord.AllowedMentions(users=True, roles=True),
             )
             if new_msg is None:
@@ -2277,13 +3108,21 @@ class RewriteDiscordBot(discord.Client):
         for key, row in list(existing_rows.items()):
             if key in active_keys:
                 continue
+            await self._cleanup_slot_temp_role(raid, day_label=key[0], time_label=key[1])
             await self._delete_slot_message(row)
             self.repo.delete_posted_slot(row.id)
             deleted += 1
 
-        debug_body = (
-            f"Memberlist Debug Guild `{raid.guild_id}` Raid `{raid.display_id}`\n"
-            + ("\n".join(debug_lines) if debug_lines else "Keine qualifizierten Slots.")
+        debug_body = self._format_debug_report(
+            topic="Memberlist Debug",
+            guild_id=raid.guild_id,
+            summary=[
+                f"Raid: {raid.display_id}",
+                f"Dungeon: {raid.dungeon}",
+                f"Qualified Slots: {len(debug_lines)}",
+            ],
+            lines=debug_lines,
+            empty_text="- Keine qualifizierten Slots.",
         )
         await self._mirror_debug_payload(
             debug_channel_id=int(self.config.memberlist_debug_channel_id),
@@ -2296,17 +3135,160 @@ class RewriteDiscordBot(discord.Client):
 
         return (created, updated, deleted)
 
+    @staticmethod
+    def _raid_jump_url(guild_id: int, channel_id: int, message_id: int | None) -> str:
+        if not message_id:
+            return "`(noch kein Link)`"
+        return f"https://discord.com/channels/{int(guild_id)}/{int(channel_id)}/{int(message_id)}"
+
+    def _build_raidlist_embed(
+        self,
+        *,
+        guild_id: int,
+        guild_name: str,
+        raids: list[RaidRecord],
+    ) -> tuple[Any, str, list[str]]:
+        now_utc = datetime.now(UTC)
+        embed = discord.Embed(
+            title=f"📌 Raidliste: {guild_name}",
+            color=discord.Color.blurple(),
+            timestamp=now_utc,
+        )
+        debug_lines: list[str] = []
+        payload_parts = [f"guild={guild_id}", f"name={guild_name}"]
+
+        if not raids:
+            embed.description = "Keine offenen Raids."
+            embed.set_footer(text="Automatisch aktualisiert durch DMW Bot")
+            payload = "\n".join(payload_parts + ["empty=1"])
+            return embed, sha256_text(payload), ["- Keine offenen Raids."]
+
+        total_qualified_slots = 0
+        global_next_start: datetime | None = None
+        global_next_label: str = "—"
+
+        for raid in raids[:25]:
+            days, times = self.repo.list_raid_options(raid.id)
+            day_users, time_users = self.repo.vote_user_sets(raid.id)
+            threshold = memberlist_threshold(raid.min_players)
+            qualified_slots, _ = compute_qualified_slot_users(
+                days=days,
+                times=times,
+                day_users=day_users,
+                time_users=time_users,
+                threshold=threshold,
+            )
+            complete_voters = len(set().union(*day_users.values()).intersection(set().union(*time_users.values())))
+
+            timezone_name = DEFAULT_TIMEZONE_NAME
+
+            slot_starts: list[tuple[datetime, str, str]] = []
+            for day_label, time_label in qualified_slots:
+                start_at = self._parse_slot_start_at_utc(
+                    day_label,
+                    time_label,
+                    timezone_name=timezone_name,
+                )
+                if start_at is None:
+                    continue
+                slot_starts.append((start_at, day_label, time_label))
+            slot_starts.sort(key=lambda item: item[0])
+
+            next_slot_text = "—"
+            next_slot_start: datetime | None = None
+            if slot_starts:
+                upcoming = [entry for entry in slot_starts if entry[0] >= now_utc]
+                chosen = upcoming[0] if upcoming else slot_starts[0]
+                next_slot_start, next_day, next_time = chosen
+                unix_ts = int(next_slot_start.timestamp())
+                next_slot_text = f"`{next_day} {next_time}` • <t:{unix_ts}:f> (<t:{unix_ts}:R>)"
+
+                if global_next_start is None or (
+                    next_slot_start >= now_utc
+                    and (global_next_start < now_utc or next_slot_start < global_next_start)
+                ):
+                    global_next_start = next_slot_start
+                    global_next_label = f"Raid `{raid.display_id}` {next_day} {next_time}"
+
+            total_qualified_slots += len(qualified_slots)
+            jump_url = self._raid_jump_url(guild_id, raid.channel_id, raid.message_id)
+            required_label = memberlist_target_label(raid.min_players)
+            field_name = f"#{raid.display_id} • {raid.dungeon}"
+            field_value = "\n".join(
+                [
+                    f"👤 <@{raid.creator_id}>",
+                    f"👥 Min `{required_label}` • ✅ Slots `{len(qualified_slots)}`",
+                    f"🗳️ Vollständig abgestimmt `{complete_voters}`",
+                    f"🕰️ Zeitzone `{timezone_name}`",
+                    f"⏭️ Nächster Slot: {next_slot_text}",
+                    f"🔗 {jump_url}",
+                ]
+            )
+            if len(field_name) > 256:
+                field_name = f"{field_name[:253]}..."
+            if len(field_value) > 1024:
+                field_value = f"{field_value[:1021]}..."
+            embed.add_field(name=field_name, value=field_value, inline=False)
+
+            debug_lines.append(
+                f"- Raid {raid.display_id} ({raid.dungeon}) tz={timezone_name} slots={len(qualified_slots)} next={next_slot_text}"
+            )
+            payload_parts.append(
+                "|".join(
+                    [
+                        f"raid={raid.id}",
+                        f"display={raid.display_id}",
+                        f"dungeon={raid.dungeon}",
+                        f"creator={raid.creator_id}",
+                        f"min={raid.min_players}",
+                        f"tz={timezone_name}",
+                        f"days={','.join(sorted(days))}",
+                        f"times={','.join(sorted(times))}",
+                        f"qualified={','.join(sorted(f'{d}@{t}' for d, t in qualified_slots))}",
+                        f"msg={int(raid.message_id or 0)}",
+                    ]
+                )
+            )
+
+        summary_parts = [
+            f"Offene Raids: `{len(raids)}`",
+            f"Qualifizierte Slots: `{total_qualified_slots}`",
+            f"Zeitzone: `{DEFAULT_TIMEZONE_NAME}`",
+        ]
+        if global_next_start is not None:
+            summary_parts.append(f"Nächster Start: `{global_next_label}`")
+        embed.description = " • ".join(summary_parts)
+        embed.set_footer(text="Automatisch aktualisiert durch DMW Bot")
+
+        payload_hash = sha256_text("\n".join(payload_parts))
+        return embed, payload_hash, debug_lines
+
     async def _refresh_raidlist_for_guild(self, guild_id: int, *, force: bool = False) -> bool:
         settings = self.repo.ensure_settings(guild_id)
         if not settings.raidlist_channel_id:
             return False
 
         guild = self.get_guild(guild_id)
-        guild_name = guild.name if guild is not None else (settings.guild_name or str(guild_id))
-        render = render_raidlist(guild_id, guild_name, self.repo.list_open_raids(guild_id))
-        debug_payload = f"Raidlist Debug Guild `{guild_id}` ({guild_name})\n{render.title}\n{render.body}"
+        guild_name = guild.name if guild is not None else (settings.guild_name or self._guild_display_name(guild_id))
+        raids = self.repo.list_open_raids(guild_id)
+        embed, payload_hash, debug_lines = self._build_raidlist_embed(
+            guild_id=guild_id,
+            guild_name=guild_name,
+            raids=raids,
+        )
+        debug_payload = self._format_debug_report(
+            topic="Raidlist Debug",
+            guild_id=guild_id,
+            summary=[
+                f"Title: Raidliste {guild_name}",
+                f"Open Raids: {len(raids)}",
+                f"Payload Hash: {payload_hash[:16]}",
+            ],
+            lines=debug_lines,
+            empty_text="- Keine Raidlist-Daten.",
+        )
 
-        if not force and self._raidlist_hash_by_guild.get(guild_id) == render.payload_hash:
+        if not force and self._raidlist_hash_by_guild.get(guild_id) == payload_hash:
             await self._mirror_debug_payload(
                 debug_channel_id=int(self.config.raidlist_debug_channel_id),
                 cache_key=f"raidlist:{guild_id}:0",
@@ -2321,12 +3303,11 @@ class RewriteDiscordBot(discord.Client):
         if channel is None:
             return False
 
-        content = f"**{render.title}**\n{render.body}"
         if settings.raidlist_message_id:
             message = await _safe_fetch_message(channel, settings.raidlist_message_id)
             if message is not None:
-                if await _safe_edit_message(message, content=content):
-                    self._raidlist_hash_by_guild[guild_id] = render.payload_hash
+                if await _safe_edit_message(message, content=None, embed=embed):
+                    self._raidlist_hash_by_guild[guild_id] = payload_hash
                     await self._mirror_debug_payload(
                         debug_channel_id=int(self.config.raidlist_debug_channel_id),
                         cache_key=f"raidlist:{guild_id}:0",
@@ -2337,11 +3318,11 @@ class RewriteDiscordBot(discord.Client):
                     )
                     return True
 
-        posted = await self._send_channel_message(channel, content=content)
+        posted = await self._send_channel_message(channel, embed=embed)
         if posted is None:
             return False
         settings.raidlist_message_id = posted.id
-        self._raidlist_hash_by_guild[guild_id] = render.payload_hash
+        self._raidlist_hash_by_guild[guild_id] = payload_hash
         await self._mirror_debug_payload(
             debug_channel_id=int(self.config.raidlist_debug_channel_id),
             cache_key=f"raidlist:{guild_id}:0",
@@ -2361,7 +3342,7 @@ class RewriteDiscordBot(discord.Client):
     async def _refresh_raidlist_for_guild_persisted(self, guild_id: int) -> None:
         async with self._state_lock:
             await self._refresh_raidlist_for_guild(guild_id)
-            persisted = await self._persist()
+            persisted = await self._persist(dirty_tables={"settings", "debug_cache"})
         if not persisted:
             log.warning("Debounced raidlist refresh persisted failed for guild %s", guild_id)
 
@@ -2396,6 +3377,16 @@ class RewriteDiscordBot(discord.Client):
             guild_id = raid.guild_id
             display_id = raid.display_id
 
+            if int(interaction.user.id) != int(raid.creator_id):
+                msg = "Nur der Raid-Ersteller darf den Raid beenden."
+                if deferred:
+                    await _safe_followup(interaction, msg, ephemeral=True)
+                else:
+                    await self._reply(interaction, msg, ephemeral=True)
+                return
+
+            # Ensure temp roles are cleaned even if raid rows are removed right after.
+            await self._cleanup_temp_role(raid)
             result = finish_raid(self.repo, raid_id=raid.id, actor_user_id=interaction.user.id)
             if not result.success:
                 if result.reason == "only_creator":
@@ -2408,7 +3399,6 @@ class RewriteDiscordBot(discord.Client):
                     await self._reply(interaction, msg, ephemeral=True)
                 return
 
-            await self._cleanup_temp_role(raid)
             for row in slot_rows:
                 await self._delete_slot_message(row)
 
@@ -2512,6 +3502,7 @@ class RewriteDiscordBot(discord.Client):
                     f"Levelup Nachrichten: `{_on_off(feature_settings.levelup_messages_enabled)}`\n"
                     f"Nanomon Reply: `{_on_off(feature_settings.nanomon_reply_enabled)}`\n"
                     f"Approved Reply: `{_on_off(feature_settings.approved_reply_enabled)}`\n"
+                    f"Raid Reminder: `{_on_off(feature_settings.raid_reminder_enabled)}`\n"
                     f"Message XP Interval (s): `{int(feature_settings.message_xp_interval_seconds)}`\n"
                     f"Levelup Cooldown (s): `{int(feature_settings.levelup_message_cooldown_seconds)}`\n"
                     f"Umfragen Channel: `{settings.planner_channel_id}`\n"
@@ -2567,7 +3558,7 @@ class RewriteDiscordBot(discord.Client):
                 return
             await self._reply(interaction, "\n".join(f"- {name}" for name in names), ephemeral=True)
 
-        @self.tree.command(name="raidplan", description="Erstellt einen Raid Plan (Modal)")
+        @self.tree.command(name="raidplan", description="Erstellt einen Raid Plan (Datumsauswahl + Modal)")
         @app_commands.describe(dungeon="Dungeon Name")
         async def raidplan_cmd(interaction, dungeon: str):
             if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
@@ -2595,8 +3586,9 @@ class RewriteDiscordBot(discord.Client):
                     await self._reply(interaction, f"Fehler: {exc}", ephemeral=True)
                     return
 
-            modal = RaidCreateModal(
+            view = RaidDateSelectionView(
                 self,
+                owner_user_id=interaction.user.id,
                 guild_id=interaction.guild.id,
                 guild_name=interaction.guild.name,
                 channel_id=int(settings.planner_channel_id),
@@ -2605,10 +3597,17 @@ class RewriteDiscordBot(discord.Client):
                 default_times=defaults.times,
                 default_min_players=defaults.min_players,
             )
-            try:
-                await interaction.response.send_modal(modal)
-            except Exception:
-                await self._reply(interaction, "Raid-Modal konnte nicht geoeffnet werden.", ephemeral=True)
+            sent = await _safe_send_initial(
+                interaction,
+                (
+                    "Waehle ein oder mehrere Daten aus und klicke dann auf "
+                    "`Weiter (Uhrzeiten + Min Spieler)`."
+                ),
+                ephemeral=True,
+                view=view,
+            )
+            if not sent:
+                await self._reply(interaction, "Datumsauswahl konnte nicht geoeffnet werden.", ephemeral=True)
 
         @raidplan_cmd.autocomplete("dungeon")
         async def raidplan_dungeon_autocomplete(interaction, current: str):
@@ -2637,7 +3636,7 @@ class RewriteDiscordBot(discord.Client):
                 return
             async with self._state_lock:
                 await self._force_raidlist_refresh(interaction.guild.id)
-                persisted = await self._persist()
+                persisted = await self._persist(dirty_tables={"settings", "debug_cache"})
             if not persisted:
                 await self._reply(interaction, "Raidlist Refresh fehlgeschlagen (DB).", ephemeral=True)
                 return
@@ -2666,7 +3665,7 @@ class RewriteDiscordBot(discord.Client):
                 return
             async with self._state_lock:
                 row = set_templates_enabled(self.repo, interaction.guild.id, interaction.guild.name, enabled)
-                persisted = await self._persist()
+                persisted = await self._persist(dirty_tables={"settings"})
             if not persisted:
                 await self._reply(interaction, "Template-Config konnte nicht gespeichert werden.", ephemeral=True)
                 return
@@ -2682,8 +3681,12 @@ class RewriteDiscordBot(discord.Client):
                 return
             await self._defer(interaction, ephemeral=True)
             amount = max(1, min(100, int(amount)))
-            deleted = await purge_fn(limit=amount)
-            await _safe_followup(interaction, f"{len(deleted)} Nachrichten geloescht.", ephemeral=True)
+            deleted_result = await self._await_if_needed(purge_fn(limit=amount))
+            try:
+                deleted_count = len(deleted_result)
+            except TypeError:
+                deleted_count = 0
+            await _safe_followup(interaction, f"{deleted_count} Nachrichten geloescht.", ephemeral=True)
 
         @self.tree.command(name="purgebot", description="Loescht Bot-Nachrichten im Channel oder serverweit")
         @_admin_or_privileged_check()
@@ -2709,7 +3712,7 @@ class RewriteDiscordBot(discord.Client):
                 await _safe_followup(interaction, "Bot-Mitglied im Server nicht gefunden.", ephemeral=True)
                 return
 
-            channels: list[discord.TextChannel]
+            channels: list[Any]
             if scope.value == "channel":
                 if not isinstance(interaction.channel, discord.TextChannel):
                     await _safe_followup(interaction, "Nur im Textchannel nutzbar.", ephemeral=True)
@@ -2817,7 +3820,7 @@ class RewriteDiscordBot(discord.Client):
             await self._defer(interaction, ephemeral=True)
             async with self._state_lock:
                 await self._refresh_raidlist_for_guild(target, force=True)
-                persisted = await self._persist()
+                persisted = await self._persist(dirty_tables={"settings", "debug_cache"})
 
             if not persisted:
                 await _safe_followup(interaction, "Remote-Raidlist-Refresh fehlgeschlagen (DB).", ephemeral=True)
@@ -2929,12 +3932,12 @@ class RewriteDiscordBot(discord.Client):
         try:
             await self.task_registry.cancel_all()
         except Exception:
-            pass
+            log.exception("Failed to cancel background tasks during shutdown.")
         try:
             for logger in self._discord_loggers:
                 logger.removeHandler(self._discord_log_handler)
         except Exception:
-            pass
+            log.exception("Failed to detach Discord log handler during shutdown.")
         await super().close()
 
 

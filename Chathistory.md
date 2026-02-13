@@ -343,3 +343,247 @@ If a new chat should continue safely:
 #### Relevant commits recorded in this period
 - `a3865f3` — message formatting + username sync implementation/tests
 - pending commit in this step — chathistory update + workflow trigger policy update
+
+### Delta persistence update (2026-02-13, newest)
+- Refined `services/persistence_service.py` flush strategy:
+  - removed full-table `DELETE` + full `INSERT` rewrite cycle for normal runtime persistence.
+  - flush now computes per-table snapshots and applies only row-level deltas:
+    - `INSERT` for newly added rows
+    - `UPDATE` for changed rows (same primary key)
+    - `DELETE` for removed rows
+  - unchanged repository state still short-circuits with fingerprint check (no DB write cycle).
+- Added/updated tests:
+  - `tests/test_phase3_persistence_optimization.py`
+    - verifies unchanged state does not open another write cycle
+    - verifies changed existing row uses `UPDATE` (not delete/reinsert).
+- Verification snapshot:
+  - `.venv/bin/pytest -q` => `83 passed, 1 warning in 0.62s`
+
+### Delta flush optimization pass 2 (2026-02-13, newest)
+- Further optimized runtime delta flush in `services/persistence_service.py`:
+  - added per-table fingerprint tracking to detect changed tables precisely.
+  - flush now skips completely unchanged tables when applying SQL deltas.
+  - delete operations are now batched (`IN (...)` chunked) instead of single-row delete statements.
+- Added regression coverage in `tests/test_phase3_persistence_optimization.py`:
+  - verifies delete path only affects changed target table rows and does not issue unrelated table deletes.
+- Verification snapshot:
+  - `.venv/bin/pytest -q tests/test_phase3_persistence_optimization.py` => `3 passed in 0.08s`
+  - `.venv/bin/pytest -q` => `84 passed, 1 warning in 0.48s`
+
+### Delta flush optimization pass 3 + code health scan (2026-02-13, newest)
+- Additional runtime persistence optimizations in `services/persistence_service.py`:
+  - fingerprint calculation switched to streaming table/global hashes (reduced temporary JSON payload work).
+  - row updates now write only changed non-PK columns (cell-level update semantics within changed rows).
+  - insert batches are chunked (`_INSERT_CHUNK_SIZE`) to avoid large one-shot ORM add lists.
+- Test hardening in `tests/test_phase3_persistence_optimization.py`:
+  - asserts guild_settings update writes only the changed column (`guild_name`).
+- Global reliability tweak in `bot/runtime.py`:
+  - shutdown no longer silently swallows failures for task cancellation / log-handler detach; now logs exceptions.
+- Full verification:
+  - `.venv/bin/pytest -q` => `84 passed, 1 warning in 0.46s`
+  - `python3 -m compileall bot db discord features services utils tests` => passed
+
+### Delta flush optimization pass 4 (2026-02-13, newest)
+- Further reduced flush overhead in `services/persistence_service.py`:
+  - flush now computes table fingerprints directly from repository rows first.
+  - row snapshots are materialized only for tables that actually changed (instead of building full snapshot each flush).
+  - unchanged-table snapshots are reused from last successful flush state.
+- Safety and behavior:
+  - SQL write semantics remain delta-based (`DELETE` removed rows, `UPDATE` changed fields, `INSERT` new rows).
+  - no schema changes were introduced.
+- Verification:
+  - `.venv/bin/pytest -q tests/test_phase3_persistence_optimization.py` => `3 passed in 0.08s`
+  - `.venv/bin/pytest -q` => `84 passed, 1 warning in 0.46s`
+  - `python3 -m compileall bot db discord features services utils tests` => passed
+
+### Repository/runtime optimization pass 5 (2026-02-13, newest)
+- Optimized debug-cache lookup performance in `db/repository.py`:
+  - added in-memory secondary indexes for `debug_cache` by:
+    - kind
+    - (kind, guild)
+    - (kind, guild, raid)
+  - `list_debug_cache` now uses index fast-paths for common query shapes used by runtime.
+  - upsert/delete/reset/recalculate now maintain/rebuild index consistency.
+- Hardened bot-message index cleanup in `bot/runtime.py`:
+  - `_clear_bot_message_index_for_id` now removes matching cache rows by `(kind, guild, channel, message_id)` scan of indexed rows.
+  - avoids dependence on current bot user id in cache key composition.
+- Added regression coverage:
+  - `tests/test_phase3_debug_mirror.py`
+    - verifies indexed kind/guild/raid filter behavior
+    - verifies reindexing on upsert scope changes
+- Verification:
+  - `.venv/bin/pytest -q tests/test_phase3_debug_mirror.py tests/test_phase3_purgebot_index.py tests/test_phase3_persistence_optimization.py` => `10 passed, 1 warning in 0.36s`
+  - `.venv/bin/pytest -q` => `86 passed, 1 warning in 0.52s`
+  - `python3 -m compileall db/repository.py bot/runtime.py tests/test_phase3_debug_mirror.py` => passed
+
+### Repository optimization pass 6 (2026-02-13, newest)
+- Implemented O(1)-style vote toggle lookup in `db/repository.py`:
+  - added in-memory vote key index: `(raid_id, kind, option_label, user_id) -> vote_id`
+  - `toggle_vote` now checks/removes/adds via index instead of full `raid_votes` scan.
+  - index is rebuilt on `recalculate_counters()` to stay consistent after DB load.
+- Implemented bulk raid cascade deletion in `db/repository.py`:
+  - added `_delete_raids_cascade(raid_ids)` to remove raids/options/votes/posted-slots in one pass.
+  - `cancel_open_raids_for_guild` and `purge_guild_data` now use bulk cascade path.
+- Voting behavior safety (important):
+  - multi-select semantics are preserved (users can still vote for multiple day options and multiple time options).
+  - only exact same `(raid_id, kind, option_label, user_id)` vote is toggled.
+- Added/updated tests:
+  - `tests/test_phase3_voting.py`
+    - verifies same user can keep multiple day/time selections.
+  - `tests/test_phase3_repository_cascade.py`
+    - verifies bulk cascade removes only target guild raid data and keeps remaining guild voting functional.
+- Verification:
+  - `.venv/bin/pytest -q tests/test_phase3_voting.py tests/test_phase3_repository_cascade.py tests/test_phase3_cleanup.py tests/test_phase3_participation_counter.py` => `8 passed in 0.05s`
+  - `.venv/bin/pytest -q` => `89 passed, 1 warning in 0.60s`
+  - `python3 -m compileall db/repository.py tests/test_phase3_voting.py tests/test_phase3_repository_cascade.py` => passed
+
+### Runtime feature expansion + harmonization check (2026-02-13, newest)
+- Implemented user timezone management and raid-timezone aware planning/reminders in `bot/runtime.py`.
+  - Added `/timezone` command with autocomplete for IANA timezone names.
+  - Raid creation now uses creator timezone context for date selection and stores raid-specific timezone metadata.
+  - Reminder scheduling now parses slot date/time in raid timezone and converts to UTC safely.
+- Added periodic integrity cleanup worker to remove orphaned runtime artifacts:
+  - stale `raid_timezone`, `raid_reminder`, `slot_temp_role`, and disconnected `user_timezone` cache rows.
+  - orphan temporary slot roles are cleaned when no open raid mapping exists.
+- Reworked raidlist output from plain text to rich embed format:
+  - per-raid structured fields (creator, min players, qualified slots, fully-voted count, timezone, next slot, planner jump link).
+  - embed payload hash remains delta-aware to avoid redundant edits.
+- Extended command registry expectations:
+  - `services/startup_service.py` now includes `/timezone` in `EXPECTED_SLASH_COMMANDS`.
+
+### Additional stabilization/tests in same pass (2026-02-13)
+- Added tests for timezone and reminder behavior:
+  - `tests/test_phase3_raid_reminder_and_roles.py`
+    - timezone-aware UTC parsing
+    - reminder send path with raid timezone
+- Added orphan-cleanup coverage:
+  - `tests/test_phase3_integrity_cleanup.py`
+- Added new raidlist-embed coverage:
+  - `tests/test_phase3_raidlist_embed.py`
+
+### Latest verification snapshot (current)
+- Type check:
+  - `.venv/bin/pyright bot/runtime.py` => `0 errors, 0 warnings`
+- Runtime compile validation:
+  - `.venv/bin/python -m py_compile bot/runtime.py services/startup_service.py ...` => passed
+- Full test suite:
+  - `.venv/bin/python -m pytest -q` => `102 passed, 1 warning in 0.54s`
+- Remaining warning source is external dependency only:
+  - `discord.py` deprecation warning for Python `audioop` removal path.
+
+### Timezone simplification (2026-02-13, latest)
+- User request: remove per-user timezone complexity and pin bot scheduling timezone to Berlin.
+- Applied in `bot/runtime.py`:
+  - fixed default timezone to `Europe/Berlin`.
+  - removed `/timezone` command and related autocomplete/config paths.
+  - removed per-user/per-raid timezone cache logic from runtime flow.
+  - raid planning and reminders now run with single global bot timezone (`Europe/Berlin`).
+  - integrity cleanup now purges legacy `user_timezone` / `raid_timezone` cache rows from debug cache.
+- Command registry alignment:
+  - removed `timezone` from `services/startup_service.py` expected command set.
+- Tests adjusted and revalidated:
+  - `tests/test_phase3_raid_reminder_and_roles.py`
+  - `tests/test_phase3_raidlist_embed.py`
+  - `tests/test_phase3_integrity_cleanup.py`
+- Verification:
+  - `.venv/bin/python -m pytest -q` => `102 passed, 1 warning in 0.55s`
+  - `.venv/bin/pyright bot/runtime.py` => `0 errors, 0 warnings`
+
+### Full bot audit + active-code hardening (2026-02-13, latest)
+- Performed full validation sweep:
+  - `python3 -m compileall bot db discord features services utils tests` => passed
+  - `.venv/bin/python -m pytest -q` => `102 passed, 1 warning`
+- Ran broad static analysis and separated noise from relevant issues:
+  - full-project `pyright` showed many legacy/test-only diagnostics.
+  - active runtime modules were checked explicitly: `.venv/bin/pyright bot db discord features services utils`.
+
+#### Fixes applied to active code (type-safety + robustness)
+- `db/schema_guard.py`
+  - tightened table/column helper typing (`Table`, `Any`) to remove unsafe `object`-typed paths.
+  - typed `create_tables` as `list[Table]` for `Base.metadata.create_all(...)` compatibility.
+- `discord/task_registry.py`
+  - made task factory explicitly coroutine-based (`TaskFactory`), and typed task storage as `asyncio.Task[None]`.
+  - removes awaitable/coroutine mismatch risk around `asyncio.create_task`.
+- `db/models.py`
+  - corrected SQLAlchemy mapped datetime annotations from `Mapped[DateTime]` to `Mapped[datetime]`.
+  - this fixes wrong static assumptions in persistence load paths.
+- `services/persistence_service.py`
+  - normalized table-row map typing to `Mapping[Any, Any]` for mixed-key repositories.
+- `services/raid_service.py`
+  - hardened `upsert_posted_slot` update path when `row.message_id` is `None` by generating deterministic fallback id.
+
+### Verification after hardening
+- Active modules type-check:
+  - `.venv/bin/pyright bot db discord features services utils` => `0 errors, 0 warnings`
+- Full tests still green:
+  - `.venv/bin/python -m pytest -q` => `102 passed, 1 warning in 0.51s`
+
+### Full active-code audit + optimization pass (2026-02-13, latest)
+- Scope audited (legacy excluded): `bot/`, `db/`, `discord/`, `features/`, `services/`, `utils/` + root requirements files.
+- Requirements validation:
+  - `requirements.in` and `requirements.txt` are consistent with resolver output.
+  - `pip check` reported no broken dependencies.
+- Runtime/performance refinements in `bot/runtime.py`:
+  - added cached timezone resolver (`_zoneinfo_for_name`) to avoid repeated `ZoneInfo(...)` construction in hot paths.
+  - reminder worker now caches participant channel lookups per channel id per pass (fewer repeated fetches).
+- Type-safety/runtime hardening in active modules:
+  - `db/schema_guard.py`: stricter table/column typing for `create_all` and DDL helper paths.
+  - `discord/task_registry.py`: coroutine/task typing tightened (`TaskFactory`, `asyncio.Task[None]`).
+  - `db/models.py`: corrected ORM annotations from `Mapped[DateTime]` to `Mapped[datetime]`.
+  - `services/persistence_service.py`: stabilized row-map typing for mixed key spaces.
+  - `services/raid_service.py`: guarded `message_id=None` path during slot upsert updates.
+- Requirements resolver script robustness:
+  - `scripts/resolve_second_latest_requirements.py` now prefers public `packaging` imports with runtime fallback and type-check-safe structure.
+- Added `pyrightconfig.json` to lock static analysis scope to active code and exclude `legacy_archive`/tests noise.
+
+### Verification snapshot after audit pass
+- Static typing (active scope):
+  - `.venv/bin/pyright` => `0 errors, 0 warnings`
+- Compile checks:
+  - `python3 -m compileall bot db discord features services utils tests` => passed
+  - `python3 -m py_compile ...` on changed modules => passed
+- Test suite:
+  - `.venv/bin/python -m pytest -q` => `102 passed, 1 warning in 0.52s`
+
+### Runtime/Persistence hardening + logging safety (2026-02-13, newest)
+- Persist reliability and state safety:
+  - `bot/runtime.py` `_persist(...)` now uses retry + exponential backoff (`PERSIST_FLUSH_MAX_ATTEMPTS=3`) instead of single-shot failure.
+  - No automatic in-memory reload on flush failure anymore (prevents transient DB errors from discarding live runtime state).
+  - `_persist` now accepts dirty-table hints and forwards them to persistence flush.
+- Delta flush optimization:
+  - `services/persistence_service.py` switched from full-table global fingerprint scan on every flush to hint-driven delta snapshots.
+  - New `dirty_tables` path limits snapshot scope to likely-changed tables.
+  - Periodic full-scan safety fallback remains (`_FULL_SCAN_EVERY_HINTED_FLUSHES=25`) to self-heal missed hints.
+- Log volume + data exposure reduction:
+  - `bot/config.py` default `DISCORD_LOG_LEVEL` changed from `DEBUG` to `INFO`.
+  - Added strict `DISCORD_LOG_LEVEL` value validation.
+  - `db/session.py` now redacts SQL parameters before logging (`<redacted>`, `<int>`, `<datetime>`, etc.) to avoid sensitive payload leakage.
+- Additional runtime safety already integrated in same pass:
+  - bounded log-forward queue with drop-oldest strategy under pressure.
+  - console command parsing hardened so malformed slash-only input does not error.
+
+### Tests added/updated for this pass
+- `tests/test_phase3_runtime_persist_behavior.py`
+  - verifies flush retry/backoff behavior.
+  - verifies dirty-table hints are forwarded.
+  - verifies no forced reload on flush failure.
+- `tests/test_phase3_db_session_redaction.py`
+  - validates SQL parameter redaction for scalar and nested payloads.
+- `tests/test_phase3_config.py`
+  - validates `DISCORD_LOG_LEVEL=INFO` default and invalid-level rejection.
+- `tests/test_phase3_persistence_optimization.py`
+  - verifies hint-scoped snapshot behavior for delta flush.
+- Updated compatibility tests:
+  - `tests/test_phase3_raidlist.py`
+  - `tests/test_phase3_memberlist_restore_recreate.py`
+
+### Latest verification snapshot
+- Targeted tests:
+  - `.venv/bin/python -m pytest -q tests/test_phase3_runtime_persist_behavior.py tests/test_phase3_db_session_redaction.py tests/test_phase3_config.py tests/test_phase3_persistence_optimization.py` => `13 passed, 1 warning`
+- Full suite:
+  - `.venv/bin/python -m pytest -q` => `127 passed, 1 warning in 0.72s`
+- Static typing:
+  - `.venv/bin/pyright` => `0 errors, 0 warnings`
+- Compile/deps:
+  - `.venv/bin/python -m compileall -q bot db discord features services utils tests` => passed
+  - `.venv/bin/python -m pip check` => `No broken requirements found.`
