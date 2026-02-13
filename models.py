@@ -168,3 +168,19 @@ class UserLevel(Base):
     updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
 Index("ix_user_levels_guild_level", UserLevel.guild_id, UserLevel.level)
+
+
+# === debug_mirror_cache ===
+class DebugMirrorCache(Base):
+    __tablename__ = "debug_mirror_cache"
+
+    cache_key: Mapped[str] = mapped_column(String(96), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    raid_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    updated_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+Index("ix_debug_mirror_cache_kind_guild_raid", DebugMirrorCache.kind, DebugMirrorCache.guild_id, DebugMirrorCache.raid_id)

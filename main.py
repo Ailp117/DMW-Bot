@@ -9,13 +9,14 @@ from datetime import datetime, timedelta
 
 import discord
 from discord import app_commands
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from config import (
     DISCORD_TOKEN,
     ENABLE_MESSAGE_CONTENT_INTENT,
     LOG_GUILD_ID,
     LOG_CHANNEL_ID,
+    SELF_TEST_INTERVAL_SECONDS,
 )
 from ensure_schema import ensure_schema
 from db import try_acquire_singleton_lock, session_scope
@@ -114,12 +115,17 @@ class RaidBot(discord.Client):
         self.raidlist_updater: RaidlistUpdater | None = None
         self.stale_raid_task: asyncio.Task | None = None
         self.voice_xp_task: asyncio.Task | None = None
+        self.self_test_task: asyncio.Task | None = None
         self.voice_xp_last_award: dict[tuple[int, int], datetime] = {}
+        self.last_self_test_ok_at: datetime | None = None
+        self.last_self_test_error: str | None = None
         self.log_channel: discord.TextChannel | None = None
         self.log_forwarder_task: asyncio.Task | None = None
         self.log_forward_queue: asyncio.Queue[str] = asyncio.Queue()
         self.pending_log_buffer: deque[str] = deque(maxlen=250)
         self._startup_guild_cleanup_done = False
+        self._ready_sync_done = False
+        self._initial_raidlist_refresh_done = False
         self._discord_log_handler = self._build_discord_log_handler()
         log.addHandler(self._discord_log_handler)
 
@@ -353,12 +359,21 @@ class RaidBot(discord.Client):
 
             stale_running = bool(self.stale_raid_task and not self.stale_raid_task.done())
             voice_xp_running = bool(self.voice_xp_task and not self.voice_xp_task.done())
+            self_test_running = bool(self.self_test_task and not self.self_test_task.done())
+            self_test_status = (
+                f"letzter Erfolg: {self.last_self_test_ok_at.isoformat(timespec='seconds')}"
+                if self.last_self_test_ok_at
+                else "noch kein erfolgreicher Lauf"
+            )
+            if self.last_self_test_error:
+                self_test_status = f"{self_test_status} | letzter Fehler: {self.last_self_test_error}"
             e.add_field(
                 name="Background Jobs",
                 value=(
                     f"Stale Cleanup: {'✅ aktiv' if stale_running else '❌ inaktiv'}\n"
                     f"Cutoff: {STALE_RAID_HOURS}h | Intervall: {STALE_RAID_CHECK_SECONDS}s\n"
-                    f"Voice XP: {'✅ aktiv' if voice_xp_running else '❌ inaktiv'} | +1 XP/{int(VOICE_XP_AWARD_INTERVAL.total_seconds() // 3600)}h"
+                    f"Voice XP: {'✅ aktiv' if voice_xp_running else '❌ inaktiv'} | +1 XP/{int(VOICE_XP_AWARD_INTERVAL.total_seconds() // 3600)}h\n"
+                    f"Self-Tests: {'✅ aktiv' if self_test_running else '❌ inaktiv'} | Intervall: {SELF_TEST_INTERVAL_SECONDS}s | {self_test_status}"
                 ),
                 inline=False,
             )
@@ -388,12 +403,12 @@ class RaidBot(discord.Client):
             await interaction.response.send_message("♻️ Neustart wird ausgeführt …", ephemeral=True)
             asyncio.create_task(self._restart_process())
 
-        await self._sync_commands_for_known_guilds()
-
         if self.stale_raid_task is None or self.stale_raid_task.done():
             self.stale_raid_task = asyncio.create_task(self._stale_raid_worker())
         if self.voice_xp_task is None or self.voice_xp_task.done():
             self.voice_xp_task = asyncio.create_task(self._voice_xp_worker())
+        if self.self_test_task is None or self.self_test_task.done():
+            self.self_test_task = asyncio.create_task(self._self_test_worker())
 
     async def restore_persistent_raid_views(self) -> None:
         """Re-register persistent raid planner views after bot restart."""
@@ -465,6 +480,39 @@ class RaidBot(discord.Client):
             except Exception:
                 log.exception("Voice XP worker failed")
             await asyncio.sleep(VOICE_XP_CHECK_SECONDS)
+
+    async def _run_self_tests_once(self):
+        registered_commands = {cmd.name for cmd in self.tree.get_commands()}
+        expected_commands = {
+            "settings", "status", "help", "restart",
+            "raidplan", "raidlist", "dungeonlist", "cancel_all_raids", "purge", "purgebot",
+        }
+        missing = sorted(expected_commands - registered_commands)
+        if missing:
+            raise RuntimeError(f"Missing commands: {', '.join(missing)}")
+
+        async with session_scope() as session:
+            guild_count = int((await session.execute(select(func.count()).select_from(GuildSettings))).scalar_one())
+            raid_count = int((await session.execute(select(func.count()).select_from(Raid))).scalar_one())
+
+        self.last_self_test_ok_at = datetime.utcnow()
+        self.last_self_test_error = None
+        log.info(
+            "Self-test passed (commands=%s, guild_settings_rows=%s, raids_rows=%s)",
+            len(registered_commands),
+            guild_count,
+            raid_count,
+        )
+
+    async def _self_test_worker(self):
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                await self._run_self_tests_once()
+            except Exception as exc:
+                self.last_self_test_error = str(exc)
+                log.exception("Background self-test failed")
+            await asyncio.sleep(max(30, SELF_TEST_INTERVAL_SECONDS))
 
     async def _award_voice_xp_once(self):
         now = datetime.utcnow()
@@ -586,6 +634,27 @@ class RaidBot(discord.Client):
         except Exception:
             log.exception("Failed to remove database data for removed guild %s", guild.id)
 
+    async def on_guild_join(self, guild: discord.Guild):
+        try:
+            await self.tree.sync(guild=discord.Object(id=guild.id))
+            log.info("Synced commands for newly joined guild %s", guild.id)
+        except Exception:
+            log.exception("Failed to sync commands for newly joined guild %s", guild.id)
+
+        try:
+            await force_raidlist_refresh(self, guild.id)
+        except Exception:
+            log.exception("Failed to refresh raidlist for newly joined guild %s", guild.id)
+
+    async def _refresh_raidlists_for_all_guilds(self) -> None:
+        async def _refresh_one(guild_id: int) -> None:
+            try:
+                await force_raidlist_refresh(self, guild_id)
+            except Exception:
+                log.exception("Initial raidlist refresh failed for guild %s", guild_id)
+
+        await asyncio.gather(*(_refresh_one(guild.id) for guild in self.guilds))
+
     async def on_ready(self):
         if not self._startup_guild_cleanup_done:
             await self._cleanup_removed_guild_data_on_startup()
@@ -602,9 +671,14 @@ class RaidBot(discord.Client):
                 self.log_forward_queue.put_nowait(self.pending_log_buffer.popleft())
             self.log_forward_queue.put_nowait("Discord live logging initialisiert.")
 
+        if not self._ready_sync_done:
+            await self._sync_commands_for_known_guilds()
+            self._ready_sync_done = True
+
         log.info("Logged in as %s", self.user)
-        if self.guilds:
-            await force_raidlist_refresh(self, self.guilds[0].id)
+        if not self._initial_raidlist_refresh_done:
+            await self._refresh_raidlists_for_all_guilds()
+            self._initial_raidlist_refresh_done = True
 
     async def close(self):
         log.removeHandler(self._discord_log_handler)
@@ -612,6 +686,8 @@ class RaidBot(discord.Client):
             self.stale_raid_task.cancel()
         if self.voice_xp_task and not self.voice_xp_task.done():
             self.voice_xp_task.cancel()
+        if self.self_test_task and not self.self_test_task.done():
+            self.self_test_task.cancel()
         if self.log_forwarder_task and not self.log_forwarder_task.done():
             self.log_forwarder_task.cancel()
         await super().close()
