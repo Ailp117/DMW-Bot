@@ -1,116 +1,159 @@
-# PLANS.md — Long Execution Plan for Discord Bot Rewrite
+# PLANS.md — ENTERPRISE PHASE EXECUTION BLUEPRINT
 
-######################################################################
-# PHASE 1 — INVENTORY
-######################################################################
+This file defines the irreversible execution order.
 
-- Enumerate all slash commands
-- Enumerate views, buttons, selects, modals
-- Enumerate DB tables and relationships
-- Analyze .github/workflows/bot.yml
-- Extract ENV variables
-- Build Feature Matrix:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 1 — INVENTORY + FEATURE MATRIX
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Feature → current files → DB tables → expected behavior → tests → edge cases
+Goal:
+Extract 100% behavior from legacy system.
 
-Append matrix to DELIVERY_REPORT.md.
+Actions:
+- Analyze entire repository.
+- Extract commands.
+- Extract tasks.
+- Extract views/modals.
+- Extract DB interactions.
+- Extract channel/role side effects.
+- Extract config/env usage.
+- Identify crash risks.
 
-Do not continue until Feature Matrix is complete.
+Generate FEATURE_MATRIX.md:
 
-######################################################################
-# PHASE 2 — REWRITE
-######################################################################
+Columns:
+Feature
+Legacy Files
+DB Tables / Columns
+Expected Behavior
+Acceptance Criteria
+Planned Test Coverage
 
-Rebuild modular architecture:
+Hard Stop:
+- Missing feature
+- Missing DB mapping
+- Missing acceptance criteria
 
-main.py
-config.py
-db/
-models/
-repositories/
-services/
-commands/
-views/
-utils/
-tests/
+NO FILE MOVEMENT ALLOWED IN PHASE 1.
 
-Rules:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 1B — LEGACY ARCHIVAL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-- Business logic separated from Discord API layer
-- No schema changes
-- No race conditions
-- Persistent views after restart
-- Rate-limit safe embed updates
-- Role creation + cleanup preserved
-- Raid cleanup only via creator button
-- Voting logic identical
+Goal:
+Prepare clean root for rebuild.
 
-######################################################################
-# PHASE 3 — TESTING
-######################################################################
+Actions:
+- Create legacy_archive/
+- Move all legacy implementation files
+- Preserve structure
+- Do NOT delete anything
 
-Implement:
+Keep only:
+- .gitignore
+- LICENSE
+- README.md
+- .github/workflows/
+- DB schema files
 
-UNIT TESTS (pytest)
-- Raid creation
-- Vote toggle
-- Minimum player trigger
-- Cleanup logic
-- Repository CRUD
+Hard Stop:
+- Files deleted
+- Files moved before Phase 1 completion
 
-ASYNC TESTS (pytest-asyncio)
-- Slash command handlers
-- View callbacks
-- Permission checks
-- Error paths
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 2 — COMPLETE MODULAR REBUILD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-DB TESTS
-- CRUD with test database
-- Schema compatibility
+Goal:
+Rebuild from scratch.
 
-STARTUP SMOKE TEST
-- DB connection
-- Tables exist
-- Persistent views restored
-- Boot log OK
+Requirements:
+- Required folder structure enforced
+- Full feature parity
+- Discord safety wrappers
+- Idempotent updates
+- Singleton loops
+- Async cancellation safety
+- No DB schema modification
 
-Run:
+Hard Stop:
+- Mixed layers
+- Schema change
+- Missing feature parity
 
-pip install -r requirements.txt
-pytest -q
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 3 — TEST ENFORCEMENT LOOP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-If tests fail:
-- Fix
-- Rerun
+Goal:
+Achieve fully green test suite.
+
+Actions:
+- Implement pytest + pytest-asyncio
+- Cover ALL features
+- Run pytest -q
+- Fix failures
 - Repeat until green
+- Print COMPLETE pytest output
 
-######################################################################
-# PHASE 4 — CI
-######################################################################
+Hard Stop:
+- Any failing test
+- Missing output
+- Untested feature
 
-Update .github/workflows/bot.yml:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PHASE 4 — CI ENFORCEMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+Goal:
+Automated enforcement.
+
+Actions:
+- Update workflow
 - Install dependencies
-- Run pytest
-- Fail on error
-- Use secrets correctly
-- Implement crash restart strategy
-- Optional scheduled restart
-- Document limitations in README
+- Install pytest
+- Run pytest -q
+- Enable pip cache
+- Add cron watchdog
+- Document health strategy
 
-######################################################################
-# HARD STOP CONDITION
-######################################################################
+Hard Stop:
+- CI does not execute pytest
+- CI passes with failing tests
 
-The task is NOT complete if:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FINAL VALIDATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-- Only documentation changed
-- Tests were not executed
-- pytest output is missing
-- Application source files were not modified
+Re-open FEATURE_MATRIX.md.
 
-Completion requires:
+For EACH feature:
+- Confirm implementation
+- Confirm DB usage
+- Confirm test coverage
 
-- Code modifications in core logic
-- Passing tests
-- CI workflow aligned
+Output verification checklist.
+
+If ANY feature not VERIFIED:
+Return to implementation.
+Repeat Phase 3.
+Re-run validation.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DEFINITION OF DONE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Rewrite is complete ONLY if:
+
+- All phases executed
+- Phase 1B executed after analysis
+- Legacy archived
+- Modular architecture enforced
+- No DB modifications
+- All tests written
+- pytest passed
+- Full output displayed
+- CI runs pytest
+- Feature matrix fully validated
+
+Anything less = NOT COMPLETE.
