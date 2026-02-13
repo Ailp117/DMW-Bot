@@ -13,6 +13,16 @@ async def _empty_fetch_members(*, limit=None):
         yield None
 
 
+async def _raising_fetch_members(*, limit=None):
+    raise AssertionError("fetch_members should not be called when members intent is disabled")
+    if False:
+        yield None
+
+
+async def _single_fetch_member(*, limit=None):
+    yield SimpleNamespace(id=3002, bot=False, display_name="Echo", global_name=None, name="echo")
+
+
 @pytest.mark.asyncio
 async def test_sync_guild_usernames_inserts_member_names(repo):
     bot = object.__new__(RewriteDiscordBot)
@@ -63,6 +73,40 @@ async def test_sync_guild_usernames_updates_changed_name(repo):
     assert scanned == 1
     assert changed == 1
     assert bot.repo.user_levels[(1, 1001)].username == "NewName"
+
+
+@pytest.mark.asyncio
+async def test_collect_guild_usernames_skips_fetch_without_members_intent():
+    bot = object.__new__(RewriteDiscordBot)
+    bot._connection = SimpleNamespace(intents=SimpleNamespace(members=False))
+
+    guild = SimpleNamespace(
+        id=9,
+        members=[SimpleNamespace(id=3001, bot=False, display_name="Delta", global_name=None, name="delta")],
+        member_count=2,
+        fetch_members=_raising_fetch_members,
+    )
+
+    usernames = await RewriteDiscordBot._collect_guild_member_usernames(bot, guild)
+
+    assert usernames == {3001: "Delta"}
+
+
+@pytest.mark.asyncio
+async def test_collect_guild_usernames_fetches_missing_members_when_intent_enabled():
+    bot = object.__new__(RewriteDiscordBot)
+    bot._connection = SimpleNamespace(intents=SimpleNamespace(members=True))
+
+    guild = SimpleNamespace(
+        id=9,
+        members=[SimpleNamespace(id=3001, bot=False, display_name="Delta", global_name=None, name="delta")],
+        member_count=2,
+        fetch_members=_single_fetch_member,
+    )
+
+    usernames = await RewriteDiscordBot._collect_guild_member_usernames(bot, guild)
+
+    assert usernames == {3001: "Delta", 3002: "Echo"}
 
 
 def test_plain_user_list_uses_db_username_fallback(repo):

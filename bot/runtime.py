@@ -799,6 +799,7 @@ class RaidVoteView(discord.ui.View):
 class RewriteDiscordBot(discord.Client):
     def __init__(self, repo: InMemoryRepository, config) -> None:
         intents = discord.Intents.default()
+        intents.members = True
         intents.message_content = config.enable_message_content_intent
         super().__init__(intents=intents)
 
@@ -1613,6 +1614,11 @@ class RewriteDiscordBot(discord.Client):
         if not callable(fetch_members):
             return users
 
+        intents = getattr(self, "intents", None)
+        members_intent_enabled = bool(getattr(intents, "members", False))
+        if not members_intent_enabled:
+            return users
+
         try:
             async for member in fetch_members(limit=None):
                 if getattr(member, "bot", False):
@@ -1622,6 +1628,14 @@ class RewriteDiscordBot(discord.Client):
                 if user_id <= 0 or not username:
                     continue
                 users[user_id] = username
+        except discord.ClientException as exc:
+            if "Intents.members must be enabled" in str(exc):
+                log.debug(
+                    "Skipping guild member fetch because members intent is disabled for guild_id=%s",
+                    getattr(guild, "id", None),
+                )
+            else:
+                log.debug("Guild member fetch failed for guild_id=%s", getattr(guild, "id", None), exc_info=True)
         except Exception:
             log.debug("Guild member fetch failed for guild_id=%s", getattr(guild, "id", None), exc_info=True)
 
