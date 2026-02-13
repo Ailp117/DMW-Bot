@@ -10,7 +10,7 @@ Ein Discord-Bot zur Planung, Verwaltung und Nachverfolgung von Raids inkl. persi
 - Attendance-Tracking per Commands.
 - Temporäre Rollen für Raid-Organisation.
 - Level-/XP-System inkl. Voice-XP-Intervallen.
-- Automatische Datenbank-Schema-Sicherung beim Start.
+- Automatische Datenbank-Schema-Anpassung beim Start (fehlende Tabellen/Spalten aller Bot-Modelle werden ergänzt).
 - Self-Tests, Logging und Health-Checks für den Betrieb.
 - Boot-Smoke-Checks beim Start (DB erreichbar, Pflichttabellen, offene Raids).
 - Automatische und manuelle SQL-Backups.
@@ -24,14 +24,20 @@ Ein Discord-Bot zur Planung, Verwaltung und Nachverfolgung von Raids inkl. persi
 ## Installation
 
 1. Repository klonen.
-2. Abhängigkeiten installieren:
+2. Gepinnte Abhängigkeiten installieren:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Umgebungsvariablen setzen (siehe unten).
-4. Bot starten:
+3. Optional: zweitneueste stabile Versionen neu auflösen (für lokale Updates):
+
+```bash
+python scripts/resolve_second_latest_requirements.py --input requirements.in --output requirements.txt
+```
+
+4. Umgebungsvariablen setzen (siehe unten).
+5. Bot starten:
 
 ```bash
 python main.py
@@ -86,14 +92,19 @@ Zusätzlich unterstützt der Bot (optional) diese Secrets/ENVs aus `config.py`:
 - `/raidplan` – neuen Raid planen
 - `/raidlist` – aktuelle Raidliste anzeigen
 - `/dungeonlist` – aktive Dungeons anzeigen
-- `/attendance_list` – Attendance-Liste anzeigen
-- `/attendance_mark` – Attendance markieren
 - `/settings` – Bot-Einstellungen verwalten
 - `/template_config` – Raid-Templates konfigurieren
 - `/cancel_all_raids` – alle offenen Raids abbrechen (Admin)
 - `/backup_db` – manuelles DB-Backup (privilegierter Nutzer)
 - `/status` – Bot-Status prüfen
 - `/help` / `/help2` – Hilfe anzeigen
+
+## Raid-Teilnahmezaehler (DB-only)
+
+- Bei `raid_finish` wird pro teilnehmendem User ein Eintrag in `raid_attendance` gespeichert.
+- Der Teilnahmezaehler startet bei `0` und steigt pro abgeschlossenen Raid mit Teilnahme um `+1`.
+- Der aktuelle Wert ergibt sich aus der Anzahl der `present`-Eintraege in `raid_attendance` pro `guild_id + user_id`.
+- Es gibt dafuer aktuell bewusst keinen Slash-Command; Speicherung erfolgt nur in der Datenbank.
 
 ## Backups
 
@@ -129,7 +140,9 @@ Die Tests decken u. a. Command-Registrierung, Berechtigungen, Konfigurationslogi
 
 ## CI / 24-7-Strategie
 
-- Der Workflow startet alle 5 Stunden neu (`schedule`) und zusätzlich manuell via `workflow_dispatch`.
-- Vor dem Start des Bots läuft immer `pytest -q`; bei Fehlern startet der Bot nicht (fail-fast).
-- Durch `concurrency.cancel-in-progress` wird nur eine Instanz des Workflows aktiv gehalten.
+- Der Runtime-Workflow startet alle 6 Stunden neu (`schedule`) und zusätzlich manuell via `workflow_dispatch`.
+- Ein Monatsend-Job aktualisiert `requirements.txt` automatisch auf zweitneueste stabile Releases.
+- Wenn ein Direkt-Push auf den Ziel-Branch blockiert ist (z. B. Branch-Protection), erstellt der Monatsend-Job automatisch ein Fallback-PR.
+- Auf jedem Push/PR läuft `pytest -q`; bei Fehlern schlägt CI fehl.
+- Durch `concurrency` wird nur eine Runtime-Instanz aktiv gehalten.
 - Ein harter 24/7-Betrieb ist auf GitHub-Hosted-Runnern nur "24/7-ish" möglich, daher der periodische Neustart als Stabilitätsstrategie.
