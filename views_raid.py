@@ -17,7 +17,7 @@ from raidlist import schedule_raidlist_refresh
 
 
 def planner_embed(raid: Raid, counts: dict[str, dict[str, int]]) -> discord.Embed:
-    e = discord.Embed(title=f"🗓️ Raid Planer: {raid.dungeon}", description=f"Raid ID: `{raid.id}`")
+    e = discord.Embed(title=f"🗓️ Raid Planer: {raid.dungeon}", description=f"Raid ID: `{raid.display_id}`")
     e.add_field(name="Min Spieler pro Slot", value=str(raid.min_players), inline=True)
 
     day_lines = [f"• **{k}** — `{v}`" for k, v in sorted(counts["day"].items(), key=lambda x: (-x[1], x[0]))]
@@ -33,7 +33,7 @@ def slot_text(raid: Raid, day_label: str, time_label: str, role: discord.Role | 
     mentions = [f"<@{u}>" for u in user_ids]
     return (
         f"✅ **Teilnehmerliste – {raid.dungeon}**\n"
-        f"🆔 Raid: `{raid.id}`\n"
+        f"🆔 Raid: `{raid.display_id}`\n"
         f"📅 Tag: **{day_label}**\n"
         f"🕒 Zeit: **{time_label}**\n"
         f"👥 Teilnehmer: **{len(user_ids)} / {raid.min_players}**\n"
@@ -98,7 +98,7 @@ async def _mirror_memberlist_debug(interaction: discord.Interaction, raid, slot_
 
     header = (
         f"🧪 Memberlist Debug | Guild `{interaction.guild.id}` ({interaction.guild.name})\n"
-        f"Raid `{raid.id}` | Dungeon **{raid.dungeon}**"
+        f"Raid `{raid.display_id}` (DB `{raid.id}`) | Dungeon **{raid.dungeon}**"
     )
     payload = f"{header}\n{content}"
     if len(payload) > 1900:
@@ -205,7 +205,7 @@ class RaidCreateModal(discord.ui.Modal, title="Raid erstellen"):
         await schedule_raidlist_refresh(interaction.client, interaction.guild.id)
 
         await interaction.followup.send(
-            f"✅ Raid erstellt: **{self.dungeon_name}** (ID `{raid.id}`)\n"
+            f"✅ Raid erstellt: **{self.dungeon_name}** (ID `{raid.display_id}`)\n"
             f"➡️ Im Planner Channel gepostet: {msg.jump_url}",
             ephemeral=True,
         )

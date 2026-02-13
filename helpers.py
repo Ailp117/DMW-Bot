@@ -29,7 +29,12 @@ async def get_active_dungeons(session: AsyncSession) -> list[Dungeon]:
     return rows
 
 async def create_raid(session: AsyncSession, guild_id: int, planner_channel_id: int, creator_id: int, dungeon: str, days: list[str], times: list[str], min_players: int) -> Raid:
+    next_display_id = (await session.execute(
+        select(func.coalesce(func.max(Raid.display_id), 0) + 1).where(Raid.guild_id == guild_id)
+    )).scalar_one()
+
     raid = Raid(
+        display_id=int(next_display_id),
         guild_id=guild_id,
         channel_id=planner_channel_id,
         creator_id=creator_id,
