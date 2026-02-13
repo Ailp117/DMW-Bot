@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 import discord
 from discord import app_commands
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 
 from config import (
     DISCORD_TOKEN,
@@ -64,6 +64,16 @@ STALE_RAID_HOURS = 7 * 24
 STALE_RAID_CHECK_SECONDS = 15 * 60
 VOICE_XP_CHECK_SECONDS = 60
 VOICE_XP_AWARD_INTERVAL = timedelta(hours=1)
+
+REQUIRED_BOOT_TABLES = (
+    "guild_settings",
+    "raids",
+    "raid_votes",
+    "raid_attendance",
+    "dungeons",
+    "user_levels",
+    "raid_templates",
+)
 
 EXPECTED_SLASH_COMMANDS = {
     "settings", "status", "help", "help2", "restart",
@@ -150,6 +160,7 @@ class RaidBot(discord.Client):
         self._initial_raidlist_refresh_done = False
         self._initial_memberlist_restore_done = False
         self._ready_announcement_sent = False
+        self.boot_smoke_stats: dict[str, int] | None = None
         self._discord_log_handler = self._build_discord_log_handler()
         log.addHandler(self._discord_log_handler)
 
@@ -218,6 +229,39 @@ class RaidBot(discord.Client):
             len(registered),
             ", ".join(registered),
         )
+
+
+    async def _run_boot_smoke_checks(self) -> dict[str, int]:
+        """Run startup DB smoke checks and log a compact boot status line."""
+        async with session_scope() as session:
+            await session.execute(text("SELECT 1"))
+            table_result = await session.execute(text(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
+            ))
+            existing_tables = set(table_result.scalars().all())
+            missing_tables = [table for table in REQUIRED_BOOT_TABLES if table not in existing_tables]
+            if missing_tables:
+                raise RuntimeError(f"Missing required DB tables: {', '.join(missing_tables)}")
+
+            open_raids = int((await session.execute(
+                select(func.count()).select_from(Raid).where(Raid.status == "open")
+            )).scalar_one())
+            guild_settings_rows = int((await session.execute(
+                select(func.count()).select_from(GuildSettings)
+            )).scalar_one())
+
+        stats = {
+            "required_tables": len(REQUIRED_BOOT_TABLES),
+            "open_raids": open_raids,
+            "guild_settings_rows": guild_settings_rows,
+        }
+        log.info(
+            "Boot OK | db=ok tables=%s open_raids=%s guild_settings=%s",
+            stats["required_tables"],
+            stats["open_raids"],
+            stats["guild_settings_rows"],
+        )
+        return stats
 
     async def _sync_commands_for_known_guilds(self) -> None:
         guild_ids = await self._get_configured_guild_ids()
@@ -365,6 +409,8 @@ class RaidBot(discord.Client):
         if not await try_acquire_singleton_lock():
             log.warning("Another instance is running (singleton lock busy). Exiting.")
             raise SystemExit(0)
+
+        self.boot_smoke_stats = await self._run_boot_smoke_checks()
 
         async def _update(gid: int):
             await refresh_raidlist_for_guild(self, gid)
