@@ -88,6 +88,21 @@ class CommandSyncResilienceTests(unittest.IsolatedAsyncioTestCase):
         sync_mock.assert_awaited_once()
         refresh_mock.assert_awaited_once_with(self.bot, guild.id)
 
+    async def test_sync_commands_for_known_guilds_runs_global_fallback_sync(self):
+        guilds = [SimpleNamespace(id=111), SimpleNamespace(id=222)]
+
+        with (
+            patch.object(self.bot, "_get_configured_guild_ids", AsyncMock(return_value=[])),
+            patch.object(type(self.bot), "guilds", new_callable=PropertyMock, return_value=guilds),
+            patch.object(self.bot.tree, "sync", AsyncMock()) as sync_mock,
+        ):
+            await self.bot._sync_commands_for_known_guilds()
+
+        self.assertEqual(sync_mock.await_count, 3)
+        sync_mock.assert_any_await(guild=main.discord.Object(id=111))
+        sync_mock.assert_any_await(guild=main.discord.Object(id=222))
+        sync_mock.assert_any_await()
+
     async def test_refresh_raidlists_for_all_guilds_attempts_every_guild(self):
         guilds = [SimpleNamespace(id=1), SimpleNamespace(id=2), SimpleNamespace(id=3)]
 
@@ -127,6 +142,19 @@ class CommandSyncResilienceTests(unittest.IsolatedAsyncioTestCase):
             await self.bot.setup_hook()
 
         self.assertIn("_self_test_worker", created)
+
+    def test_command_registry_health_detects_unexpected_commands(self):
+        fake_commands = [SimpleNamespace(name=n) for n in [
+            *sorted(main.EXPECTED_SLASH_COMMANDS),
+            "unexpected_demo",
+        ]]
+
+        with patch.object(self.bot.tree, "get_commands", return_value=fake_commands):
+            registered, missing, unexpected = self.bot._command_registry_health()
+
+        self.assertIn("unexpected_demo", registered)
+        self.assertEqual(missing, [])
+        self.assertEqual(unexpected, ["unexpected_demo"])
 
     async def test_run_self_tests_once_queries_same_database_session_scope(self):
         fake_commands = [SimpleNamespace(name=n) for n in [
