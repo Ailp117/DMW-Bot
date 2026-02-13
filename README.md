@@ -76,6 +76,7 @@ Für GitHub Actions (`.github/workflows/bot.yml`) werden mindestens diese Secret
 
 - `DISCORD_TOKEN`
 - `DATABASE_URL`
+- `ACTIONS_VARIABLES_TOKEN` (Fine-grained PAT mit Repository-Berechtigung `Variables: Read and write`, für `BOT_RUNTIME_WATCHDOG`)
 
 Zusätzlich unterstützt der Bot (optional) diese Secrets/ENVs aus `config.py`:
 
