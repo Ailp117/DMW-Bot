@@ -2,5 +2,5 @@ discord.py
 SQLAlchemy
 asyncpg
 python-dotenv
-pytest
+pytest<9
 pytest-asyncio
