@@ -1,22 +1,116 @@
-# PLANS.md — Long-running execution plan
+# PLANS.md — Long Execution Plan for Discord Bot Rewrite
 
-## Phase 1 — Inventory
-- Enumerate existing commands, views, DB tables, workflow steps
-- Produce Feature Matrix: Feature → files → DB tables → expected behavior → tests
+######################################################################
+# PHASE 1 — INVENTORY
+######################################################################
 
-## Phase 2 — Implementation
-- Rebuild modular structure (services/repositories/views/commands)
-- Keep behavior 1:1
-- Keep DB schema unchanged
+- Enumerate all slash commands
+- Enumerate views, buttons, selects, modals
+- Enumerate DB tables and relationships
+- Analyze .github/workflows/bot.yml
+- Extract ENV variables
+- Build Feature Matrix:
 
-## Phase 3 — Tests
-- Unit tests for business logic
-- Async tests with mocks
-- DB repository tests
+Feature → current files → DB tables → expected behavior → tests → edge cases
 
-## Phase 4 — CI
-- Update `.github/workflows/bot.yml` to run tests and use restart strategy for near-24/7
-- Ensure workflow fails on failing tests
+Append matrix to DELIVERY_REPORT.md.
 
-## Stop condition
-Not done until pytest is green and CI workflow is consistent with repo structure.
+Do not continue until Feature Matrix is complete.
+
+######################################################################
+# PHASE 2 — REWRITE
+######################################################################
+
+Rebuild modular architecture:
+
+main.py
+config.py
+db/
+models/
+repositories/
+services/
+commands/
+views/
+utils/
+tests/
+
+Rules:
+
+- Business logic separated from Discord API layer
+- No schema changes
+- No race conditions
+- Persistent views after restart
+- Rate-limit safe embed updates
+- Role creation + cleanup preserved
+- Raid cleanup only via creator button
+- Voting logic identical
+
+######################################################################
+# PHASE 3 — TESTING
+######################################################################
+
+Implement:
+
+UNIT TESTS (pytest)
+- Raid creation
+- Vote toggle
+- Minimum player trigger
+- Cleanup logic
+- Repository CRUD
+
+ASYNC TESTS (pytest-asyncio)
+- Slash command handlers
+- View callbacks
+- Permission checks
+- Error paths
+
+DB TESTS
+- CRUD with test database
+- Schema compatibility
+
+STARTUP SMOKE TEST
+- DB connection
+- Tables exist
+- Persistent views restored
+- Boot log OK
+
+Run:
+
+pip install -r requirements.txt
+pytest -q
+
+If tests fail:
+- Fix
+- Rerun
+- Repeat until green
+
+######################################################################
+# PHASE 4 — CI
+######################################################################
+
+Update .github/workflows/bot.yml:
+
+- Install dependencies
+- Run pytest
+- Fail on error
+- Use secrets correctly
+- Implement crash restart strategy
+- Optional scheduled restart
+- Document limitations in README
+
+######################################################################
+# HARD STOP CONDITION
+######################################################################
+
+The task is NOT complete if:
+
+- Only documentation changed
+- Tests were not executed
+- pytest output is missing
+- Application source files were not modified
+
+Completion requires:
+
+- Code modifications in core logic
+- Passing tests
+- CI workflow aligned
