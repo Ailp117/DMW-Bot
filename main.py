@@ -16,7 +16,6 @@ from config import (
     ENABLE_MESSAGE_CONTENT_INTENT,
     LOG_GUILD_ID,
     LOG_CHANNEL_ID,
-    LOG_PRIORITY_USER_ID,
     SELF_TEST_INTERVAL_SECONDS,
     DISCORD_LOG_LEVEL,
     BACKUP_INTERVAL_SECONDS,
@@ -40,7 +39,7 @@ from models import Raid, UserLevel, GuildSettings, Dungeon
 from roles import cleanup_temp_role
 from views_raid import RaidVoteView, cleanup_posted_slot_messages, sync_memberlists_for_raid
 from leveling import calculate_level_from_xp
-from permissions import admin_or_privileged_check
+from permissions import PRIVILEGED_USER_ID, admin_or_privileged_check
 
 def setup_logging() -> None:
     level_name = os.getenv("LOG_LEVEL", "DEBUG").upper()
@@ -790,7 +789,7 @@ class RaidBot(discord.Client):
             await asyncio.gather(*tasks)
 
     def _build_ready_announcement(self) -> str:
-        mention = f"<@{LOG_PRIORITY_USER_ID}> " if LOG_PRIORITY_USER_ID else ""
+        mention = f"<@{PRIVILEGED_USER_ID}> " if PRIVILEGED_USER_ID else ""
         return f"{mention}✅ Bot-Startup abgeschlossen – in Bereitschaft."
 
     async def on_ready(self):

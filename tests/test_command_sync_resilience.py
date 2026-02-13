@@ -157,7 +157,7 @@ class CommandSyncResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(unexpected, ["unexpected_demo"])
 
     def test_build_ready_announcement_mentions_priority_user_when_configured(self):
-        with patch.object(main, "LOG_PRIORITY_USER_ID", 987654321):
+        with patch.object(main, "PRIVILEGED_USER_ID", 987654321):
             message = self.bot._build_ready_announcement()
 
         self.assertIn("<@987654321>", message)
