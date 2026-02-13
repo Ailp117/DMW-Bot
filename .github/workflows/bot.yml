@@ -1,4 +1,4 @@
-name: DMW Bot (private 24/7-ish)
+name: DMW Bot CI + 24/7-ish Runner
 
 on:
   workflow_dispatch:
@@ -10,7 +10,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: |
+          pytest -q
+
   run:
+    needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 330
 
@@ -26,12 +50,21 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
-          
-      - name: Run bot
+
+      - name: Start bot
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          GUILD_ID: ${{ secrets.GUILD_ID }}
+          LOG_GUILD_ID: ${{ secrets.LOG_GUILD_ID }}
+          LOG_CHANNEL_ID: ${{ secrets.LOG_CHANNEL_ID }}
+          RAIDLIST_DEBUG_CHANNEL_ID: ${{ secrets.RAIDLIST_DEBUG_CHANNEL_ID }}
+          MEMBERLIST_DEBUG_CHANNEL_ID: ${{ secrets.MEMBERLIST_DEBUG_CHANNEL_ID }}
+          DISCORD_LOG_LEVEL: ${{ secrets.DISCORD_LOG_LEVEL }}
+          DB_ECHO: ${{ secrets.DB_ECHO }}
+          ENABLE_MESSAGE_CONTENT_INTENT: ${{ secrets.ENABLE_MESSAGE_CONTENT_INTENT }}
+          SELF_TEST_INTERVAL_SECONDS: ${{ secrets.SELF_TEST_INTERVAL_SECONDS }}
+          BACKUP_INTERVAL_SECONDS: ${{ secrets.BACKUP_INTERVAL_SECONDS }}
         run: |
           python main.py
