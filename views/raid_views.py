@@ -352,7 +352,7 @@ class SettingsIntervalsModal(discord.ui.Modal):
 
 class SettingsCalendarChannelModal(discord.ui.Modal):
     calendar_channel = discord.ui.TextInput(
-        label="Raid Kalender Channel (ID oder #mention, leer=aus)",
+        label="Raid Kalender Channel (ID/#, leer=aus)",
         required=False,
         max_length=64,
     )

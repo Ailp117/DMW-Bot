@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -17,6 +18,7 @@ from services.admin_service import list_active_dungeons
 from services.backup_service import export_rows_to_sql
 from services.raid_service import build_raid_plan_defaults
 from services.settings_service import set_templates_enabled
+from services.update_service import pull_repo_update
 from views.raid_views import RaidDateSelectionView, SettingsView
 
 if TYPE_CHECKING:
@@ -161,6 +163,36 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
         if not await _require_privileged(interaction):
             return
         await bot._reply(interaction, "Neustart wird eingeleitet.", ephemeral=True)
+        await bot.close()
+
+    @bot.tree.command(
+        name="restart_update",
+        description="Fuehrt `git pull --ff-only` aus und startet den Bot neu (privileged).",
+    )
+    async def restart_update_cmd(interaction):
+        if not await _require_privileged(interaction):
+            return
+
+        await bot._defer(interaction, ephemeral=True)
+        result = await asyncio.to_thread(
+            pull_repo_update,
+            repo_dir=Path.cwd(),
+            timeout_seconds=60,
+        )
+        if not result.ok:
+            await _safe_followup(
+                interaction,
+                f"Update fehlgeschlagen. Kein Neustart.\n{result.detail}",
+                ephemeral=True,
+            )
+            return
+
+        state = "Neue Commits eingespielt." if result.changed else "Kein neuer Commit gefunden."
+        await _safe_followup(
+            interaction,
+            f"{state}\n{result.detail}\nNeustart wird eingeleitet.",
+            ephemeral=True,
+        )
         await bot.close()
 
     @bot.tree.command(name="dungeonlist", description="Aktive Dungeons")
