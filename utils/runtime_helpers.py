@@ -59,6 +59,7 @@ PERSIST_FLUSH_RETRY_BASE_SECONDS = 0.1
 PRIVILEGED_ONLY_HELP_COMMANDS = frozenset(
     {
         "restart",
+        "restart_update",
         "remote_guilds",
         "remote_cancel_all_raids",
         "remote_raidlist",
