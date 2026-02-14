@@ -350,6 +350,59 @@ class SettingsIntervalsModal(discord.ui.Modal):
         await self.bot._reply(interaction, "Intervall-Einstellungen vorgemerkt.", ephemeral=True)
 
 
+class SettingsCalendarChannelModal(discord.ui.Modal):
+    calendar_channel = discord.ui.TextInput(
+        label="Raid Kalender Channel (ID oder #mention, leer=aus)",
+        required=False,
+        max_length=64,
+    )
+
+    def __init__(self, bot: "RewriteDiscordBot", view: "SettingsView"):
+        super().__init__(title="Raid Kalender Channel")
+        self.bot = bot
+        self._view_ref = view
+        if view.raid_calendar_channel_id:
+            self.calendar_channel.default = str(int(view.raid_calendar_channel_id))
+
+    async def on_submit(self, interaction):
+        view = self._view_ref
+        if not isinstance(view, SettingsView):
+            await self.bot._reply(interaction, "Settings View nicht verfuegbar.", ephemeral=True)
+            return
+        if not interaction.guild or interaction.guild.id != view.guild_id:
+            await self.bot._reply(interaction, "Ungueltiger Guild-Kontext.", ephemeral=True)
+            return
+
+        raw = str(self.calendar_channel.value or "").strip()
+        if not raw:
+            view.raid_calendar_channel_id = None
+            await self.bot._reply(interaction, "Raid Kalender Channel deaktiviert.", ephemeral=True)
+            return
+
+        if raw.startswith("<#") and raw.endswith(">"):
+            raw = raw[2:-1].strip()
+        if raw.startswith("#"):
+            raw = raw[1:].strip()
+
+        try:
+            channel_id = int(raw)
+        except ValueError:
+            await self.bot._reply(interaction, "Bitte gueltige Channel-ID oder #mention angeben.", ephemeral=True)
+            return
+
+        channel = interaction.guild.get_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            await self.bot._reply(
+                interaction,
+                "Channel nicht gefunden oder kein Text/News-Channel.",
+                ephemeral=True,
+            )
+            return
+
+        view.raid_calendar_channel_id = channel_id
+        await self.bot._reply(interaction, f"Raid Kalender Channel vorgemerkt: `{channel_id}`", ephemeral=True)
+
+
 class SettingsToggleButton(discord.ui.Button):
     def __init__(
         self,
@@ -416,6 +469,31 @@ class SettingsIntervalsButton(discord.ui.Button):
             await self.bot._reply(interaction, "Modal konnte nicht geoeffnet werden.", ephemeral=True)
 
 
+class SettingsCalendarChannelButton(discord.ui.Button):
+    def __init__(self, bot: "RewriteDiscordBot", *, guild_id: int):
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            label="Kalender Channel",
+            custom_id=f"settings:{guild_id}:calendar_modal",
+            row=4,
+        )
+        self.bot = bot
+        self.guild_id = guild_id
+
+    async def callback(self, interaction):
+        if not interaction.guild or interaction.guild.id != self.guild_id:
+            await self.bot._reply(interaction, "Ungueltiger Guild-Kontext.", ephemeral=True)
+            return
+        view = self.view
+        if not isinstance(view, SettingsView):
+            await self.bot._reply(interaction, "Settings View nicht verfuegbar.", ephemeral=True)
+            return
+        try:
+            await interaction.response.send_modal(SettingsCalendarChannelModal(self.bot, view))
+        except Exception:
+            await self.bot._reply(interaction, "Modal konnte nicht geoeffnet werden.", ephemeral=True)
+
+
 class SettingsView(discord.ui.View):
     def __init__(self, bot: "RewriteDiscordBot", *, guild_id: int):
         super().__init__(timeout=300)
@@ -459,24 +537,14 @@ class SettingsView(discord.ui.View):
             custom_id=f"settings:{guild_id}:raidlist",
             row=2,
         )
-        calendar_select = discord.ui.ChannelSelect(
-            placeholder="Raid Kalender Channel waehlen",
-            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
-            min_values=0,
-            max_values=1,
-            custom_id=f"settings:{guild_id}:calendar",
-            row=2,
-        )
 
         planner_select.callback = self._on_planner_select
         participants_select.callback = self._on_participants_select
         raidlist_select.callback = self._on_raidlist_select
-        calendar_select.callback = self._on_calendar_select
 
         self.add_item(planner_select)
         self.add_item(participants_select)
         self.add_item(raidlist_select)
-        self.add_item(calendar_select)
 
         toggle_items = [
             SettingsToggleButton(
@@ -514,6 +582,7 @@ class SettingsView(discord.ui.View):
             item._refresh_appearance(self)
             self.add_item(item)
 
+        self.add_item(SettingsCalendarChannelButton(bot, guild_id=guild_id))
         self.add_item(SettingsIntervalsButton(bot, guild_id=guild_id))
         self.add_item(SettingsSaveButton(bot, guild_id))
 
@@ -534,13 +603,6 @@ class SettingsView(discord.ui.View):
         self.raidlist_channel_id = int(selected[0]) if selected else None
         await self.bot._defer(interaction, ephemeral=True)
         await _safe_followup(interaction, "Raidlist Channel vorgemerkt.", ephemeral=True)
-
-    async def _on_calendar_select(self, interaction):
-        selected = ((interaction.data or {}).get("values") or [])
-        self.raid_calendar_channel_id = int(selected[0]) if selected else None
-        await self.bot._defer(interaction, ephemeral=True)
-        await _safe_followup(interaction, "Raid Kalender Channel vorgemerkt.", ephemeral=True)
-
 
 class SettingsSaveButton(discord.ui.Button):
     def __init__(self, bot: "RewriteDiscordBot", guild_id: int):
@@ -814,4 +876,3 @@ class RaidVoteView(discord.ui.View):
 
     async def on_time_select(self, interaction):
         await self._vote(interaction, kind="time")
-
