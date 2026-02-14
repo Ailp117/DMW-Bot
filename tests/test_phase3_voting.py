@@ -17,7 +17,7 @@ def _raid(repo):
         planner_channel_id=11,
         creator_id=100,
         dungeon_name="Nanos",
-        days_input="Mon",
+        days_input="14.02.2026",
         times_input="20:00",
         min_players_input="1",
         message_id=5100,
@@ -39,7 +39,7 @@ def _raid_multi(repo):
         planner_channel_id=11,
         creator_id=100,
         dungeon_name="Nanos",
-        days_input="Mon, Tue",
+        days_input="14.02.2026, 15.02.2026",
         times_input="20:00, 21:00",
         min_players_input="1",
         message_id=5101,
@@ -50,35 +50,35 @@ def _raid_multi(repo):
 def test_toggle_vote_insert_then_remove(repo):
     raid_id = _raid(repo)
 
-    toggle_vote(repo, raid_id=raid_id, kind="day", option_label="Mon", user_id=200)
+    toggle_vote(repo, raid_id=raid_id, kind="day", option_label="14.02.2026", user_id=200)
     assert len(repo.raid_votes) == 1
 
-    toggle_vote(repo, raid_id=raid_id, kind="day", option_label="Mon", user_id=200)
+    toggle_vote(repo, raid_id=raid_id, kind="day", option_label="14.02.2026", user_id=200)
     assert len(repo.raid_votes) == 0
 
 
 def test_vote_counts_reflect_rows(repo):
     raid_id = _raid(repo)
 
-    toggle_vote(repo, raid_id=raid_id, kind="day", option_label="Mon", user_id=200)
+    toggle_vote(repo, raid_id=raid_id, kind="day", option_label="14.02.2026", user_id=200)
     toggle_vote(repo, raid_id=raid_id, kind="time", option_label="20:00", user_id=200)
     toggle_vote(repo, raid_id=raid_id, kind="time", option_label="20:00", user_id=201)
 
     counts = planner_counts(repo, raid_id)
-    assert counts["day"]["Mon"] == 1
+    assert counts["day"]["14.02.2026"] == 1
     assert counts["time"]["20:00"] == 2
 
 
 def test_toggle_vote_allows_multiple_days_and_times_for_same_user(repo):
     raid_id = _raid_multi(repo)
 
-    toggle_vote(repo, raid_id=raid_id, kind="day", option_label="Mon", user_id=200)
-    toggle_vote(repo, raid_id=raid_id, kind="day", option_label="Tue", user_id=200)
+    toggle_vote(repo, raid_id=raid_id, kind="day", option_label="14.02.2026", user_id=200)
+    toggle_vote(repo, raid_id=raid_id, kind="day", option_label="15.02.2026", user_id=200)
     toggle_vote(repo, raid_id=raid_id, kind="time", option_label="20:00", user_id=200)
     toggle_vote(repo, raid_id=raid_id, kind="time", option_label="21:00", user_id=200)
 
     counts = planner_counts(repo, raid_id)
-    assert counts["day"]["Mon"] == 1
-    assert counts["day"]["Tue"] == 1
+    assert counts["day"]["14.02.2026"] == 1
+    assert counts["day"]["15.02.2026"] == 1
     assert counts["time"]["20:00"] == 1
     assert counts["time"]["21:00"] == 1

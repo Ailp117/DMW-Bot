@@ -60,12 +60,12 @@ async def test_rebuild_memberlists_clears_slots_then_recreates(repo):
         planner_channel_id=11,
         creator_id=100,
         dungeon_name="Nanos",
-        days_input="Mon",
+        days_input="14.02.2026",
         times_input="20:00",
         min_players_input="1",
         message_id=9900,
     ).raid
-    repo.upsert_posted_slot(raid_id=created.id, day_label="Mon", time_label="20:00", channel_id=22, message_id=501)
+    repo.upsert_posted_slot(raid_id=created.id, day_label="14.02.2026", time_label="20:00", channel_id=22, message_id=501)
 
     bot = object.__new__(RewriteDiscordBot)
     bot.repo = repo
@@ -80,7 +80,7 @@ async def test_rebuild_memberlists_clears_slots_then_recreates(repo):
 
     async def _fake_sync_memberlists(raid_id: int):
         assert repo.list_posted_slots(raid_id) == {}
-        repo.upsert_posted_slot(raid_id=raid_id, day_label="Mon", time_label="20:00", channel_id=22, message_id=777)
+        repo.upsert_posted_slot(raid_id=raid_id, day_label="14.02.2026", time_label="20:00", channel_id=22, message_id=777)
         return (1, 0, 0)
 
     bot._delete_slot_message = _fake_delete_slot_message

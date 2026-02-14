@@ -472,6 +472,14 @@ class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
             self.repo.delete_debug_cache(row.cache_key)
             removed_rows += 1
 
+        for row in list(self.repo.list_debug_cache(kind=PLANNER_MESSAGE_KIND)):
+            raid_id = int(row.raid_id or 0)
+            raid = open_raids_by_id.get(raid_id)
+            if raid is not None and int(raid.guild_id) == int(row.guild_id):
+                continue
+            self.repo.delete_debug_cache(row.cache_key)
+            removed_rows += 1
+
         for row in list(self.repo.list_debug_cache(kind=SLOT_TEMP_ROLE_KIND)):
             raid_id = int(row.raid_id or 0)
             raid = open_raids_by_id.get(raid_id)
@@ -610,6 +618,7 @@ class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
                 reason="stale-cleanup",
             )
             await self._cleanup_temp_role(raid)
+            self._clear_planner_message_cache_for_raid(raid)
             for row in slot_rows:
                 await self._delete_slot_message(row)
             self.repo.delete_raid_cascade(raid.id)

@@ -17,7 +17,7 @@ def _raid(repo):
         planner_channel_id=11,
         creator_id=100,
         dungeon_name="Nanos",
-        days_input="Mon",
+        days_input="14.02.2026",
         times_input="20:00",
         min_players_input="1",
         message_id=5300,
@@ -37,7 +37,7 @@ def test_finish_deletes_raid_and_keeps_attendance_snapshot(repo):
     raid_id = _raid(repo)
     raid = repo.get_raid(raid_id)
 
-    toggle_vote(repo, raid_id=raid_id, kind="day", option_label="Mon", user_id=200)
+    toggle_vote(repo, raid_id=raid_id, kind="day", option_label="14.02.2026", user_id=200)
     toggle_vote(repo, raid_id=raid_id, kind="time", option_label="20:00", user_id=200)
 
     result = finish_raid(repo, raid_id=raid_id, actor_user_id=100)

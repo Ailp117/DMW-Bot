@@ -22,13 +22,13 @@ def _enabled_feature_settings() -> GuildFeatureSettings:
 
 
 def test_parse_slot_start_at_utc_parses_iso_date_and_time():
-    parsed = RewriteDiscordBot._parse_slot_start_at_utc("2026-02-13 (Fr)", "20:15")
+    parsed = RewriteDiscordBot._parse_slot_start_at_utc("13.02.2026", "20:15")
     assert parsed == datetime(2026, 2, 13, 19, 15, tzinfo=UTC)
 
 
 def test_parse_slot_start_at_utc_respects_timezone():
     parsed = RewriteDiscordBot._parse_slot_start_at_utc(
-        "2026-02-13 (Fr)",
+        "13.02.2026",
         "20:15",
         timezone_name="Europe/Berlin",
     )
@@ -44,7 +44,7 @@ async def test_run_raid_reminders_once_sends_only_once_per_slot(repo):
         raidlist_channel_id=33,
     )
     now = datetime(2026, 2, 13, 18, 50, tzinfo=UTC)
-    day_label = "2026-02-13 (Fr)"
+    day_label = "13.02.2026"
     time_label = "20:00"
 
     raid = create_raid_from_modal(
@@ -93,7 +93,7 @@ async def test_run_raid_reminders_once_sends_only_once_per_slot(repo):
     assert first == 1
     assert second == 0
     assert len(sent_messages) == 1
-    assert "<@&2026-02-13 (Fr):20:00>" in sent_messages[0]
+    assert "<@&13.02.2026:20:00>" in sent_messages[0]
     cache_key = RewriteDiscordBot._raid_reminder_cache_key(raid.id, day_label, time_label)
     cache_row = repo.get_debug_cache(cache_key)
     assert cache_row is not None
@@ -108,7 +108,7 @@ async def test_run_raid_reminders_once_uses_default_timezone(repo):
         raidlist_channel_id=33,
     )
     now_utc = datetime(2026, 2, 13, 18, 50, tzinfo=UTC)
-    day_label = "2026-02-13 (Fr)"
+    day_label = "13.02.2026"
     time_label = "20:00"
 
     raid = create_raid_from_modal(
@@ -166,8 +166,8 @@ async def test_sync_memberlists_uses_unique_slot_roles_per_slot(repo):
         participants_channel_id=22,
         raidlist_channel_id=33,
     )
-    day_one = "2026-02-13 (Fr)"
-    day_two = "2026-02-14 (Sa)"
+    day_one = "13.02.2026"
+    day_two = "14.02.2026"
     time_label = "20:00"
 
     raid = create_raid_from_modal(

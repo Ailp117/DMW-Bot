@@ -18,7 +18,7 @@ def _create(repo, min_players: str):
         planner_channel_id=11,
         creator_id=100,
         dungeon_name="Nanos",
-        days_input="Mon",
+        days_input="14.02.2026",
         times_input="20:00",
         min_players_input=min_players,
         message_id=5200,
@@ -33,7 +33,7 @@ def test_min_zero_maps_to_threshold_one():
 def test_sync_creates_updates_and_deletes_slot_rows(repo):
     raid_id = _create(repo, "0")
 
-    toggle_vote(repo, raid_id=raid_id, kind="day", option_label="Mon", user_id=200)
+    toggle_vote(repo, raid_id=raid_id, kind="day", option_label="14.02.2026", user_id=200)
     toggle_vote(repo, raid_id=raid_id, kind="time", option_label="20:00", user_id=200)
 
     first = sync_memberlist_slots(repo, raid_id=raid_id, participants_channel_id=22)

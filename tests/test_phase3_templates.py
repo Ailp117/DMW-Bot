@@ -22,7 +22,7 @@ def test_template_toggle_and_auto_template_upsert(repo):
         planner_channel_id=11,
         creator_id=100,
         dungeon_name="Nanos",
-        days_input="Mon, Tue",
+        days_input="14.02.2026, 15.02.2026",
         times_input="20:00",
         min_players_input="3",
         message_id=5700,
@@ -35,6 +35,6 @@ def test_template_toggle_and_auto_template_upsert(repo):
         dungeon_name="Nanos",
     )
 
-    assert defaults.days == ["Mon", "Tue"]
+    assert defaults.days == ["14.02.2026", "15.02.2026"]
     assert defaults.times == ["20:00"]
     assert defaults.min_players == 3
