@@ -1,0 +1,6 @@
+discord.py
+SQLAlchemy
+asyncpg
+python-dotenv
+pytest<9
+pytest-asyncio

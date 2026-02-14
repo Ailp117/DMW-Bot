@@ -1,0 +1,256 @@
+name: DMW Bot CI + Runtime
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+    - cron: "17 3 28-31 * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  test:
+    name: Pytest Enforcement
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: ${{ github.event_name != 'schedule' }}
+    concurrency:
+      group: dmw-bot-test-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run test suite
+        run: |
+          pytest -q
+
+      - name: Restart and health strategy
+        run: |
+          echo "Health strategy:" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Every push and pull request must pass pytest -q." >> "$GITHUB_STEP_SUMMARY"
+          echo "- Scheduled watchdog starts the runtime job every 6 hours." >> "$GITHUB_STEP_SUMMARY"
+          echo "- Dedicated runner restarts crashed bot processes automatically." >> "$GITHUB_STEP_SUMMARY"
+          echo "- Runtime job is best-effort 24/7 within GitHub-Hosted runner limits." >> "$GITHUB_STEP_SUMMARY"
+
+  update-requirements:
+    name: Monthly Stable Requirements Refresh
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'schedule' && github.event.schedule == '17 3 28-31 * *' }}
+    concurrency:
+      group: dmw-bot-requirements-refresh
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref_name }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check if month end
+        id: month_end
+        run: |
+          set -euo pipefail
+          today_month="$(date -u +%m)"
+          tomorrow_month="$(date -u -d 'tomorrow' +%m)"
+          if [[ "$today_month" != "$tomorrow_month" ]]; then
+            echo "is_last_day=true" >> "$GITHUB_OUTPUT"
+            echo "Last day of month detected." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "is_last_day=false" >> "$GITHUB_OUTPUT"
+            echo "Not the last day of month; skipping refresh." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Refresh pinned requirements
+        if: ${{ steps.month_end.outputs.is_last_day == 'true' }}
+        run: |
+          set -euo pipefail
+          python scripts/resolve_second_latest_requirements.py --input requirements.in --output requirements.txt
+
+      - name: Detect changes
+        if: ${{ steps.month_end.outputs.is_last_day == 'true' }}
+        id: req_changes
+        run: |
+          if git diff --quiet -- requirements.txt; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve branch targets
+        if: ${{ steps.month_end.outputs.is_last_day == 'true' && steps.req_changes.outputs.changed == 'true' }}
+        id: branch_meta
+        run: |
+          set -euo pipefail
+          TARGET_BRANCH="${GITHUB_REF_NAME:-main}"
+          FALLBACK_BRANCH="chore/monthly-requirements-${GITHUB_RUN_ID}"
+          echo "target_branch=${TARGET_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "fallback_branch=${FALLBACK_BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Commit requirement updates
+        if: ${{ steps.month_end.outputs.is_last_day == 'true' && steps.req_changes.outputs.changed == 'true' }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add requirements.txt
+          git commit -m "chore(deps): monthly stable dependency refresh"
+
+      - name: Push requirement update directly
+        if: ${{ steps.month_end.outputs.is_last_day == 'true' && steps.req_changes.outputs.changed == 'true' }}
+        id: direct_push
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          git push origin "HEAD:${{ steps.branch_meta.outputs.target_branch }}"
+
+      - name: Push fallback branch
+        if: ${{ steps.month_end.outputs.is_last_day == 'true' && steps.req_changes.outputs.changed == 'true' && steps.direct_push.outcome == 'failure' }}
+        run: |
+          set -euo pipefail
+          git push origin "HEAD:${{ steps.branch_meta.outputs.fallback_branch }}"
+
+      - name: Open fallback pull request
+        if: ${{ steps.month_end.outputs.is_last_day == 'true' && steps.req_changes.outputs.changed == 'true' && steps.direct_push.outcome == 'failure' }}
+        id: open_pr
+        uses: actions/github-script@v7
+        env:
+          TARGET_BRANCH: ${{ steps.branch_meta.outputs.target_branch }}
+          FALLBACK_BRANCH: ${{ steps.branch_meta.outputs.fallback_branch }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const base = process.env.TARGET_BRANCH;
+            const branch = process.env.FALLBACK_BRANCH;
+            const head = `${owner}:${branch}`;
+            const title = "chore(deps): monthly stable dependency refresh";
+            const body = [
+              "Automatisch erzeugtes Fallback-PR.",
+              "",
+              "- Direkter Push auf den Ziel-Branch war nicht erlaubt (z. B. Branch-Protection).",
+              "- `requirements.txt` wurde auf zweitneueste stabile Releases aktualisiert.",
+            ].join("\n");
+
+            const existing = await github.rest.pulls.list({
+              owner,
+              repo,
+              state: "open",
+              head,
+              base,
+            });
+
+            if (existing.data.length > 0) {
+              core.setOutput("pr_url", existing.data[0].html_url);
+              return;
+            }
+
+            const pr = await github.rest.pulls.create({
+              owner,
+              repo,
+              title,
+              head: branch,
+              base,
+              body,
+            });
+            core.setOutput("pr_url", pr.data.html_url);
+
+      - name: Requirements refresh summary
+        if: ${{ steps.month_end.outputs.is_last_day == 'true' }}
+        run: |
+          if [[ "${{ steps.req_changes.outputs.changed }}" != "true" ]]; then
+            echo "requirements.txt already up to date." >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "${{ steps.direct_push.outcome }}" == "success" ]]; then
+            echo "requirements.txt updated and pushed directly to ${{ steps.branch_meta.outputs.target_branch }}." >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "${{ steps.direct_push.outcome }}" == "failure" ]]; then
+            echo "Direct push blocked. Fallback PR created: ${{ steps.open_pr.outputs.pr_url }}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "requirements.txt update path skipped." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  bot-runtime:
+    name: Bot Runtime (Best-Effort 24/7)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && github.event.schedule == '0 */6 * * *') }}
+    concurrency:
+      group: dmw-bot-runtime
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Start dedicated bot runner
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PRIVILEGED_USER_ID: "403988960638009347"
+          LOG_GUILD_ID: "1471638702316060836"
+          LOG_CHANNEL_ID: "1471639446641315931"
+          RAIDLIST_DEBUG_CHANNEL_ID: "1471683354410750066"
+          MEMBERLIST_DEBUG_CHANNEL_ID: "1471683419552354334"
+          DISCORD_LOG_LEVEL: "DEBUG"
+          DB_ECHO: "0"
+          ENABLE_MESSAGE_CONTENT_INTENT: "true"
+          LEVEL_PERSIST_INTERVAL_SECONDS: "120"
+          MESSAGE_XP_INTERVAL_SECONDS: "15"
+          LEVELUP_MESSAGE_COOLDOWN_SECONDS: "20"
+          SELF_TEST_INTERVAL_SECONDS: "900"
+          BACKUP_INTERVAL_SECONDS: "21600"
+          BOT_RUNNER_MAX_RUNTIME_SECONDS: "21420"
+          BOT_RUNNER_RESTART_DELAY_SECONDS: "5"
+          BOT_RUNNER_MAX_BACKOFF_SECONDS: "120"
+          BOT_RUNNER_MIN_UPTIME_SECONDS: "20"
+          BOT_RUNNER_MAX_QUICK_FAILURES: "6"
+        run: |
+          set -euo pipefail
+          if [[ -z "${DISCORD_TOKEN:-}" || -z "${DATABASE_URL:-}" ]]; then
+            echo "DISCORD_TOKEN or DATABASE_URL missing, skipping bot runtime."
+            exit 0
+          fi
+          python -m bot.runner --target-script module:bot.runtime 2>&1 | tee bot_runtime.log
+
+      - name: Upload runtime log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-runtime-log
+          path: bot_runtime.log
