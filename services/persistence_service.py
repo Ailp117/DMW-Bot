@@ -270,7 +270,7 @@ class RepositoryPersistence:
             payload_rows = updates_by_columns[change_group]
             statement = update(spec.model).where(self._pk_bind_clause(spec)).values(
                 **{column: bindparam(column) for column in change_group}
-            )
+            ).execution_options(synchronize_session=False)
             for payload_chunk in self._iter_chunks(payload_rows, self._UPDATE_CHUNK_SIZE):
                 await session.execute(statement, payload_chunk)
 
