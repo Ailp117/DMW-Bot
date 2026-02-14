@@ -108,7 +108,9 @@ class RuntimeEventsMixin(RuntimeMixinBase):
                 log.info("%s", self._format_command_usage_log(interaction))
         except Exception:
             log.exception("Command usage logging failed")
-        await discord.Client.on_interaction(self, interaction)
+        # discord.Client has no base on_interaction coroutine.
+        # CommandTree/view/modal handling already runs in discord.py's
+        # ConnectionState.parse_interaction_create before this event is dispatched.
 
     async def setup_hook(self) -> None:
         if not self._state_loaded:
