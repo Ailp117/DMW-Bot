@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -48,12 +48,55 @@ def test_build_raid_calendar_embed_contains_grid_and_raid_entries(repo):
     assert grid_field is not None
     assert "2026-03-04" not in (grid_field.value or "")
     assert "01" in (grid_field.value or "")
-    assert "[1]" in (grid_field.value or "")
+    assert "04+" in (grid_field.value or "")
 
     details_field = next((field for field in embed.fields if field.name == "Raid Termine"), None)
     assert details_field is not None
     assert "2026-03-04" in (details_field.value or "")
     assert "#1 Nanos" in (details_field.value or "")
+
+
+def test_build_raid_calendar_embed_uses_ansi_colors(repo, monkeypatch):
+    repo.configure_channels(
+        1,
+        planner_channel_id=11,
+        participants_channel_id=22,
+        raidlist_channel_id=33,
+    )
+    create_raid_from_modal(
+        repo,
+        guild_id=1,
+        guild_name="GuildOne",
+        planner_channel_id=11,
+        creator_id=100,
+        dungeon_name="Nanos",
+        days_input="2026-03-04 (Mi)\n2026-03-10 (Di)",
+        times_input="20:00",
+        min_players_input="1",
+        message_id=5151,
+    )
+
+    import features.runtime_mixins.state_calendar as state_calendar_mod
+
+    monkeypatch.setattr(state_calendar_mod, "_berlin_now", lambda: datetime(2026, 3, 4, 12, 0, 0))
+
+    bot = object.__new__(RewriteDiscordBot)
+    bot.repo = repo
+
+    embed, _payload_hash, _debug_lines = RewriteDiscordBot._build_raid_calendar_embed(
+        bot,
+        guild_id=1,
+        guild_name="GuildOne",
+        month_start=date(2026, 3, 1),
+    )
+
+    grid_field = next((field for field in embed.fields if field.name == "Monatsansicht"), None)
+    assert grid_field is not None
+    grid_value = grid_field.value or ""
+    assert grid_value.startswith("```ansi")
+    assert "\u001b[0;31m" in grid_value
+    assert "\u001b[0;33m" in grid_value
+    assert "\u001b[0;37m" in grid_value
 
 
 @pytest.mark.asyncio

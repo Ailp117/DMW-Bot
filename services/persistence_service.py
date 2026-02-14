@@ -183,16 +183,6 @@ class RepositoryPersistence:
         return repr(value)
 
     @staticmethod
-    def _pk_clause(spec: _TableSpec, key: object):
-        if len(spec.pk_columns) == 1:
-            return getattr(spec.model, spec.pk_columns[0]) == key
-        if not isinstance(key, tuple):
-            raise ValueError(f"Composite key expected for table {spec.name}")
-        if len(key) != len(spec.pk_columns):
-            raise ValueError(f"Invalid key shape for table {spec.name}")
-        return and_(*[getattr(spec.model, column) == key[index] for index, column in enumerate(spec.pk_columns)])
-
-    @staticmethod
     def _pk_bind_params(spec: _TableSpec, key: object) -> dict[str, object]:
         if len(spec.pk_columns) == 1:
             return {f"pk_{spec.pk_columns[0]}": key}
@@ -204,8 +194,9 @@ class RepositoryPersistence:
 
     @staticmethod
     def _pk_bind_clause(spec: _TableSpec):
+        table = spec.model.__table__
         clauses = [
-            getattr(spec.model, column) == bindparam(f"pk_{column}")
+            table.c[column] == bindparam(f"pk_{column}")
             for column in spec.pk_columns
         ]
         if len(clauses) == 1:
@@ -228,15 +219,16 @@ class RepositoryPersistence:
         if not removed_keys:
             return
 
+        table = spec.model.__table__
         if len(spec.pk_columns) == 1:
-            pk_column = getattr(spec.model, spec.pk_columns[0])
+            pk_column = table.c[spec.pk_columns[0]]
             for key_chunk in self._iter_chunks(removed_keys, self._DELETE_CHUNK_SIZE):
-                await session.execute(delete(spec.model).where(pk_column.in_(key_chunk)))
+                await session.execute(delete(table).where(pk_column.in_(key_chunk)))
             return
 
-        pk_expr = tuple_(*[getattr(spec.model, column) for column in spec.pk_columns])
+        pk_expr = tuple_(*[table.c[column] for column in spec.pk_columns])
         for key_chunk in self._iter_chunks(removed_keys, self._DELETE_CHUNK_SIZE):
-            await session.execute(delete(spec.model).where(pk_expr.in_(key_chunk)))
+            await session.execute(delete(table).where(pk_expr.in_(key_chunk)))
 
     async def _apply_table_upserts(
         self,
@@ -268,7 +260,8 @@ class RepositoryPersistence:
 
         for change_group in sorted(updates_by_columns):
             payload_rows = updates_by_columns[change_group]
-            statement = update(spec.model).where(self._pk_bind_clause(spec)).values(
+            table = spec.model.__table__
+            statement = update(table).where(self._pk_bind_clause(spec)).values(
                 **{column: bindparam(column) for column in change_group}
             ).execution_options(synchronize_session=False)
             for payload_chunk in self._iter_chunks(payload_rows, self._UPDATE_CHUNK_SIZE):
@@ -276,7 +269,7 @@ class RepositoryPersistence:
 
         added_keys = sorted(current_keys - previous_keys, key=self._stable_sort_key)
         for key_chunk in self._iter_chunks(added_keys, self._INSERT_CHUNK_SIZE):
-            await session.execute(insert(spec.model), [current_rows[key] for key in key_chunk])
+            await session.execute(insert(spec.model.__table__), [current_rows[key] for key in key_chunk])
 
     async def _fetch_table_rows(self, session: Any, table_name: str) -> list[dict[str, Any]]:
         spec = self._TABLE_SPECS[table_name]
