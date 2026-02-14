@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 import pytest
-from sqlalchemy.sql.dml import Delete, Update
+from sqlalchemy.sql.dml import Delete, Insert, Update
 
 from services.persistence_service import RepositoryPersistence
 
@@ -28,11 +28,13 @@ class _DummySession:
         self.execute_calls = 0
         self.add_all_calls = 0
         self.executed_statements: list[object] = []
+        self.executed_params: list[object | None] = []
         self.added_rows: list[object] = []
 
-    async def execute(self, stmt):
+    async def execute(self, stmt, params=None):
         self.execute_calls += 1
         self.executed_statements.append(stmt)
+        self.executed_params.append(params)
 
     def add_all(self, rows):
         self.add_all_calls += 1
@@ -52,6 +54,10 @@ class _DummySessionManager:
         yield session
 
 
+def _is_insert_statement_for_table(statement: object, table_name: str) -> bool:
+    return isinstance(statement, Insert) and getattr(getattr(statement, "table", None), "name", None) == table_name
+
+
 @pytest.mark.asyncio
 async def test_flush_skips_db_when_repository_state_is_unchanged(config, repo):
     persistence = RepositoryPersistence(config)
@@ -60,7 +66,10 @@ async def test_flush_skips_db_when_repository_state_is_unchanged(config, repo):
 
     await persistence.flush(repo)
     assert dummy_manager.session_scope_calls == 1
-    assert dummy_manager.sessions[0].add_all_calls > 0
+    assert any(
+        _is_insert_statement_for_table(stmt, "dungeons")
+        for stmt in dummy_manager.sessions[0].executed_statements
+    )
 
     await persistence.flush(repo)
     assert dummy_manager.session_scope_calls == 1
@@ -68,7 +77,10 @@ async def test_flush_skips_db_when_repository_state_is_unchanged(config, repo):
     repo.ensure_settings(1, "Guild")
     await persistence.flush(repo)
     assert dummy_manager.session_scope_calls == 2
-    assert dummy_manager.sessions[1].add_all_calls > 0
+    assert any(
+        _is_insert_statement_for_table(stmt, "guild_settings")
+        for stmt in dummy_manager.sessions[1].executed_statements
+    )
 
 
 @pytest.mark.asyncio
@@ -150,3 +162,33 @@ async def test_flush_uses_dirty_table_hints_for_snapshot_scope(config, repo):
     assert captured_table_sets
     assert "user_levels" in captured_table_sets[-1]
     assert "settings" not in captured_table_sets[-1]
+
+
+@pytest.mark.asyncio
+async def test_flush_batches_updates_by_column_set(config, repo):
+    persistence = RepositoryPersistence(config)
+    dummy_manager = _DummySessionManager()
+    persistence.session_manager = dummy_manager
+
+    repo.get_or_create_user_level(1, 10, "User10").xp = 1
+    repo.get_or_create_user_level(1, 11, "User11").xp = 2
+    await persistence.flush(repo)
+    assert dummy_manager.session_scope_calls == 1
+
+    repo.get_or_create_user_level(1, 10, "User10").xp = 3
+    repo.get_or_create_user_level(1, 11, "User11").xp = 4
+    await persistence.flush(repo)
+    assert dummy_manager.session_scope_calls == 2
+
+    second_session = dummy_manager.sessions[1]
+    level_updates = [
+        (stmt, params)
+        for stmt, params in zip(second_session.executed_statements, second_session.executed_params)
+        if isinstance(stmt, Update) and getattr(getattr(stmt, "table", None), "name", None) == "user_levels"
+    ]
+    assert level_updates
+    assert len(level_updates) == 1
+    _, params = level_updates[0]
+    assert isinstance(params, list)
+    assert len(params) == 2
+    assert all("xp" in row and "pk_guild_id" in row and "pk_user_id" in row for row in params)

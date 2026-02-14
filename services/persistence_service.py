@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence, TypeVar, cast
 
-from sqlalchemy import and_, delete, select, tuple_, update
+from sqlalchemy import and_, bindparam, delete, insert, select, tuple_, update
 
 from bot.config import BotConfig
 from db.models import (
@@ -35,6 +36,9 @@ from db.repository import (
 from db.session import SessionManager
 
 
+_ChunkItem = TypeVar("_ChunkItem")
+
+
 @dataclass(frozen=True)
 class _TableSpec:
     name: str
@@ -45,6 +49,7 @@ class _TableSpec:
 class RepositoryPersistence:
     _DELETE_CHUNK_SIZE = 500
     _INSERT_CHUNK_SIZE = 500
+    _UPDATE_CHUNK_SIZE = 500
     _FULL_SCAN_EVERY_HINTED_FLUSHES = 25
     _TABLE_SPECS: dict[str, _TableSpec] = {
         "settings": _TableSpec("settings", GuildSettings, ("guild_id",)),
@@ -188,7 +193,27 @@ class RepositoryPersistence:
         return and_(*[getattr(spec.model, column) == key[index] for index, column in enumerate(spec.pk_columns)])
 
     @staticmethod
-    def _iter_chunks(values: list[object], chunk_size: int):
+    def _pk_bind_params(spec: _TableSpec, key: object) -> dict[str, object]:
+        if len(spec.pk_columns) == 1:
+            return {f"pk_{spec.pk_columns[0]}": key}
+        if not isinstance(key, tuple):
+            raise ValueError(f"Composite key expected for table {spec.name}")
+        if len(key) != len(spec.pk_columns):
+            raise ValueError(f"Invalid key shape for table {spec.name}")
+        return {f"pk_{column}": key[index] for index, column in enumerate(spec.pk_columns)}
+
+    @staticmethod
+    def _pk_bind_clause(spec: _TableSpec):
+        clauses = [
+            getattr(spec.model, column) == bindparam(f"pk_{column}")
+            for column in spec.pk_columns
+        ]
+        if len(clauses) == 1:
+            return clauses[0]
+        return and_(*clauses)
+
+    @staticmethod
+    def _iter_chunks(values: Sequence[_ChunkItem], chunk_size: int):
         for index in range(0, len(values), chunk_size):
             yield values[index : index + chunk_size]
 
@@ -226,6 +251,7 @@ class RepositoryPersistence:
             [key for key in (current_keys & previous_keys) if current_rows[key] != previous_rows[key]],
             key=self._stable_sort_key,
         )
+        updates_by_columns: dict[tuple[str, ...], list[dict[str, object]]] = defaultdict(list)
         for key in changed_keys:
             previous_row = previous_rows[key]
             values = {
@@ -235,130 +261,147 @@ class RepositoryPersistence:
             }
             if not values:
                 continue
-            await session.execute(update(spec.model).where(self._pk_clause(spec, key)).values(**values))
+            change_group = tuple(sorted(values.keys()))
+            update_payload = self._pk_bind_params(spec, key)
+            update_payload.update(values)
+            updates_by_columns[change_group].append(update_payload)
+
+        for change_group in sorted(updates_by_columns):
+            payload_rows = updates_by_columns[change_group]
+            statement = update(spec.model).where(self._pk_bind_clause(spec)).values(
+                **{column: bindparam(column) for column in change_group}
+            )
+            for payload_chunk in self._iter_chunks(payload_rows, self._UPDATE_CHUNK_SIZE):
+                await session.execute(statement, payload_chunk)
 
         added_keys = sorted(current_keys - previous_keys, key=self._stable_sort_key)
         for key_chunk in self._iter_chunks(added_keys, self._INSERT_CHUNK_SIZE):
-            session.add_all([spec.model(**current_rows[key]) for key in key_chunk])
+            await session.execute(insert(spec.model), [current_rows[key] for key in key_chunk])
+
+    async def _fetch_table_rows(self, session: Any, table_name: str) -> list[dict[str, Any]]:
+        spec = self._TABLE_SPECS[table_name]
+        columns = [getattr(spec.model, column_name) for column_name in self._TABLE_FIELDS[table_name]]
+        result = await session.execute(select(*columns))
+        return cast(list[dict[str, Any]], result.mappings().all())
 
     async def load(self, repo: InMemoryRepository) -> None:
         async with self._lock:
             repo.reset()
             async with self.session_manager.session_scope() as session:
-                dungeons = (await session.execute(select(Dungeon))).scalars().all()
-                settings = (await session.execute(select(GuildSettings))).scalars().all()
-                raids = (await session.execute(select(Raid))).scalars().all()
-                options = (await session.execute(select(RaidOption))).scalars().all()
-                votes = (await session.execute(select(RaidVote))).scalars().all()
-                slots = (await session.execute(select(RaidPostedSlot))).scalars().all()
-                templates = (await session.execute(select(RaidTemplate))).scalars().all()
-                attendance = (await session.execute(select(RaidAttendance))).scalars().all()
-                levels = (await session.execute(select(UserLevel))).scalars().all()
-                debug_rows = (await session.execute(select(DebugMirrorCache))).scalars().all()
+                dungeons = await self._fetch_table_rows(session, "dungeons")
+                settings = await self._fetch_table_rows(session, "settings")
+                raids = await self._fetch_table_rows(session, "raids")
+                options = await self._fetch_table_rows(session, "raid_options")
+                votes = await self._fetch_table_rows(session, "raid_votes")
+                slots = await self._fetch_table_rows(session, "raid_posted_slots")
+                templates = await self._fetch_table_rows(session, "raid_templates")
+                attendance = await self._fetch_table_rows(session, "raid_attendance")
+                levels = await self._fetch_table_rows(session, "user_levels")
+                debug_rows = await self._fetch_table_rows(session, "debug_cache")
 
             for row in dungeons:
-                repo.dungeons[int(row.id)] = DungeonRecord(
-                    id=int(row.id),
-                    name=row.name,
-                    short_code=row.short_code,
-                    is_active=bool(row.is_active),
-                    sort_order=int(row.sort_order or 0),
+                repo.dungeons[int(row["id"])] = DungeonRecord(
+                    id=int(row["id"]),
+                    name=str(row["name"]),
+                    short_code=str(row["short_code"]),
+                    is_active=bool(row["is_active"]),
+                    sort_order=int(row["sort_order"] or 0),
                 )
 
             for row in settings:
-                repo.settings[int(row.guild_id)] = GuildSettingsRecord(
-                    guild_id=int(row.guild_id),
-                    guild_name=row.guild_name,
-                    participants_channel_id=int(row.participants_channel_id) if row.participants_channel_id else None,
-                    raidlist_channel_id=int(row.raidlist_channel_id) if row.raidlist_channel_id else None,
-                    raidlist_message_id=int(row.raidlist_message_id) if row.raidlist_message_id else None,
-                    planner_channel_id=int(row.planner_channel_id) if row.planner_channel_id else None,
-                    default_min_players=int(row.default_min_players or 0),
-                    templates_enabled=bool(row.templates_enabled),
-                    template_manager_role_id=int(row.template_manager_role_id) if row.template_manager_role_id else None,
+                repo.settings[int(row["guild_id"])] = GuildSettingsRecord(
+                    guild_id=int(row["guild_id"]),
+                    guild_name=row["guild_name"],
+                    participants_channel_id=int(row["participants_channel_id"]) if row["participants_channel_id"] else None,
+                    raidlist_channel_id=int(row["raidlist_channel_id"]) if row["raidlist_channel_id"] else None,
+                    raidlist_message_id=int(row["raidlist_message_id"]) if row["raidlist_message_id"] else None,
+                    planner_channel_id=int(row["planner_channel_id"]) if row["planner_channel_id"] else None,
+                    default_min_players=int(row["default_min_players"] or 0),
+                    templates_enabled=bool(row["templates_enabled"]),
+                    template_manager_role_id=int(row["template_manager_role_id"]) if row["template_manager_role_id"] else None,
                 )
 
             for row in raids:
-                repo.raids[int(row.id)] = RaidRecord(
-                    id=int(row.id),
-                    display_id=int(row.display_id or 0),
-                    guild_id=int(row.guild_id),
-                    channel_id=int(row.channel_id),
-                    creator_id=int(row.creator_id),
-                    dungeon=row.dungeon,
-                    status=row.status,
-                    created_at=row.created_at,
-                    message_id=int(row.message_id) if row.message_id else None,
-                    min_players=int(row.min_players or 0),
-                    participants_posted=bool(row.participants_posted),
-                    temp_role_id=int(row.temp_role_id) if row.temp_role_id else None,
-                    temp_role_created=bool(row.temp_role_created),
+                repo.raids[int(row["id"])] = RaidRecord(
+                    id=int(row["id"]),
+                    display_id=int(row["display_id"] or 0),
+                    guild_id=int(row["guild_id"]),
+                    channel_id=int(row["channel_id"]),
+                    creator_id=int(row["creator_id"]),
+                    dungeon=str(row["dungeon"]),
+                    status=str(row["status"]),
+                    created_at=row["created_at"],
+                    message_id=int(row["message_id"]) if row["message_id"] else None,
+                    min_players=int(row["min_players"] or 0),
+                    participants_posted=bool(row["participants_posted"]),
+                    temp_role_id=int(row["temp_role_id"]) if row["temp_role_id"] else None,
+                    temp_role_created=bool(row["temp_role_created"]),
                 )
 
             for row in options:
-                repo.raid_options[int(row.id)] = RaidOptionRecord(
-                    id=int(row.id),
-                    raid_id=int(row.raid_id),
-                    kind=row.kind,
-                    label=row.label,
+                repo.raid_options[int(row["id"])] = RaidOptionRecord(
+                    id=int(row["id"]),
+                    raid_id=int(row["raid_id"]),
+                    kind=str(row["kind"]),
+                    label=str(row["label"]),
                 )
 
             for row in votes:
-                repo.raid_votes[int(row.id)] = RaidVoteRecord(
-                    id=int(row.id),
-                    raid_id=int(row.raid_id),
-                    kind=row.kind,
-                    option_label=row.option_label,
-                    user_id=int(row.user_id),
+                repo.raid_votes[int(row["id"])] = RaidVoteRecord(
+                    id=int(row["id"]),
+                    raid_id=int(row["raid_id"]),
+                    kind=str(row["kind"]),
+                    option_label=str(row["option_label"]),
+                    user_id=int(row["user_id"]),
                 )
 
             for row in slots:
-                repo.raid_posted_slots[int(row.id)] = RaidPostedSlotRecord(
-                    id=int(row.id),
-                    raid_id=int(row.raid_id),
-                    day_label=row.day_label,
-                    time_label=row.time_label,
-                    channel_id=int(row.channel_id) if row.channel_id else None,
-                    message_id=int(row.message_id) if row.message_id else None,
+                repo.raid_posted_slots[int(row["id"])] = RaidPostedSlotRecord(
+                    id=int(row["id"]),
+                    raid_id=int(row["raid_id"]),
+                    day_label=str(row["day_label"]),
+                    time_label=str(row["time_label"]),
+                    channel_id=int(row["channel_id"]) if row["channel_id"] else None,
+                    message_id=int(row["message_id"]) if row["message_id"] else None,
                 )
 
             for row in templates:
-                repo.raid_templates[int(row.id)] = RaidTemplateRecord(
-                    id=int(row.id),
-                    guild_id=int(row.guild_id),
-                    dungeon_id=int(row.dungeon_id),
-                    template_name=row.template_name,
-                    template_data=row.template_data,
+                repo.raid_templates[int(row["id"])] = RaidTemplateRecord(
+                    id=int(row["id"]),
+                    guild_id=int(row["guild_id"]),
+                    dungeon_id=int(row["dungeon_id"]),
+                    template_name=str(row["template_name"]),
+                    template_data=str(row["template_data"]),
                 )
 
             for row in attendance:
-                repo.raid_attendance[int(row.id)] = RaidAttendanceRecord(
-                    id=int(row.id),
-                    guild_id=int(row.guild_id),
-                    raid_display_id=int(row.raid_display_id),
-                    dungeon=row.dungeon,
-                    user_id=int(row.user_id),
-                    status=row.status,
-                    marked_by_user_id=int(row.marked_by_user_id) if row.marked_by_user_id else None,
+                repo.raid_attendance[int(row["id"])] = RaidAttendanceRecord(
+                    id=int(row["id"]),
+                    guild_id=int(row["guild_id"]),
+                    raid_display_id=int(row["raid_display_id"]),
+                    dungeon=str(row["dungeon"]),
+                    user_id=int(row["user_id"]),
+                    status=str(row["status"]),
+                    marked_by_user_id=int(row["marked_by_user_id"]) if row["marked_by_user_id"] else None,
                 )
 
             for row in levels:
-                repo.user_levels[(int(row.guild_id), int(row.user_id))] = UserLevelRecord(
-                    guild_id=int(row.guild_id),
-                    user_id=int(row.user_id),
-                    xp=int(row.xp or 0),
-                    level=int(row.level or 0),
-                    username=row.username,
+                repo.user_levels[(int(row["guild_id"]), int(row["user_id"]))] = UserLevelRecord(
+                    guild_id=int(row["guild_id"]),
+                    user_id=int(row["user_id"]),
+                    xp=int(row["xp"] or 0),
+                    level=int(row["level"] or 0),
+                    username=row["username"],
                 )
 
             for row in debug_rows:
-                repo.debug_cache[row.cache_key] = DebugMirrorCacheRecord(
-                    cache_key=row.cache_key,
-                    kind=row.kind,
-                    guild_id=int(row.guild_id),
-                    raid_id=int(row.raid_id) if row.raid_id else None,
-                    message_id=int(row.message_id),
-                    payload_hash=row.payload_hash,
+                repo.debug_cache[str(row["cache_key"])] = DebugMirrorCacheRecord(
+                    cache_key=str(row["cache_key"]),
+                    kind=str(row["kind"]),
+                    guild_id=int(row["guild_id"]),
+                    raid_id=int(row["raid_id"]) if row["raid_id"] else None,
+                    message_id=int(row["message_id"]),
+                    payload_hash=str(row["payload_hash"]),
                 )
 
             repo.recalculate_counters()
