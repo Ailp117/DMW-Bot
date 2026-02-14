@@ -340,6 +340,10 @@ class RuntimeStateCalendarMixin(RuntimeMixinBase):
         grid_rows: list[str] = []
         debug_lines: list[str] = []
         payload_parts = [f"month={normalized_month.isoformat()}", f"open_raids={len(open_raids)}"]
+        ansi_reset = "\u001b[0m"
+        ansi_red = "\u001b[0;31m"
+        ansi_yellow = "\u001b[0;33m"
+        ansi_white = "\u001b[0;37m"
         for row_index in range(RAID_CALENDAR_GRID_ROWS):
             token_parts: list[str] = []
             for col_index in range(RAID_CALENDAR_GRID_COLUMNS):
@@ -349,16 +353,19 @@ class RuntimeStateCalendarMixin(RuntimeMixinBase):
                 entry_count = len(entries_by_day.get(slot_date, []))
                 is_today = slot_date == today_local and in_current_month
 
-                base = f"{slot_date.day:02d}"
-                if not in_current_month:
-                    base += ">"
-                if is_today:
-                    base = f"🟩{base}"
-                if entry_count > 0:
-                    token = f"{base}[{entry_count}]"
+                if in_current_month:
+                    suffix = "+" if entry_count > 0 else " "
+                    token = f" {slot_date.day:02d}{suffix}"
                 else:
-                    token = base
-                token_parts.append(token.rjust(8))
+                    token = f">{slot_date.day:02d} "
+                token_cell = token.rjust(4)
+                if is_today:
+                    color = ansi_red
+                elif entry_count > 0:
+                    color = ansi_yellow
+                else:
+                    color = ansi_white
+                token_parts.append(f"{color}{token_cell}{ansi_reset}")
                 payload_parts.append(f"{slot_date.isoformat()}:{entry_count}:{int(in_current_month)}")
             grid_rows.append("".join(token_parts).rstrip())
 
@@ -374,7 +381,7 @@ class RuntimeStateCalendarMixin(RuntimeMixinBase):
             debug_lines.append(line)
             payload_parts.append(f"detail={line}")
 
-        grid_block = "```text\n" + "\n".join(grid_rows) + "\n```"
+        grid_block = "```ansi\n" + "\n".join(grid_rows) + "\n```"
         embed = discord.Embed(
             title=f"📅 Raid Kalender • {_month_label_de(normalized_month)}",
             description=(
@@ -396,7 +403,7 @@ class RuntimeStateCalendarMixin(RuntimeMixinBase):
         embed.add_field(name="Raid Termine", value=details, inline=False)
         embed.set_footer(
             text=(
-                "Legende: 🟩DD = heute, DD = Monatstag, DD>[n] = Folgemonatstag, [n] = Anzahl Eintraege | "
+                "Legende: Rot = heute, Gelb = Tag mit Raid, Weiss = sonstige Tage, >DD = Folgemonatstag | "
                 "Monat per Buttons wechseln"
             )
         )
