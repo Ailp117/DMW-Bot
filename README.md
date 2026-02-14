@@ -127,15 +127,36 @@ Die Tests decken u. a. Command-Registrierung, Berechtigungen, Konfigurationslogi
 
 ## Projektstruktur (Kurzüberblick)
 
-- `main.py` – Bot-Lifecycle, Task-Scheduling, Command-Registrierung
-- `commands_*.py` – Slash-Command-Module nach Themen
-- `views_*.py` – Discord UI Views
-- `models.py` – SQLAlchemy-Modelle
-- `db.py` – DB-Engine, Session-Handling, SQL-Logging
-- `ensure_schema.py` – Schema-Initialisierung/-Migration
-- `backup_sql.py` – SQL-Export/Backup
+- `bot/runtime.py` – Runtime-Bootstrap + Bot-Klasse + Event/Background-Orchestrierung
+- `bot/discord_api.py` – Discord.py-Import-Layer (`discord`, `app_commands`)
+- `features/runtime_mixins/*.py` – Runtime-Featuremodule (Lifecycle, Logging/Worker, State/Calendar, Raid-Operations)
+- `commands/runtime_commands.py` – Slash-Command-Registrierung (`register_runtime_commands(bot)`)
+- `views/raid_views.py` – Discord UI (Views, Buttons, Modals) für Raid/Settings/Kalender
+- `utils/runtime_helpers.py` – gemeinsame Runtime-Konstanten + Helper-Funktionen
+- `services/` – Business-Logik (Raid, Leveling, Persistenz, Settings, Backup, Templates)
+- `db/` – Repository, Models, Session/Schema-Guard
+- `utils/` – Hilfsfunktionen (Hashing, Text, Slots, Level-Math)
 - `tests/` – automatisierte Tests
 - `FEATURE_MATRIX.md` – Zuordnung Feature → Code → DB → Tests
+
+## Runtime Bootstrap und Erweiterung
+
+Der Runtime-Startpfad ist jetzt klar getrennt:
+
+1. `RewriteDiscordBot.setup_hook()` lädt DB-State und restauriert persistente Views.
+2. `RewriteDiscordBot._register_commands()` delegiert an `commands.runtime_commands.register_runtime_commands(self)`.
+3. Runtime-Featurelogik kommt über Mixins aus `features/runtime_mixins/*`.
+4. Discord-UI-Komponenten liegen in `views/raid_views.py`.
+5. Gemeinsame Runtime-Helfer liegen in `utils/runtime_helpers.py`.
+6. Geschäftslogik bleibt in `services/*` und wird aus Commands/Views genutzt.
+
+Neue Features hängst du so ein:
+
+1. Business-Logik in `services/<feature>_service.py`.
+2. Interaktive UI in `views/<feature>_views.py`.
+3. Slash-Commands in `commands/<feature>_commands.py` mit `register_*_commands(bot)`.
+4. Runtime-Methoden in `features/runtime_mixins/<feature>.py` als Mixin kapseln.
+5. In `runtime.py` den Mixin in der Vererbung von `RewriteDiscordBot` ergänzen und ggf. `register_*` aufrufen.
 
 ## Hinweise für den Betrieb
 
