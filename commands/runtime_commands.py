@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from utils.runtime_helpers import (
     DEFAULT_TIMEZONE_NAME,
@@ -26,6 +26,10 @@ if TYPE_CHECKING:
 
 
 log = logging.getLogger("dmw.runtime")
+
+
+class _ChoiceLike(Protocol):
+    value: str
 
 
 def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
@@ -366,7 +370,7 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
             app_commands.Choice(name="server", value="server"),
         ]
     )
-    async def purgebot_cmd(interaction, scope: app_commands.Choice[str], limit: int = 500):
+    async def purgebot_cmd(interaction, scope: _ChoiceLike, limit: int = 500):
         if interaction.guild is None:
             await bot._reply(interaction, "Nur im Server nutzbar.", ephemeral=True)
             return

@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
+from bot.discord_api import discord
 from bot.runtime import RewriteDiscordBot
+from features.runtime_mixins import events as runtime_events_mod
 
 
 def test_interaction_command_path_supports_subcommands(repo):
@@ -92,3 +96,18 @@ def test_format_command_usage_log_sanitizes_multiline_values(repo):
     assert "command=/status hidden" in text
     assert "user=Sebas Admin (1234)" in text
     assert "guild=Alpha Guild" in text
+
+
+@pytest.mark.asyncio
+async def test_on_interaction_logs_without_calling_missing_client_base_method(repo, monkeypatch):
+    bot = object.__new__(RewriteDiscordBot)
+    bot.repo = repo
+    bot._format_command_usage_log = lambda _interaction: "Command executed: command=/status"
+
+    logged: list[str] = []
+    monkeypatch.setattr(runtime_events_mod.log, "info", lambda _fmt, text: logged.append(text))
+
+    interaction = SimpleNamespace(type=discord.InteractionType.application_command)
+    await RewriteDiscordBot.on_interaction(bot, interaction)
+
+    assert logged == ["Command executed: command=/status"]
