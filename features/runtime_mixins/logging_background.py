@@ -6,6 +6,7 @@ from datetime import UTC, date, datetime, timedelta
 import inspect
 import logging
 from pathlib import Path
+import re
 import time
 from typing import Any, AsyncIterable, Awaitable, cast
 
@@ -24,6 +25,17 @@ from utils.text import contains_approved_keyword, contains_nanomon_keyword
 
 
 class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
+    _IMPORTANT_INFO_PREFIXES = (
+        "Rewrite bot ready as",
+        "Command sync completed",
+        "Applied DB schema changes",
+        "Restored ",
+        "Automatic backup completed",
+        "Username sync updated rows=",
+        "Command executed:",
+    )
+    _LOG_GUILD_ID_PATTERN = re.compile(r"\bguild_id=(?P<guild_id>\d+)\b")
+
     def _enqueue_log_forward_queue(self, message: str) -> None:
         if self.log_forward_queue.full():
             try:
@@ -41,6 +53,8 @@ class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
         class _DiscordQueueHandler(logging.Handler):
             def emit(self, record: logging.LogRecord) -> None:
                 try:
+                    if not bot._should_forward_log_record(record):
+                        return
                     msg = self.format(record)
                     bot.enqueue_discord_log(msg)
                 except Exception:
@@ -55,6 +69,28 @@ class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
             )
         )
         return handler
+
+    @classmethod
+    def _is_important_info_message(cls, text: str) -> bool:
+        normalized = str(text or "").strip()
+        return any(normalized.startswith(prefix) for prefix in cls._IMPORTANT_INFO_PREFIXES)
+
+    def _should_forward_log_record(self, record: logging.LogRecord) -> bool:
+        level = int(getattr(record, "levelno", logging.INFO))
+        if level >= logging.WARNING:
+            return True
+        if level <= logging.DEBUG:
+            return False
+
+        source_name = str(getattr(record, "name", "") or "")
+        if source_name.startswith("dmw.db"):
+            return False
+
+        try:
+            message = record.getMessage()
+        except Exception:
+            message = str(getattr(record, "msg", ""))
+        return self._is_important_info_message(message)
 
     def _attach_discord_log_handler(self) -> None:
         attached: list[logging.Logger] = []
@@ -100,25 +136,56 @@ class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
 
         match = _DISCORD_LOG_LINE_PATTERN.match(text)
         if match is None:
-            return None
+            timestamp = _berlin_now().strftime("%Y-%m-%d %H:%M:%S")
+            level = "INFO"
+            source = "dmw.runtime/unstructured"
+            body = text
+        else:
+            timestamp = (match.group("timestamp") or "").strip()
+            level = (match.group("level") or "").strip().upper()
+            source = (match.group("source") or "").strip()
+            body = (match.group("body") or "").strip() or "(leer)"
 
-        timestamp = (match.group("timestamp") or "").strip()
-        level = (match.group("level") or "").strip().upper()
-        source = (match.group("source") or "").strip()
-        body = (match.group("body") or "").strip() or "(leer)"
-        title, color = self._log_level_presentation(level)
+        title_label, color = self._log_level_presentation(level)
+        compact_body = " ".join(body.split()) or "(leer)"
+        guild_id: int | None = None
+        guild_match = self._LOG_GUILD_ID_PATTERN.search(compact_body)
+        if guild_match is not None:
+            try:
+                guild_id = int(guild_match.group("guild_id"))
+            except (TypeError, ValueError):
+                guild_id = None
+        if guild_id is not None:
+            compact_body = self._LOG_GUILD_ID_PATTERN.sub(
+                f"guild={self._log_guild_label(guild_id)}",
+                compact_body,
+            )
 
-        description = body if len(body) <= 3500 else f"{body[:3497]}..."
+        description = compact_body if len(compact_body) <= 700 else f"{compact_body[:697]}..."
         source_field = source if len(source) <= 1000 else f"{source[:997]}..."
         embed = discord.Embed(
-            title=title,
+            title=f"{title_label} • Systemlog",
             description=description,
             color=color,
+            timestamp=_berlin_now(),
         )
         embed.add_field(name="Quelle", value=f"`{source_field}`", inline=False)
         embed.add_field(name="Zeit", value=f"`{timestamp}`", inline=True)
-        embed.set_footer(text="DMW Log Forwarder")
+        if guild_id is not None:
+            embed.add_field(name="Server", value=f"`{self._log_guild_label(guild_id)}`", inline=True)
+        embed.set_footer(text="DMW • Wichtige Ereignisse")
         return embed
+
+    def _log_guild_label(self, guild_id: int) -> str:
+        resolver = getattr(self, "_guild_display_name", None)
+        if callable(resolver):
+            try:
+                name = str(resolver(int(guild_id)) or "").strip()
+                if name:
+                    return f"{name} ({int(guild_id)})"
+            except Exception:
+                pass
+        return f"Server {int(guild_id)}"
 
     def _build_user_id_card_embed(self, *, guild_id: int, guild_name: str, user: Any):
         user_id = int(getattr(user, "id", 0) or 0)
@@ -142,7 +209,7 @@ class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
             title="🪪 DMW Spieler-Ausweis",
             description=f"Server: **{guild_name}**",
             color=discord.Color.blue(),
-            timestamp=datetime.now(UTC),
+            timestamp=_berlin_now(),
         )
         if avatar_url:
             embed.set_author(name=display_name, icon_url=avatar_url)
@@ -164,9 +231,16 @@ class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
         guild = self.get_guild(self.config.log_guild_id)
         if guild is None:
             return None
-        channel = guild.get_channel(self.config.log_channel_id)
+        channel_id = int(self.config.log_channel_id)
+        channel = guild.get_channel(channel_id)
         if isinstance(channel, discord.TextChannel):
             return channel
+        try:
+            fetched = await self.fetch_channel(channel_id)
+        except Exception:
+            return None
+        if isinstance(fetched, discord.TextChannel) and int(getattr(getattr(fetched, "guild", None), "id", 0) or 0) == int(guild.id):
+            return fetched
         return None
 
     async def _log_forwarder_worker(self) -> None:
@@ -175,6 +249,12 @@ class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
             message = await self.log_forward_queue.get()
             channel = self.log_channel
             if channel is None:
+                self.log_channel = await self._resolve_log_channel()
+                channel = self.log_channel
+            if channel is None:
+                # Keep message buffered if log channel is temporarily unavailable.
+                self._enqueue_log_forward_queue(message)
+                await asyncio.sleep(1.0)
                 continue
             try:
                 embed = self._build_discord_log_embed(message)
@@ -195,7 +275,7 @@ class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
         unexpected = sorted(name for name in reg_set if name not in EXPECTED_SLASH_COMMANDS)
         if unexpected:
             log.warning("Unexpected extra commands registered: %s", ", ".join(unexpected))
-        self.last_self_test_ok_at = datetime.now(UTC)
+        self.last_self_test_ok_at = _utc_now()
         self.last_self_test_error = None
 
     async def _self_test_worker(self) -> None:
@@ -278,7 +358,7 @@ class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
             return None
 
     async def _run_raid_reminders_once(self, *, now_utc: datetime | None = None) -> int:
-        current = now_utc or datetime.now(UTC)
+        current = now_utc or _utc_now()
         sent = 0
         participants_channel_by_id: dict[int, Any | None] = {}
         for raid in self.repo.list_open_raids():
@@ -368,6 +448,12 @@ class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
 
     async def _run_integrity_cleanup_once(self) -> int:
         open_raids_by_id = {int(raid.id): raid for raid in self.repo.list_open_raids()}
+        open_display_ids_by_guild: dict[int, set[int]] = {}
+        for raid in open_raids_by_id.values():
+            display_id = int(raid.display_id or 0)
+            if display_id <= 0:
+                continue
+            open_display_ids_by_guild.setdefault(int(raid.guild_id), set()).add(display_id)
         removed_rows = 0
 
         # Legacy cleanup: remove previously used timezone cache rows.
@@ -401,11 +487,7 @@ class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
             removed_rows += 1
 
         for guild in list(getattr(self, "guilds", []) or []):
-            open_display_ids = {
-                int(raid.display_id)
-                for raid in self.repo.list_open_raids(guild.id)
-                if int(raid.display_id or 0) > 0
-            }
+            open_display_ids = open_display_ids_by_guild.get(int(getattr(guild, "id", 0) or 0), set())
             for role in list(getattr(guild, "roles", []) or []):
                 role_name = str(getattr(role, "name", "") or "")
                 if not role_name.startswith("DMW Raid "):
@@ -436,7 +518,7 @@ class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
         await self.wait_until_ready()
         while not self.is_closed():
             changed = False
-            now = datetime.now(UTC)
+            now = _utc_now()
             async with self._state_lock:
                 for guild in self.guilds:
                     feature_settings = self._get_guild_feature_settings(guild.id)
@@ -502,6 +584,7 @@ class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
 
     async def _cleanup_stale_raids_once(self) -> int:
         cutoff_hours = STALE_RAID_HOURS
+        now = _utc_now()
 
         stale_ids: list[int] = []
         for raid in self.repo.list_open_raids():
@@ -510,7 +593,6 @@ class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
                 created_utc = created_at.replace(tzinfo=UTC)
             else:
                 created_utc = created_at.astimezone(UTC)
-            now = datetime.now(UTC)
             age_seconds = (now - created_utc).total_seconds()
             if age_seconds >= cutoff_hours * 3600:
                 stale_ids.append(raid.id)

@@ -35,3 +35,10 @@ def test_discord_log_level_validation_rejects_invalid_value(monkeypatch):
     monkeypatch.setenv("DISCORD_LOG_LEVEL", "trace")
     with pytest.raises(ValueError, match="DISCORD_LOG_LEVEL must be one of"):
         load_config()
+
+
+def test_log_forward_queue_size_validation_rejects_negative(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@localhost/db")
+    monkeypatch.setenv("LOG_FORWARD_QUEUE_MAX_SIZE", "-1")
+    with pytest.raises(ValueError, match="LOG_FORWARD_QUEUE_MAX_SIZE must be >= 0"):
+        load_config()

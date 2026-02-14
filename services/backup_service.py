@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Iterable, Mapping
+from utils.time_utils import berlin_now
 
 
 _BACKUP_WRITE_LOCK = asyncio.Lock()
@@ -32,7 +33,7 @@ def sql_literal(value: object) -> str:
     if isinstance(value, datetime):
         current = value
         if current.tzinfo is None:
-            current = current.replace(tzinfo=timezone.utc)
+            current = current.replace(tzinfo=UTC)
         return "'" + current.isoformat().replace("'", "''") + "'"
     return "'" + str(value).replace("'", "''") + "'"
 
@@ -59,7 +60,7 @@ async def export_rows_to_sql(
     async with _BACKUP_WRITE_LOCK:
         lines = [
             "-- DMW Rewrite SQL Backup",
-            f"-- generated_at_utc: {datetime.now(timezone.utc).isoformat()}",
+            f"-- generated_at_berlin: {berlin_now().isoformat()}",
             "BEGIN;",
             "",
         ]

@@ -30,7 +30,7 @@ def test_feature_settings_defaults_come_from_config(repo):
     assert loaded.levelup_messages_enabled is True
     assert loaded.nanomon_reply_enabled is True
     assert loaded.approved_reply_enabled is True
-    assert loaded.raid_reminder_enabled is False
+    assert loaded.raid_reminder_enabled is True
     assert loaded.message_xp_interval_seconds == 15
     assert loaded.levelup_message_cooldown_seconds == 20
 

@@ -6,6 +6,7 @@ import math
 
 from db.repository import InMemoryRepository
 from utils.leveling import calculate_level_from_xp
+from utils.time_utils import berlin_now
 
 
 VOICE_XP_AWARD_INTERVAL = timedelta(hours=1)
@@ -39,7 +40,7 @@ class LevelingService:
     @staticmethod
     def _normalize_ts(ts: datetime | None) -> datetime:
         if ts is None:
-            return datetime.now(UTC)
+            return berlin_now().astimezone(UTC)
         if ts.tzinfo is None:
             return ts.replace(tzinfo=UTC)
         return ts.astimezone(UTC)

@@ -94,40 +94,8 @@ Implemented and then refined:
   - only show users who fully voted (day + time)
   - do not show partial list
 
-## Current slash commands (after all requested removals)
-From `bot/runtime.py` command registration:
-- `/settings`
-- `/status`
-- `/help`
-- `/help2`
-- `/restart` (privileged only)
-- `/dungeonlist`
-- `/raidplan` (modal)
-- `/raid_finish`
-- `/raidlist`
-- `/cancel_all_raids`
-- `/template_config`
-- `/purge`
-- `/purgebot`
-- `/remote_guilds` (privileged only)
-- `/remote_cancel_all_raids` (privileged only)
-- `/remote_raidlist` (privileged only)
-- `/backup_db` (privileged only)
-
-Removed during this chat:
-- `/attendance_list`
-- `/attendance_mark`
-- `/raid_vote`
-- `/raid_options`
-
 ## Test and validation snapshots recorded
 Repeated checks executed successfully.
-Most recent full test output:
-
-```
-........................................                                 [100%]
-40 passed in 0.14s
-```
 
 Other checks that passed during chat:
 - `python -m py_compile ...` for project modules
@@ -280,9 +248,6 @@ If a new chat should continue safely:
   - avoids unbounded growth and expensive full-table flush payloads
   - keeps `/purgebot` indexed path fast
 - Added regression coverage in `tests/test_phase3_purgebot_index.py` for pruning behavior.
-
-#### Additional minor safety fix
-- Updated `bot/main.py` self-test timestamp to timezone-aware UTC (`datetime.now(UTC)`).
 
 #### Latest verified test snapshot
 - `76 passed, 1 warning in 0.48s`
@@ -438,18 +403,12 @@ If a new chat should continue safely:
   - `python3 -m compileall db/repository.py tests/test_phase3_voting.py tests/test_phase3_repository_cascade.py` => passed
 
 ### Runtime feature expansion + harmonization check (2026-02-13, newest)
-- Implemented user timezone management and raid-timezone aware planning/reminders in `bot/runtime.py`.
-  - Added `/timezone` command with autocomplete for IANA timezone names.
-  - Raid creation now uses creator timezone context for date selection and stores raid-specific timezone metadata.
-  - Reminder scheduling now parses slot date/time in raid timezone and converts to UTC safely.
 - Added periodic integrity cleanup worker to remove orphaned runtime artifacts:
   - stale `raid_timezone`, `raid_reminder`, `slot_temp_role`, and disconnected `user_timezone` cache rows.
   - orphan temporary slot roles are cleaned when no open raid mapping exists.
 - Reworked raidlist output from plain text to rich embed format:
   - per-raid structured fields (creator, min players, qualified slots, fully-voted count, timezone, next slot, planner jump link).
   - embed payload hash remains delta-aware to avoid redundant edits.
-- Extended command registry expectations:
-  - `services/startup_service.py` now includes `/timezone` in `EXPECTED_SLASH_COMMANDS`.
 
 ### Additional stabilization/tests in same pass (2026-02-13)
 - Added tests for timezone and reminder behavior:
@@ -587,3 +546,119 @@ If a new chat should continue safely:
 - Compile/deps:
   - `.venv/bin/python -m compileall -q bot db discord features services utils tests` => passed
   - `.venv/bin/python -m pip check` => `No broken requirements found.`
+
+## Incremental updates (2026-02-14, current canonical state)
+
+### Runtime and command changes
+- Removed update/pull restart path:
+  - deleted `services/update_service.py`
+  - removed `/restart_update`
+  - removed `tests/test_phase3_update_service.py`
+- Added/kept remote maintenance command for memberlist rebuild:
+  - `/remote_rebuild_memberlists`
+- Added/kept raid calendar rebuild command:
+  - `/raidcalendar_rebuild`
+
+### Current authoritative slash command set
+Source of truth: `services/startup_service.py` `EXPECTED_SLASH_COMMANDS`.
+- `/settings`
+- `/status`
+- `/help`
+- `/help2`
+- `/id`
+- `/restart`
+- `/raidplan`
+- `/raid_finish`
+- `/raidlist`
+- `/raidcalendar_rebuild`
+- `/dungeonlist`
+- `/cancel_all_raids`
+- `/purge`
+- `/purgebot`
+- `/remote_guilds`
+- `/remote_cancel_all_raids`
+- `/remote_raidlist`
+- `/remote_rebuild_memberlists`
+- `/template_config`
+- `/backup_db`
+
+### Time handling simplification (Berlin-only)
+- Bot time source is centralized and Berlin-locked:
+  - added `utils/time_utils.py`
+  - canonical timezone constant: `Europe/Berlin`
+  - helper functions: `berlin_now()`, `berlin_now_utc()`
+- Runtime/time helper paths now use centralized source:
+  - `utils/runtime_helpers.py`
+  - `bot/main.py`
+  - `services/leveling_service.py`
+  - `services/backup_service.py`
+- `/status` formatting updated:
+  - time shown first
+  - date format now `TT.MM.JJJJ`
+
+### Log channel system (standardized + reduced noise)
+- Discord log forwarding now sends only important entries:
+  - always: `WARNING`/`ERROR`/`CRITICAL`
+  - selected `INFO` events (startup/sync/restore/backup/command-executed)
+  - noisy DB `INFO` is filtered
+- Log embeds unified:
+  - stable title/body/footer format
+  - compact message body
+  - source field always present
+  - server context included when available
+- Guild IDs in log message bodies are mapped to guild labels where possible.
+
+### Command usage audit logging
+- Every app-command interaction now logs:
+  - command path
+  - executing user
+  - target guild/server
+- Added sanitization to avoid multiline/injected log formatting from user/guild names.
+
+### Queue and config hardening
+- Added config key in `bot/config.py`:
+  - `LOG_FORWARD_QUEUE_MAX_SIZE` (default `1000`, validation `>= 0`)
+- Applied queue-size config and drop-oldest safety in:
+  - `bot/runtime.py`
+  - `bot/main.py`
+
+### Additional safety/performance hardening
+- `features/runtime_mixins/logging_background.py`:
+  - log channel resolution now retries with `fetch_channel(...)` fallback.
+  - forwarder re-resolves channel on demand instead of silently dropping all messages when channel object is missing.
+  - stale cleanup now computes `now` once per pass (hot-path improvement).
+  - integrity cleanup reuses precomputed open display-id sets per guild.
+- `features/runtime_mixins/events.py`:
+  - command-path parsing hardened against malformed interaction option types.
+- `db/repository.py`:
+  - `list_debug_cache(...)` index fast-path now returns deterministic order (sorted by `cache_key`) for stable behavior/debug output.
+
+### Tests added/updated in this phase
+- Added:
+  - `tests/test_phase3_command_usage_logging.py`
+- Updated:
+  - `tests/test_phase3_log_embed_formatting.py`
+  - `tests/test_phase3_guild_lifecycle_logging.py`
+  - `tests/test_phase3_config.py`
+  - `tests/test_phase3_debug_mirror.py`
+
+### Current verification snapshot (latest)
+- Focused test runs executed repeatedly (log, command usage, debug index, config safety).
+- Full validation currently green:
+  - `.venv/bin/python -m pytest -q` => `147 passed, 1 warning`
+  - `.venv/bin/pyright` => `0 errors, 0 warnings`
+  - `.venv/bin/python -m compileall -q bot commands views features services db utils tests` => passed
+  - `.venv/bin/python -m pip check` => `No broken requirements found.`
+- Known warning remains external dependency only:
+  - `discord.py` (`audioop` deprecation warning)
+
+### Reusable operational checklist
+When resuming in a new chat/session:
+1. Read `Chathistory.md` first.
+2. Run:
+   - `.venv/bin/python -m pytest -q`
+   - `.venv/bin/pyright`
+3. If command set changes, update both:
+   - `commands/runtime_commands.py`
+   - `services/startup_service.py` (`EXPECTED_SLASH_COMMANDS`)
+4. Keep Berlin-only time behavior intact (`utils/time_utils.py` as source of truth).

@@ -95,3 +95,20 @@ def test_upsert_debug_cache_reindexes_when_scope_changes(repo):
     assert len(new_scope) == 1
     assert int(new_scope[0].guild_id) == 2
     assert int(new_scope[0].raid_id or 0) == 22
+
+
+def test_list_debug_cache_returns_deterministic_order(repo):
+    keys = ["botmsg:z", "botmsg:a", "botmsg:m"]
+    for index, key in enumerate(keys):
+        repo.upsert_debug_cache(
+            cache_key=key,
+            kind="bot_message",
+            guild_id=1,
+            raid_id=10,
+            message_id=1000 + index,
+            payload_hash=sha256_text(str(index)),
+        )
+
+    rows = repo.list_debug_cache(kind="bot_message", guild_id=1, raid_id=10)
+
+    assert [row.cache_key for row in rows] == sorted(keys)

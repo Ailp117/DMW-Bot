@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Iterable
 
 from bot.config import BotConfig
@@ -21,6 +21,7 @@ from services.startup_service import (
     run_boot_smoke_checks,
 )
 from utils.text import contains_approved_keyword, contains_nanomon_keyword
+from utils.time_utils import berlin_now
 from db.repository import InMemoryRepository
 from db.models import REQUIRED_BOOT_TABLES
 
@@ -55,7 +56,10 @@ class BotApplication:
 
         self.boot_smoke_stats: BootSmokeStats | None = None
         self.self_test_state = SelfTestState()
-        self.log_forward_queue: asyncio.Queue[str] = asyncio.Queue()
+        queue_max_size = max(0, int(getattr(self.config, "log_forward_queue_max_size", 1000)))
+        self.log_forward_queue: asyncio.Queue[str] = (
+            asyncio.Queue(maxsize=queue_max_size) if queue_max_size > 0 else asyncio.Queue()
+        )
         self.pending_log_buffer: list[str] = []
         self.log_forwarder_active = False
 
@@ -146,7 +150,7 @@ class BotApplication:
             self.self_test_state.last_error = f"Unexpected commands: {', '.join(unexpected)}"
             raise RuntimeError(self.self_test_state.last_error)
 
-        self.self_test_state.last_ok_at = datetime.now(UTC)
+        self.self_test_state.last_ok_at = berlin_now()
         self.self_test_state.last_error = None
 
     async def cleanup_removed_guilds(self, *, connected_guild_ids: Iterable[int]) -> None:
@@ -196,13 +200,24 @@ class BotApplication:
             return
         normalized = message if len(message) <= 1800 else f"{message[:1797]}..."
         if self.log_forwarder_active:
-            self.log_forward_queue.put_nowait(normalized)
+            self._enqueue_log_forward_queue(normalized)
             return
         self.pending_log_buffer.append(normalized)
 
+    def _enqueue_log_forward_queue(self, message: str) -> None:
+        if self.log_forward_queue.full():
+            try:
+                self.log_forward_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            self.log_forward_queue.put_nowait(message)
+        except asyncio.QueueFull:
+            pass
+
     def flush_pending_logs(self) -> None:
         while self.pending_log_buffer:
-            self.log_forward_queue.put_nowait(self.pending_log_buffer.pop(0))
+            self._enqueue_log_forward_queue(self.pending_log_buffer.pop(0))
 
     async def close(self) -> None:
         await self.task_registry.cancel_all()

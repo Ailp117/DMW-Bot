@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import pytest
 
 from services.raid_service import create_raid_from_modal
@@ -47,3 +48,18 @@ def test_log_queue_buffers_before_ready(app):
 
     assert queued == ["one", "two"]
     assert app.pending_log_buffer == []
+
+
+def test_log_queue_drops_oldest_when_full(app):
+    app.log_forward_queue = asyncio.Queue(maxsize=2)
+    app.log_forwarder_active = True
+
+    app.enqueue_discord_log("one")
+    app.enqueue_discord_log("two")
+    app.enqueue_discord_log("three")
+
+    queued = []
+    while not app.log_forward_queue.empty():
+        queued.append(app.log_forward_queue.get_nowait())
+
+    assert queued == ["two", "three"]

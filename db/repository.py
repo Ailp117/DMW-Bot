@@ -609,18 +609,22 @@ class InMemoryRepository:
         guild_id: int | None = None,
         raid_id: int | None = None,
     ) -> List[DebugMirrorCacheRecord]:
+        def _rows_from_keys(keys: set[str]) -> List[DebugMirrorCacheRecord]:
+            # Keep deterministic order for stable debug output and tests.
+            return [self.debug_cache[key] for key in sorted(keys) if key in self.debug_cache]
+
         if kind is not None and guild_id is not None:
             normalized_guild = int(guild_id)
             if raid_id is not None:
                 normalized_raid = int(raid_id)
                 keys = self._debug_cache_keys_by_kind_guild_raid.get((kind, normalized_guild, normalized_raid), set())
-                return [self.debug_cache[key] for key in keys if key in self.debug_cache]
+                return _rows_from_keys(keys)
             keys = self._debug_cache_keys_by_kind_guild.get((kind, normalized_guild), set())
-            return [self.debug_cache[key] for key in keys if key in self.debug_cache]
+            return _rows_from_keys(keys)
 
         if kind is not None and guild_id is None and raid_id is None:
             keys = self._debug_cache_keys_by_kind.get(kind, set())
-            return [self.debug_cache[key] for key in keys if key in self.debug_cache]
+            return _rows_from_keys(keys)
 
         rows = list(self.debug_cache.values())
         if kind is not None:

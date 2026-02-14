@@ -103,7 +103,7 @@ class RuntimeStateCalendarMixin(RuntimeMixinBase):
             levelup_messages_enabled=True,
             nanomon_reply_enabled=True,
             approved_reply_enabled=True,
-            raid_reminder_enabled=False,
+            raid_reminder_enabled=True,
             message_xp_interval_seconds=max(1, int(self.config.message_xp_interval_seconds)),
             levelup_message_cooldown_seconds=max(1, int(self.config.levelup_message_cooldown_seconds)),
         )
@@ -215,8 +215,7 @@ class RuntimeStateCalendarMixin(RuntimeMixinBase):
         return f"{RAID_CALENDAR_MESSAGE_CACHE_PREFIX}:{int(guild_id)}"
 
     def _current_calendar_month_start(self) -> date:
-        timezone = _zoneinfo_for_name(DEFAULT_TIMEZONE_NAME)
-        return _month_start(datetime.now(timezone).date())
+        return _month_start(_berlin_now().date())
 
     def _get_raid_calendar_channel_id(self, guild_id: int) -> int | None:
         row = self.repo.get_debug_cache(self._raid_calendar_config_cache_key(guild_id))
@@ -326,8 +325,7 @@ class RuntimeStateCalendarMixin(RuntimeMixinBase):
         normalized_month = _month_start(month_start)
         month_days = _days_in_month(normalized_month)
         month_end = normalized_month + timedelta(days=month_days - 1)
-        timezone = _zoneinfo_for_name(DEFAULT_TIMEZONE_NAME)
-        today_local = datetime.now(timezone).date()
+        today_local = _berlin_now().date()
         open_raids = self.repo.list_open_raids(guild_id)
         entries = self._collect_calendar_entries(
             guild_id=guild_id,
@@ -384,7 +382,7 @@ class RuntimeStateCalendarMixin(RuntimeMixinBase):
                 f"Offene Raids gesamt: `{len(open_raids)}`"
             ),
             color=discord.Color.green(),
-            timestamp=datetime.now(UTC),
+            timestamp=_berlin_now(),
         )
         embed.add_field(name="Monatsansicht", value=grid_block, inline=False)
         if detail_lines:

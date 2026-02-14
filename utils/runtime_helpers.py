@@ -7,10 +7,11 @@ import logging
 import math
 import re
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
 from bot.discord_api import app_commands, discord
 from utils.leveling import xp_needed_for_level
+from utils.time_utils import BERLIN_TIMEZONE, DEFAULT_TIMEZONE_NAME, berlin_now, berlin_now_utc
 
 log = logging.getLogger("dmw.runtime")
 DEFAULT_PRIVILEGED_USER_ID = 403988960638009347
@@ -50,7 +51,6 @@ RAID_CALENDAR_GRID_ROWS = 5
 RAID_DATE_LOOKAHEAD_DAYS = 21
 RAID_DATE_CACHE_DAYS_MAX = 25
 INTEGRITY_CLEANUP_SLEEP_SECONDS = 15 * 60
-DEFAULT_TIMEZONE_NAME = "Europe/Berlin"
 USERNAME_SYNC_WORKER_SLEEP_SECONDS = 10 * 60
 USERNAME_SYNC_RESCAN_SECONDS = 12 * 60 * 60
 LOG_FORWARD_QUEUE_MAX_SIZE = 1000
@@ -59,7 +59,6 @@ PERSIST_FLUSH_RETRY_BASE_SECONDS = 0.1
 PRIVILEGED_ONLY_HELP_COMMANDS = frozenset(
     {
         "restart",
-        "restart_update",
         "remote_guilds",
         "remote_cancel_all_raids",
         "remote_raidlist",
@@ -388,23 +387,23 @@ def _month_label_de(value: date) -> str:
 
 
 def _normalize_timezone_name(value: str | None) -> str:
-    text = (value or "").strip()
-    if not text:
-        return DEFAULT_TIMEZONE_NAME
-    try:
-        ZoneInfo(text)
-        return text
-    except ZoneInfoNotFoundError:
-        return DEFAULT_TIMEZONE_NAME
+    # Time handling is locked to Berlin for the full bot runtime.
+    _ = value
+    return DEFAULT_TIMEZONE_NAME
 
 
 @lru_cache(maxsize=16)
 def _zoneinfo_for_name(value: str | None) -> ZoneInfo:
-    normalized = _normalize_timezone_name(value)
-    try:
-        return ZoneInfo(normalized)
-    except ZoneInfoNotFoundError:
-        return ZoneInfo(DEFAULT_TIMEZONE_NAME)
+    _ = value
+    return BERLIN_TIMEZONE
+
+
+def _berlin_now() -> datetime:
+    return berlin_now()
+
+
+def _utc_now() -> datetime:
+    return berlin_now_utc()
 
 
 def _upcoming_raid_date_labels(
@@ -412,9 +411,8 @@ def _upcoming_raid_date_labels(
     start_date: date | None = None,
     count: int = RAID_DATE_LOOKAHEAD_DAYS,
 ) -> list[str]:
-    timezone = _zoneinfo_for_name(DEFAULT_TIMEZONE_NAME)
     if start_date is None:
-        first = datetime.now(timezone).date()
+        first = _berlin_now().date()
     else:
         first = start_date
     total = max(1, min(RAID_DATE_CACHE_DAYS_MAX, int(count)))
@@ -570,6 +568,7 @@ __all__ = [
     "_parse_raid_date_from_label",
     "_parse_raid_time_label",
     "_raid_weekday_short",
+    "_berlin_now",
     "_render_xp_progress_bar",
     "_round_xp_for_display",
     "_safe_defer",
@@ -581,6 +580,7 @@ __all__ = [
     "_safe_send_initial",
     "_settings_embed",
     "_shift_month",
+    "_utc_now",
     "_upcoming_raid_date_labels",
     "_xp_progress_stats",
     "_zoneinfo_for_name",
