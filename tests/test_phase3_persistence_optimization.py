@@ -192,3 +192,6 @@ async def test_flush_batches_updates_by_column_set(config, repo):
     assert isinstance(params, list)
     assert len(params) == 2
     assert all("xp" in row and "pk_guild_id" in row and "pk_user_id" in row for row in params)
+    statement, _ = level_updates[0]
+    execution_options = dict(getattr(statement, "_execution_options", {}))
+    assert execution_options.get("synchronize_session") is False
