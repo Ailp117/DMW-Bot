@@ -106,15 +106,26 @@ class SessionManager:
         return self._engine
 
     def _install_sql_logging(self) -> None:
+        def _sql_debug_enabled() -> bool:
+            return log.isEnabledFor(logging.DEBUG)
+
         @event.listens_for(self._engine.sync_engine, "before_cursor_execute")
         def before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+            if not _sql_debug_enabled():
+                return
             context._query_started_at = time.perf_counter()
             log.debug("[to-db] SQL=%s params=%s", statement, _redact_sql_parameters(parameters))
 
         @event.listens_for(self._engine.sync_engine, "after_cursor_execute")
         def after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
-            elapsed_ms = (time.perf_counter() - context._query_started_at) * 1000
-            log.debug("[from-db] rows=%s took=%.2fms", cursor.rowcount, elapsed_ms)
+            if not _sql_debug_enabled():
+                return
+            started_at = getattr(context, "_query_started_at", None)
+            if isinstance(started_at, (int, float)):
+                elapsed_ms = (time.perf_counter() - started_at) * 1000
+                log.debug("[from-db] rows=%s took=%.2fms", cursor.rowcount, elapsed_ms)
+            else:
+                log.debug("[from-db] rows=%s", cursor.rowcount)
 
         @event.listens_for(self._engine.sync_engine, "handle_error")
         def on_sqlalchemy_error(exception_context):
