@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from utils.runtime_helpers import (
+    DEFAULT_TIMEZONE_NAME,
     DEFAULT_PRIVILEGED_USER_ID,
+    _berlin_now,
     _admin_or_privileged_check,
     _on_off,
     _safe_followup,
@@ -18,7 +19,6 @@ from services.admin_service import list_active_dungeons
 from services.backup_service import export_rows_to_sql
 from services.raid_service import build_raid_plan_defaults
 from services.settings_service import set_templates_enabled
-from services.update_service import pull_repo_update
 from views.raid_views import RaidDateSelectionView, SettingsView
 
 if TYPE_CHECKING:
@@ -89,9 +89,12 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
         open_raids = bot.repo.list_open_raids(interaction.guild.id)
         self_test_ok = bot.last_self_test_ok_at.isoformat() if bot.last_self_test_ok_at else "-"
         self_test_err = bot.last_self_test_error or "-"
+        now_local = _berlin_now()
         await bot._reply(
             interaction,
             (
+                f"Bot Uhrzeit ({DEFAULT_TIMEZONE_NAME}): `{now_local.strftime('%H:%M:%S')}`\n"
+                f"Bot Datum ({DEFAULT_TIMEZONE_NAME}): `{now_local.strftime('%d.%m.%Y')}`\n"
                 f"Guild: **{interaction.guild.name}**\n"
                 f"Privileged User ID (configured): `{int(getattr(bot.config, 'privileged_user_id', DEFAULT_PRIVILEGED_USER_ID))}`\n"
                 f"Level Persist Interval (s): `{int(bot.config.level_persist_interval_seconds)}`\n"
@@ -163,36 +166,6 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
         if not await _require_privileged(interaction):
             return
         await bot._reply(interaction, "Neustart wird eingeleitet.", ephemeral=True)
-        await bot.close()
-
-    @bot.tree.command(
-        name="restart_update",
-        description="Fuehrt `git pull --ff-only` aus und startet den Bot neu (privileged).",
-    )
-    async def restart_update_cmd(interaction):
-        if not await _require_privileged(interaction):
-            return
-
-        await bot._defer(interaction, ephemeral=True)
-        result = await asyncio.to_thread(
-            pull_repo_update,
-            repo_dir=Path.cwd(),
-            timeout_seconds=60,
-        )
-        if not result.ok:
-            await _safe_followup(
-                interaction,
-                f"Update fehlgeschlagen. Kein Neustart.\n{result.detail}",
-                ephemeral=True,
-            )
-            return
-
-        state = "Neue Commits eingespielt." if result.changed else "Kein neuer Commit gefunden."
-        await _safe_followup(
-            interaction,
-            f"{state}\n{result.detail}\nNeustart wird eingeleitet.",
-            ephemeral=True,
-        )
         await bot.close()
 
     @bot.tree.command(name="dungeonlist", description="Aktive Dungeons")

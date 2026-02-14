@@ -45,6 +45,7 @@ class BotConfig:
     raidlist_debug_channel_id: int
     memberlist_debug_channel_id: int
     discord_log_level: str
+    log_forward_queue_max_size: int
 
 
     def validate(self) -> None:
@@ -69,6 +70,8 @@ class BotConfig:
         if self.discord_log_level not in VALID_DISCORD_LOG_LEVELS:
             valid = ", ".join(sorted(VALID_DISCORD_LOG_LEVELS))
             raise ValueError(f"DISCORD_LOG_LEVEL must be one of: {valid}")
+        if self.log_forward_queue_max_size < 0:
+            raise ValueError("LOG_FORWARD_QUEUE_MAX_SIZE must be >= 0")
 
 
 def load_config() -> BotConfig:
@@ -88,6 +91,7 @@ def load_config() -> BotConfig:
         raidlist_debug_channel_id=env_int("RAIDLIST_DEBUG_CHANNEL_ID", default=0),
         memberlist_debug_channel_id=env_int("MEMBERLIST_DEBUG_CHANNEL_ID", default=0),
         discord_log_level=os.getenv("DISCORD_LOG_LEVEL", "INFO").strip().upper(),
+        log_forward_queue_max_size=env_int("LOG_FORWARD_QUEUE_MAX_SIZE", default=1000),
     )
     cfg.validate()
     return cfg

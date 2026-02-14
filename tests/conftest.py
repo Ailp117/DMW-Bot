@@ -25,6 +25,7 @@ def config() -> BotConfig:
         raidlist_debug_channel_id=0,
         memberlist_debug_channel_id=0,
         discord_log_level="DEBUG",
+        log_forward_queue_max_size=1000,
     )
 
 

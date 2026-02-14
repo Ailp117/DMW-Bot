@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import asdict
 from datetime import UTC, date, datetime, timedelta
 import inspect
+import json
 import logging
 from pathlib import Path
 import re
@@ -332,6 +333,7 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
         guild_id: int,
         raid_id: int | None,
         content: str,
+        embed: Any | None = None,
     ) -> None:
         if debug_channel_id <= 0:
             return
@@ -340,7 +342,13 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             return
 
         payload = content if len(content) <= 1900 else f"{content[:1897]}..."
-        payload_hash = sha256_text(payload)
+        embed_payload = ""
+        if embed is not None:
+            try:
+                embed_payload = json.dumps(embed.to_dict(), sort_keys=True, ensure_ascii=False)
+            except Exception:
+                embed_payload = repr(embed)
+        payload_hash = sha256_text(f"{payload}\n{embed_payload}" if embed_payload else payload)
         cached = self.repo.get_debug_cache(cache_key)
 
         if cached is not None and cached.payload_hash == payload_hash and cached.message_id:
@@ -351,7 +359,8 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
         if cached is not None and cached.message_id:
             existing = await _runtime_mod()._safe_fetch_message(channel, cached.message_id)
             if existing is not None:
-                edited = await _runtime_mod()._safe_edit_message(existing, content=payload)
+                edit_kwargs = {"embed": embed, "content": None} if embed is not None else {"content": payload}
+                edited = await _runtime_mod()._safe_edit_message(existing, **edit_kwargs)
                 if edited:
                     self.repo.upsert_debug_cache(
                         cache_key=cache_key,
@@ -363,7 +372,8 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                     )
                     return
 
-        posted = await self._send_channel_message(channel, content=payload)
+        post_kwargs = {"embed": embed, "content": None} if embed is not None else {"content": payload}
+        posted = await self._send_channel_message(channel, **post_kwargs)
         if posted is None:
             return
         self.repo.upsert_debug_cache(
@@ -374,6 +384,124 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             message_id=posted.id,
             payload_hash=payload_hash,
         )
+
+    @staticmethod
+    def _clone_embed(embed: Any):
+        try:
+            return discord.Embed.from_dict(embed.to_dict())
+        except Exception:
+            return embed
+
+    def _build_raidlist_debug_embed(
+        self,
+        *,
+        base_embed: Any,
+        guild_id: int,
+        payload_hash: str,
+        debug_lines: list[str],
+    ):
+        debug_embed = self._clone_embed(base_embed)
+        base_title = str(getattr(debug_embed, "title", "") or "📌 Raidliste")
+        if "DEBUG" not in base_title.upper():
+            debug_embed.title = f"{base_title} • DEBUG"
+        debug_embed.color = discord.Color.orange()
+
+        debug_meta = "\n".join(
+            [
+                f"Guild ID: `{int(guild_id)}`",
+                f"Payload: `{payload_hash[:16]}`",
+                f"Eintraege: `{len(debug_lines)}`",
+            ]
+        )
+
+        details = debug_lines or ["- Keine Raidlist-Daten."]
+        details_text = "\n".join(details[:10])
+        if len(details) > 10:
+            details_text += f"\n... +{len(details) - 10} weitere"
+        if len(details_text) > 1024:
+            details_text = f"{details_text[:1021]}..."
+
+        field_count = len(getattr(debug_embed, "fields", []))
+        if field_count <= 23:
+            debug_embed.add_field(name="🛠️ Debug", value=debug_meta, inline=False)
+            debug_embed.add_field(name="Debug Details", value=details_text, inline=False)
+        elif field_count == 24:
+            merged = f"{debug_meta}\n{details_text}"
+            if len(merged) > 1024:
+                merged = f"{merged[:1021]}..."
+            debug_embed.add_field(name="🛠️ Debug", value=merged, inline=False)
+        else:
+            description = str(getattr(debug_embed, "description", "") or "").strip()
+            debug_line = f"[DEBUG guild={int(guild_id)} payload={payload_hash[:16]} lines={len(debug_lines)}]"
+            merged_description = f"{description}\n{debug_line}" if description else debug_line
+            if len(merged_description) > 4096:
+                merged_description = f"{merged_description[:4093]}..."
+            debug_embed.description = merged_description
+
+        footer_text = str(getattr(getattr(debug_embed, "footer", None), "text", "") or "").strip()
+        if "DEBUG" not in footer_text.upper():
+            debug_embed.set_footer(
+                text=f"{footer_text} | DEBUG Mirror".strip(" |")
+                if footer_text
+                else "DEBUG Mirror",
+            )
+        return debug_embed
+
+    def _build_memberlist_debug_embed(
+        self,
+        *,
+        raid: RaidRecord,
+        qualified_slots: dict[tuple[str, str], list[int]],
+        created: int,
+        updated: int,
+        deleted: int,
+        debug_lines: list[str],
+    ):
+        if qualified_slots:
+            slot_key = sorted(qualified_slots.keys(), key=lambda item: (item[0], item[1]))[0]
+            debug_embed = self._memberlist_slot_embed(
+                raid,
+                day_label=slot_key[0],
+                time_label=slot_key[1],
+                users=qualified_slots[slot_key],
+            )
+            base_title = str(getattr(debug_embed, "title", "") or "✅ Teilnehmerliste")
+            if "DEBUG" not in base_title.upper():
+                debug_embed.title = f"{base_title} • DEBUG"
+            debug_embed.color = discord.Color.orange()
+        else:
+            guild_name = self._guild_display_name(raid.guild_id)
+            debug_embed = discord.Embed(
+                title=f"✅ Teilnehmerliste: {raid.dungeon} • DEBUG",
+                description=f"Server: **{guild_name}**\nRaid: `{raid.display_id}`",
+                color=discord.Color.orange(),
+            )
+
+        debug_meta = "\n".join(
+            [
+                f"Raid ID: `{int(raid.display_id or 0)}`",
+                f"Qualifizierte Slots: `{len(qualified_slots)}`",
+                f"Sync: `created={created} updated={updated} deleted={deleted}`",
+            ]
+        )
+        debug_embed.add_field(name="🛠️ Debug", value=debug_meta, inline=False)
+
+        details = debug_lines or ["- Keine qualifizierten Slots."]
+        details_text = "\n".join(details[:10])
+        if len(details) > 10:
+            details_text += f"\n... +{len(details) - 10} weitere"
+        if len(details_text) > 1024:
+            details_text = f"{details_text[:1021]}..."
+        debug_embed.add_field(name="Debug Details", value=details_text, inline=False)
+
+        footer_text = str(getattr(getattr(debug_embed, "footer", None), "text", "") or "").strip()
+        if "DEBUG" not in footer_text.upper():
+            debug_embed.set_footer(
+                text=f"{footer_text} | DEBUG Mirror".strip(" |")
+                if footer_text
+                else "DEBUG Mirror",
+            )
+        return debug_embed
 
     def _planner_embed(self, raid: RaidRecord):
         counts = planner_counts(self.repo, raid.id)
@@ -966,7 +1094,11 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                 slot_role = await self._ensure_slot_temp_role(raid, day_label=day_label, time_label=time_label)
                 if slot_role is not None:
                     await self._sync_slot_role_members(raid, role=slot_role, user_ids=users)
-                    content = f"🔔 {slot_role.mention}"
+                    role_name = (getattr(slot_role, "name", "") or "").strip()
+                    if role_name:
+                        content = f"🔔 Erinnerungsrolle aktiv: `{role_name}` (Ping erst beim Raid-Reminder)."
+                    else:
+                        content = "🔔 Erinnerungsrolle aktiv (Ping erst beim Raid-Reminder)."
             debug_lines.append(f"- {day_label} {time_label}: {', '.join(f'<@{u}>' for u in users)}")
             row = existing_rows.get((day_label, time_label))
             old_msg_for_recreate = None
@@ -1043,6 +1175,14 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             lines=debug_lines,
             empty_text="- Keine qualifizierten Slots.",
         )
+        debug_embed = self._build_memberlist_debug_embed(
+            raid=raid,
+            qualified_slots=qualified_slots,
+            created=created,
+            updated=updated,
+            deleted=deleted,
+            debug_lines=debug_lines,
+        )
         await self._mirror_debug_payload(
             debug_channel_id=int(self.config.memberlist_debug_channel_id),
             cache_key=f"memberlist:{raid.guild_id}:{raid.id}",
@@ -1050,6 +1190,7 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             guild_id=raid.guild_id,
             raid_id=raid.id,
             content=debug_body,
+            embed=debug_embed,
         )
 
         return (created, updated, deleted)
@@ -1067,7 +1208,7 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
         guild_name: str,
         raids: list[RaidRecord],
     ) -> tuple[Any, str, list[str]]:
-        now_utc = datetime.now(UTC)
+        now_utc = _utc_now()
         embed = discord.Embed(
             title=f"📌 Raidliste: {guild_name}",
             color=discord.Color.blurple(),
@@ -1135,7 +1276,6 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             field_name = f"#{raid.display_id} • {raid.dungeon}"
             field_value = "\n".join(
                 [
-                    f"👤 <@{raid.creator_id}>",
                     f"👥 Min `{required_label}` • ✅ Slots `{len(qualified_slots)}`",
                     f"🗳️ Vollständig abgestimmt `{complete_voters}`",
                     f"🕰️ Zeitzone `{timezone_name}`",
@@ -1206,6 +1346,12 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             lines=debug_lines,
             empty_text="- Keine Raidlist-Daten.",
         )
+        debug_embed = self._build_raidlist_debug_embed(
+            base_embed=embed,
+            guild_id=guild_id,
+            payload_hash=payload_hash,
+            debug_lines=debug_lines,
+        )
 
         if not force and self._raidlist_hash_by_guild.get(guild_id) == payload_hash:
             await self._mirror_debug_payload(
@@ -1215,6 +1361,7 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                 guild_id=guild_id,
                 raid_id=None,
                 content=debug_payload,
+                embed=debug_embed,
             )
             return False
 
@@ -1234,6 +1381,7 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                         guild_id=guild_id,
                         raid_id=None,
                         content=debug_payload,
+                        embed=debug_embed,
                     )
                     return True
 
@@ -1249,6 +1397,7 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             guild_id=guild_id,
             raid_id=None,
             content=debug_payload,
+            embed=debug_embed,
         )
         return True
 

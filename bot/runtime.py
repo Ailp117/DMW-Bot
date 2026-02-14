@@ -49,7 +49,10 @@ class RewriteDiscordBot(
         self.leveling_service = LevelingService()
 
         self.log_channel = None
-        self.log_forward_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=LOG_FORWARD_QUEUE_MAX_SIZE)
+        queue_max_size = max(0, int(getattr(self.config, "log_forward_queue_max_size", LOG_FORWARD_QUEUE_MAX_SIZE)))
+        self.log_forward_queue: asyncio.Queue[str] = (
+            asyncio.Queue(maxsize=queue_max_size) if queue_max_size > 0 else asyncio.Queue()
+        )
         self.pending_log_buffer: deque[str] = deque(maxlen=250)
         self.log_forwarder_active = False
         self.last_self_test_ok_at: datetime | None = None

@@ -93,6 +93,7 @@ async def test_run_raid_reminders_once_sends_only_once_per_slot(repo):
     assert first == 1
     assert second == 0
     assert len(sent_messages) == 1
+    assert "<@&2026-02-13 (Fr):20:00>" in sent_messages[0]
     cache_key = RewriteDiscordBot._raid_reminder_cache_key(raid.id, day_label, time_label)
     cache_row = repo.get_debug_cache(cache_key)
     assert cache_row is not None
@@ -224,6 +225,7 @@ async def test_sync_memberlists_uses_unique_slot_roles_per_slot(repo):
     assert updated == 0
     assert deleted == 0
     assert set(ensured_slots) == {(day_one, time_label), (day_two, time_label)}
-    assert any(f"<@&{day_one}-{time_label}>" in payload for payload in sent_payloads)
-    assert any(f"<@&{day_two}-{time_label}>" in payload for payload in sent_payloads)
+    assert all(f"<@&{day_one}-{time_label}>" not in payload for payload in sent_payloads)
+    assert all(f"<@&{day_two}-{time_label}>" not in payload for payload in sent_payloads)
+    assert all("Ping erst beim Raid-Reminder" in payload for payload in sent_payloads)
     assert all(embed is not None for embed in sent_embeds)

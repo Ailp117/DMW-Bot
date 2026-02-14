@@ -45,6 +45,7 @@ def test_build_raidlist_embed_contains_structured_raid_data(repo):
     assert len(embed.fields) == 1
     assert "Zeitzone `Europe/Berlin`" in (embed.fields[0].value or "")
     assert "https://discord.com/channels/1/11/5151" in (embed.fields[0].value or "")
+    assert "<@100>" not in (embed.fields[0].value or "")
     assert payload_hash
     assert any("Raid 1" in line for line in debug_lines)
 

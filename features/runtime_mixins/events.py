@@ -26,6 +26,90 @@ if TYPE_CHECKING:
 
 
 class RuntimeEventsMixin(RuntimeMixinBase):
+    @staticmethod
+    def _single_line_text(value: Any, *, fallback: str = "unknown", max_len: int = 120) -> str:
+        text = " ".join(str(value or "").split()).strip()
+        if not text:
+            return fallback
+        if len(text) <= max_len:
+            return text
+        return f"{text[: max_len - 3]}..."
+
+    @staticmethod
+    def _interaction_command_path(interaction: Any) -> str:
+        command_obj = getattr(interaction, "command", None)
+        qualified = str(getattr(command_obj, "qualified_name", "") or "").strip()
+        if qualified:
+            return qualified
+
+        data = getattr(interaction, "data", None)
+        if not isinstance(data, dict):
+            return "unknown"
+
+        root = str(data.get("name", "") or "").strip()
+        if not root:
+            return "unknown"
+
+        parts = [root]
+        options = data.get("options")
+        while isinstance(options, list) and options:
+            def _nested_type(item: Any) -> int:
+                if not isinstance(item, dict):
+                    return 0
+                raw = item.get("type", 0)
+                try:
+                    return int(raw or 0)
+                except (TypeError, ValueError, OverflowError):
+                    return 0
+
+            nested = next(
+                (
+                    item
+                    for item in options
+                    if isinstance(item, dict) and _nested_type(item) in {1, 2}
+                ),
+                None,
+            )
+            if nested is None:
+                break
+            nested_name = str(nested.get("name", "") or "").strip()
+            if nested_name:
+                parts.append(nested_name)
+            options = nested.get("options")
+        return " ".join(parts)
+
+    def _format_command_usage_log(self, interaction: Any) -> str:
+        command_path = self._single_line_text(self._interaction_command_path(interaction), fallback="unknown", max_len=180)
+
+        actor = getattr(interaction, "user", None)
+        actor_id = int(getattr(actor, "id", 0) or 0)
+        actor_name_raw = (_member_name(actor) if actor is not None else "") or (
+            f"User {actor_id}" if actor_id > 0 else "Unbekannt"
+        )
+        actor_name = self._single_line_text(actor_name_raw, fallback="Unbekannt", max_len=120)
+
+        guild = getattr(interaction, "guild", None)
+        guild_id = int(getattr(guild, "id", 0) or 0)
+        if guild_id > 0:
+            guild_name_raw = (getattr(guild, "name", "") or "").strip() or self._guild_display_name(guild_id)
+        else:
+            guild_name_raw = "DM"
+        guild_name = self._single_line_text(guild_name_raw, fallback="DM", max_len=120)
+
+        return (
+            f"Command executed: command=/{command_path} "
+            f"user={actor_name} ({actor_id if actor_id > 0 else '-'}) "
+            f"guild={guild_name} guild_id={guild_id}"
+        )
+
+    async def on_interaction(self, interaction) -> None:
+        try:
+            if getattr(interaction, "type", None) == discord.InteractionType.application_command:
+                log.info("%s", self._format_command_usage_log(interaction))
+        except Exception:
+            log.exception("Command usage logging failed")
+        await discord.Client.on_interaction(self, interaction)
+
     async def setup_hook(self) -> None:
         if not self._state_loaded:
             await self._bootstrap_repository()
@@ -226,7 +310,7 @@ class RuntimeEventsMixin(RuntimeMixinBase):
 
         guild_feature_settings = self._get_guild_feature_settings(message.guild.id) if message.guild is not None else None
         if guild_feature_settings is not None:
-            now = datetime.now(UTC)
+            now = _utc_now()
             is_command_message = self._is_registered_command_message(getattr(message, "content", None))
             if guild_feature_settings.leveling_enabled and not is_command_message:
                 async with self._state_lock:
@@ -300,7 +384,7 @@ class RuntimeEventsMixin(RuntimeMixinBase):
         if getattr(after, "channel", None) is None:
             self.leveling_service.on_voice_disconnect(guild.id, member.id)
         elif getattr(before, "channel", None) is None:
-            self.leveling_service.on_voice_connect(guild.id, member.id, datetime.now(UTC))
+            self.leveling_service.on_voice_connect(guild.id, member.id, _utc_now())
 
     async def _execute_console_command(self, message) -> bool:
         raw = (getattr(message, "content", "") or "").strip()
