@@ -17,7 +17,7 @@ def _create_raid(repo, *, guild_id: int, planner_channel_id: int, participants_c
         planner_channel_id=planner_channel_id,
         creator_id=100,
         dungeon_name="Nanos",
-        days_input="Mon, Tue",
+        days_input="14.02.2026, 15.02.2026",
         times_input="20:00, 21:00",
         min_players_input="1",
         message_id=message_id,
@@ -51,23 +51,23 @@ def test_cancel_open_raids_bulk_cascade_keeps_other_guild_data(repo):
         message_id=6201,
     )
 
-    toggle_vote(repo, raid_id=raid_g1_a, kind="day", option_label="Mon", user_id=200)
+    toggle_vote(repo, raid_id=raid_g1_a, kind="day", option_label="14.02.2026", user_id=200)
     toggle_vote(repo, raid_id=raid_g1_a, kind="time", option_label="20:00", user_id=200)
-    toggle_vote(repo, raid_id=raid_g1_b, kind="day", option_label="Tue", user_id=201)
+    toggle_vote(repo, raid_id=raid_g1_b, kind="day", option_label="15.02.2026", user_id=201)
     toggle_vote(repo, raid_id=raid_g1_b, kind="time", option_label="21:00", user_id=201)
-    toggle_vote(repo, raid_id=raid_g2, kind="day", option_label="Mon", user_id=300)
+    toggle_vote(repo, raid_id=raid_g2, kind="day", option_label="14.02.2026", user_id=300)
     toggle_vote(repo, raid_id=raid_g2, kind="time", option_label="20:00", user_id=300)
 
     repo.upsert_posted_slot(
         raid_id=raid_g1_a,
-        day_label="Mon",
+        day_label="14.02.2026",
         time_label="20:00",
         channel_id=22,
         message_id=9101,
     )
     repo.upsert_posted_slot(
         raid_id=raid_g2,
-        day_label="Mon",
+        day_label="14.02.2026",
         time_label="20:00",
         channel_id=222,
         message_id=9201,
@@ -86,10 +86,10 @@ def test_cancel_open_raids_bulk_cascade_keeps_other_guild_data(repo):
     assert all(row.raid_id in remaining_raid_ids for row in repo.raid_posted_slots.values())
 
     # Vote index must remain consistent after bulk cascade.
-    toggle_vote(repo, raid_id=raid_g2, kind="day", option_label="Mon", user_id=300)
-    assert all(row.user_id != 300 or row.option_label != "Mon" for row in repo.raid_votes.values())
-    toggle_vote(repo, raid_id=raid_g2, kind="day", option_label="Mon", user_id=300)
-    assert any(row.user_id == 300 and row.option_label == "Mon" for row in repo.raid_votes.values())
+    toggle_vote(repo, raid_id=raid_g2, kind="day", option_label="14.02.2026", user_id=300)
+    assert all(row.user_id != 300 or row.option_label != "14.02.2026" for row in repo.raid_votes.values())
+    toggle_vote(repo, raid_id=raid_g2, kind="day", option_label="14.02.2026", user_id=300)
+    assert any(row.user_id == 300 and row.option_label == "14.02.2026" for row in repo.raid_votes.values())
 
 
 def test_purge_guild_data_bulk_cascade_keeps_other_guild_votes_working(repo):
@@ -110,9 +110,9 @@ def test_purge_guild_data_bulk_cascade_keeps_other_guild_votes_working(repo):
         message_id=6302,
     )
 
-    toggle_vote(repo, raid_id=raid_g1, kind="day", option_label="Mon", user_id=200)
+    toggle_vote(repo, raid_id=raid_g1, kind="day", option_label="14.02.2026", user_id=200)
     toggle_vote(repo, raid_id=raid_g1, kind="time", option_label="20:00", user_id=200)
-    toggle_vote(repo, raid_id=raid_g2, kind="day", option_label="Tue", user_id=300)
+    toggle_vote(repo, raid_id=raid_g2, kind="day", option_label="15.02.2026", user_id=300)
     toggle_vote(repo, raid_id=raid_g2, kind="time", option_label="21:00", user_id=300)
 
     repo.get_or_create_user_level(1, 5001, "Alpha")
@@ -126,7 +126,7 @@ def test_purge_guild_data_bulk_cascade_keeps_other_guild_votes_working(repo):
     assert repo.get_raid(raid_g1) is None
     assert repo.get_raid(raid_g2) is not None
 
-    toggle_vote(repo, raid_id=raid_g2, kind="day", option_label="Tue", user_id=300)
-    assert all(not (row.raid_id == raid_g2 and row.kind == "day" and row.option_label == "Tue" and row.user_id == 300) for row in repo.raid_votes.values())
-    toggle_vote(repo, raid_id=raid_g2, kind="day", option_label="Tue", user_id=300)
-    assert any(row.raid_id == raid_g2 and row.kind == "day" and row.option_label == "Tue" and row.user_id == 300 for row in repo.raid_votes.values())
+    toggle_vote(repo, raid_id=raid_g2, kind="day", option_label="15.02.2026", user_id=300)
+    assert all(not (row.raid_id == raid_g2 and row.kind == "day" and row.option_label == "15.02.2026" and row.user_id == 300) for row in repo.raid_votes.values())
+    toggle_vote(repo, raid_id=raid_g2, kind="day", option_label="15.02.2026", user_id=300)
+    assert any(row.raid_id == raid_g2 and row.kind == "day" and row.option_label == "15.02.2026" and row.user_id == 300 for row in repo.raid_votes.values())

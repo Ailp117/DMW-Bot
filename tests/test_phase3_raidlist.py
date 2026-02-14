@@ -24,7 +24,7 @@ def test_raidlist_render_contains_open_raids(repo):
         planner_channel_id=11,
         creator_id=100,
         dungeon_name="Nanos",
-        days_input="Mon",
+        days_input="14.02.2026",
         times_input="20:00",
         min_players_input="2",
         message_id=5400,
@@ -68,7 +68,7 @@ async def test_debounced_raidlist_refresh_persists_state():
 
     async def fake_persist(*, dirty_tables=None):
         calls.append(("persist",))
-        assert dirty_tables == {"settings", "debug_cache"}
+        assert dirty_tables == {"settings", "debug_cache", "raids", "raid_posted_slots"}
         return True
 
     bot._refresh_raidlist_for_guild = fake_refresh

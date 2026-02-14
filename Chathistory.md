@@ -662,3 +662,200 @@ When resuming in a new chat/session:
    - `commands/runtime_commands.py`
    - `services/startup_service.py` (`EXPECTED_SLASH_COMMANDS`)
 4. Keep Berlin-only time behavior intact (`utils/time_utils.py` as source of truth).
+
+## Incremental updates (2026-02-14, latest)
+
+### Planner persistence + raid/memberlist persistence hardening
+- Runtime planner refresh now re-registers the persistent vote view even when an existing planner message is edited (not only on newly posted planner messages).
+- If a fetched existing planner message has a different message id than the stored raid row, the raid row is corrected in-memory before persist.
+- Debounced raidlist refresh persistence now also flushes raid + posted-slot state to DB:
+  - dirty table hint set expanded from `{"settings", "debug_cache"}` to
+    `{"settings", "debug_cache", "raids", "raid_posted_slots"}`.
+- Purpose of this change set:
+  - prevent planner vote view registration gaps after restart
+  - reduce risk that planner/slot message-id updates stay only in memory when refresh paths are debounced
+  - improve restart consistency for planner/memberlist/raidlist references
+
+### Tests added/updated for this pass
+- Added:
+  - `tests/test_phase3_planner_persistence.py`
+    - verifies planner refresh re-registers persistent view on existing message
+    - verifies stored planner message id is corrected when fetched message id differs
+- Updated:
+  - `tests/test_phase3_raidlist.py`
+    - updated expected dirty-table hints for debounced raidlist persisted path
+
+### Verification snapshot after this pass
+- Focused tests:
+  - `.venv/bin/python -m pytest -q tests/test_phase3_planner_persistence.py tests/test_phase3_raidlist.py tests/test_phase3_memberlist_restore_recreate.py`
+    => `8 passed, 1 warning`
+- Full suite:
+  - `.venv/bin/python -m pytest -q` => `151 passed, 1 warning in 0.59s`
+- Static typing:
+  - `.venv/bin/pyright` => `0 errors, 0 warnings, 0 informations`
+
+## Incremental updates (2026-02-14, latest pass 2)
+
+### Memberlist orphan cleanup hardening
+- Added runtime cleanup path for stale/orphan participant list messages during recreate restore flow:
+  - new helper detection for memberlist messages tied to a specific raid display id.
+  - new indexed cleanup routine that deletes orphaned memberlist messages in participants channel when they are no longer part of current posted-slot state.
+  - cleanup also clears bot-message/debug references for removed or missing orphan messages.
+- Integrated into `_sync_memberlist_messages_for_raid(..., recreate_existing=True)` so restart-recreate now removes stale leftovers more reliably.
+
+### Tests added/updated in this pass
+- Updated:
+  - `tests/test_phase3_memberlist_restore_recreate.py`
+    - added regression test for orphan indexed memberlist cleanup in recreate mode.
+
+### Verification snapshot after pass 2
+- Focused tests:
+  - `.venv/bin/python -m pytest -q tests/test_phase3_memberlist_restore_recreate.py tests/test_phase3_planner_persistence.py tests/test_phase3_raidlist.py`
+    => `9 passed, 1 warning`
+- Full suite:
+  - `.venv/bin/python -m pytest -q` => `152 passed, 1 warning in 0.62s`
+- Static typing:
+  - `.venv/bin/pyright` => `0 errors, 0 warnings, 0 informations`
+- Compile:
+  - `.venv/bin/python -m compileall -q bot commands views features services db utils tests` => passed
+
+## Incremental updates (2026-02-14, latest pass 3)
+
+### Debug data removal from raid/memberlist flows
+- User request implemented: remove debug data emission from raidlist and participant list update flows.
+- Applied in `features/runtime_mixins/raid_ops.py`:
+  - removed memberlist debug mirror publishing from `_sync_memberlist_messages_for_raid(...)`.
+  - removed raidlist debug mirror publishing from `_refresh_raidlist_for_guild(...)` (all branches).
+  - raidlist/memberlist primary messages remain unchanged functionally; only debug mirror output is suppressed for these two flows.
+
+### Tests updated for this behavior change
+- Updated `tests/test_phase3_debug_formatting.py`:
+  - raidlist test now verifies no debug payload emission.
+  - memberlist test now verifies no debug payload emission.
+
+### Verification snapshot after pass 3
+- Focused tests:
+  - `.venv/bin/python -m pytest -q tests/test_phase3_debug_formatting.py tests/test_phase3_raidlist_embed.py tests/test_phase3_memberlist_restore_recreate.py`
+    => `8 passed, 1 warning`
+- Full suite:
+  - `.venv/bin/python -m pytest -q` => `152 passed, 1 warning in 0.58s`
+- Static typing:
+  - `.venv/bin/pyright` => `0 errors, 0 warnings, 0 informations`
+- Compile:
+  - `.venv/bin/python -m compileall -q bot commands views features services db utils tests` => passed
+
+## Incremental updates (2026-02-14, latest pass 4)
+
+### Raid planner date format + time persistence hardening
+- Planner date label format switched to German date style:
+  - `_format_raid_date_label(...)` now outputs `TT.MM.JJJJ` (no ISO weekday suffix).
+  - This directly affects date choices shown in the `/raidplan` date selection UI.
+- Default-day resolution in `RaidDateSelectionView` made format-agnostic:
+  - mapping now resolves by parsed `date` objects instead of ISO-string slicing.
+  - keeps compatibility for legacy template/default values while supporting new `TT.MM.JJJJ` labels.
+- `create_raid_from_modal(...)` now enforces canonical time storage for DB/reminder paths:
+  - added strict time normalization helper in `services/raid_service.py`.
+  - accepted input formats: `H:MM`, `HH:MM`, `H.MM`, `HH.MM` (normalized to `HH:MM`).
+  - invalid time values now raise `ValueError("Time values must use HH:MM")`.
+  - normalized times are what gets written to `raid_options` (`kind="time"`), so reminder lookup/parsing uses stable DB values.
+
+### Tests added/updated for this pass
+- Updated:
+  - `tests/test_phase3_raid_creation.py`
+    - verifies time normalization persisted to DB (`07:05`, `19:30`).
+    - verifies invalid time strings are rejected.
+  - `tests/test_phase3_raidplan.py`
+    - verifies upcoming planner date labels use `TT.MM.JJJJ`.
+
+### Verification snapshot after pass 4
+- Focused tests:
+  - `.venv/bin/python -m pytest -q tests/test_phase3_raidplan.py tests/test_phase3_raid_creation.py tests/test_phase3_raid_reminder_and_roles.py tests/test_phase3_raid_calendar.py`
+    => `18 passed, 1 warning`
+- Full suite:
+  - `.venv/bin/python -m pytest -q` => `155 passed, 1 warning in 0.62s`
+- Static typing:
+  - `.venv/bin/pyright` => `0 errors, 0 warnings, 0 informations`
+- Compile:
+  - `.venv/bin/python -m compileall -q bot commands views features services db utils tests` => passed
+
+## Incremental updates (2026-02-14, latest pass 5)
+
+### Raid planner day policy hardening (date-only)
+- Enforced strict day input policy for raid creation:
+  - `services/raid_service.py` now normalizes/validates day labels via `_normalize_day_labels(...)`.
+  - accepted day format is now only `TT.MM.JJJJ`.
+  - weekday-style labels (`Mo`, `Di`, `Mon`, etc.) are rejected with:
+    - `ValueError("Day values must use TT.MM.JJJJ")`.
+- Planner default-day resolution tightened in `views/raid_views.py`:
+  - removed weekday-alias fallback mapping (`Mo/Di/...` -> next matching weekday date).
+  - defaults now resolve only by exact label match or parsed date match.
+  - result: raid planner no longer accepts weekday names as day values.
+
+### Test alignment for date-only day labels
+- Updated phase3 tests that previously used weekday labels (`Mon/Tue/Wed` and ISO+weekday variants) to canonical date labels (`TT.MM.JJJJ`).
+- Added explicit rejection coverage:
+  - `tests/test_phase3_raid_creation.py`
+    - `test_modal_validation_rejects_weekday_day_values`.
+
+### Verification snapshot after pass 5
+- Focused tests:
+  - `.venv/bin/python -m pytest -q tests/test_phase3_raid_creation.py tests/test_phase3_voting.py tests/test_phase3_memberlist.py tests/test_phase3_participation_counter.py tests/test_phase3_raid_reminder_and_roles.py tests/test_phase3_raid_calendar.py tests/test_phase3_raidlist_embed.py tests/test_phase3_debug_formatting.py tests/test_phase3_memberlist_restore_recreate.py tests/test_phase3_repository_cascade.py tests/test_phase3_restart_persistence.py tests/test_phase3_templates.py tests/test_phase3_raidplan.py`
+    => `38 passed, 1 warning`
+- Full suite:
+  - `.venv/bin/python -m pytest -q` => `156 passed, 1 warning in 0.78s`
+- Static typing:
+  - `.venv/bin/pyright` => `0 errors, 0 warnings, 0 informations`
+- Compile:
+  - `.venv/bin/python -m compileall -q bot commands views features services db utils tests` => passed
+
+## Incremental updates (2026-02-14, latest pass 6)
+
+### Planner message persistence for faster restart recovery
+- Added persistent planner message registry in `features/runtime_mixins/raid_ops.py` using `debug_cache` kind `planner_message`:
+  - stores `guild_id` (column), `raid_id` (column), `message_id` (column), and `channel_id` encoded in deterministic cache key:
+    - `plannermsg:{guild_id}:{channel_id}:{raid_id}`
+  - added helpers:
+    - `_planner_message_cache_key(...)`
+    - `_planner_channel_id_from_cache_key(...)`
+    - `_planner_cache_row_for_raid(...)`
+    - `_upsert_planner_message_cache(...)`
+    - `_clear_planner_message_cache_for_raid(...)`
+- `_refresh_planner_message(...)` now:
+  - recovers message/channel candidates from planner cache when `raid.message_id` is missing or stale.
+  - updates/maintains planner cache on successful edit and on new post.
+  - keeps re-registering persistent view with the resolved message id.
+- Startup persistent view restore improved in `features/runtime_mixins/events.py`:
+  - `_restore_persistent_vote_views(...)` now falls back to planner cache message id if `raid.message_id` is absent.
+  - recovered id is written back to raid row before view registration.
+
+### Lifecycle cleanup of planner cache rows
+- Planner cache entries now get removed when raids are closed/cancelled:
+  - `features/runtime_mixins/raid_ops.py`
+    - `_finish_raid_interaction(...)` clears planner cache for that raid.
+    - `_cancel_raids_for_guild(...)` clears planner cache per raid before cascade cancel.
+- Added stale/orphan cleanup coverage:
+  - `features/runtime_mixins/logging_background.py`
+    - `_cleanup_stale_raids_once(...)` clears planner cache before deleting stale raid data.
+    - `_run_integrity_cleanup_once(...)` removes orphan `planner_message` cache rows when their raid is no longer open.
+
+### Tests added/updated in this pass
+- Updated `tests/test_phase3_planner_persistence.py`:
+  - asserts planner cache row is written on planner refresh.
+  - asserts planner refresh uses cached message when raid row is missing message id.
+  - asserts startup vote-view restore uses cached planner message id.
+  - asserts planner cache is cleared on finish interaction.
+  - asserts planner cache is cleared on guild raid cancel.
+- Updated `tests/test_phase3_integrity_cleanup.py`:
+  - orphan cleanup now includes `planner_message` rows.
+  - open raid cleanup keeps valid `planner_message` rows.
+
+### Verification snapshot after pass 6
+- Focused tests:
+  - `.venv/bin/pytest -q tests/test_phase3_planner_persistence.py tests/test_phase3_integrity_cleanup.py`
+    => `8 passed, 1 warning`
+- Full suite:
+  - `.venv/bin/pytest -q` => `160 passed, 1 warning in 0.58s`
+- Static typing:
+  - `.venv/bin/pyright` => `0 errors, 0 warnings, 0 informations`
+- Compile:
+  - `.venv/bin/python -m compileall bot commands db discord features services utils views tests` => passed

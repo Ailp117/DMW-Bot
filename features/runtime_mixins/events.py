@@ -144,14 +144,22 @@ class RuntimeEventsMixin(RuntimeMixinBase):
 
         restored = 0
         for raid in self.repo.list_open_raids():
-            if not raid.message_id:
+            message_id = int(raid.message_id or 0)
+            if message_id <= 0:
+                cached_row = self._planner_cache_row_for_raid(raid)
+                cached_message_id = int(getattr(cached_row, "message_id", 0) or 0)
+                if cached_message_id > 0:
+                    self.repo.set_raid_message_id(raid.id, cached_message_id)
+                    message_id = cached_message_id
+
+            if message_id <= 0:
                 continue
             days, times = self.repo.list_raid_options(raid.id)
             if not days or not times:
                 continue
             self.add_view(
                 RaidVoteView(cast("RewriteDiscordBot", self), raid.id, days, times),
-                message_id=raid.message_id,
+                message_id=message_id,
             )
             restored += 1
         if restored:

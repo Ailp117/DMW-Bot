@@ -38,6 +38,8 @@ BOT_MESSAGE_CACHE_PREFIX = "botmsg"
 BOT_MESSAGE_INDEX_MAX_PER_CHANNEL = 400
 SLOT_TEMP_ROLE_KIND = "slot_temp_role"
 SLOT_TEMP_ROLE_CACHE_PREFIX = "slotrole"
+PLANNER_MESSAGE_KIND = "planner_message"
+PLANNER_MESSAGE_CACHE_PREFIX = "plannermsg"
 RAID_REMINDER_KIND = "raid_reminder"
 RAID_REMINDER_CACHE_PREFIX = "raidrem"
 RAID_REMINDER_ADVANCE_SECONDS = 10 * 60
@@ -306,7 +308,7 @@ def _raid_weekday_short(weekday_index: int) -> str:
 
 
 def _format_raid_date_label(value: date) -> str:
-    return f"{value.isoformat()} ({_raid_weekday_short(value.weekday())})"
+    return f"{value.day:02d}.{value.month:02d}.{value.year:04d}"
 
 
 def _parse_raid_date_from_label(label: str) -> date | None:
@@ -530,6 +532,8 @@ __all__ = [
     "NANOMON_IMAGE_URL",
     "PERSIST_FLUSH_MAX_ATTEMPTS",
     "PERSIST_FLUSH_RETRY_BASE_SECONDS",
+    "PLANNER_MESSAGE_CACHE_PREFIX",
+    "PLANNER_MESSAGE_KIND",
     "PRIVILEGED_ONLY_HELP_COMMANDS",
     "RAID_CALENDAR_CONFIG_CACHE_PREFIX",
     "RAID_CALENDAR_CONFIG_KIND",

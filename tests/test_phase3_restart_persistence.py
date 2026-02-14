@@ -22,7 +22,7 @@ def test_restore_persistent_views_for_open_raids(repo):
         planner_channel_id=11,
         creator_id=100,
         dungeon_name="Nanos",
-        days_input="Mon, Tue",
+        days_input="14.02.2026, 15.02.2026",
         times_input="20:00, 21:00",
         min_players_input="1",
         message_id=5500,
@@ -48,13 +48,13 @@ def test_restore_memberlists_for_open_raids(repo):
         planner_channel_id=11,
         creator_id=100,
         dungeon_name="Nanos",
-        days_input="Mon",
+        days_input="14.02.2026",
         times_input="20:00",
         min_players_input="1",
         message_id=5501,
     ).raid.id
 
-    toggle_vote(repo, raid_id=raid_id, kind="day", option_label="Mon", user_id=123)
+    toggle_vote(repo, raid_id=raid_id, kind="day", option_label="14.02.2026", user_id=123)
     toggle_vote(repo, raid_id=raid_id, kind="time", option_label="20:00", user_id=123)
 
     restored = restore_memberlists(repo)

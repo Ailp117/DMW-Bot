@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+import re
 
 from db.repository import InMemoryRepository, RaidRecord
 from services.template_service import get_auto_template_defaults, upsert_auto_template
@@ -60,6 +61,49 @@ class StaleCleanupResult:
     affected_guild_ids: list[int]
 
 
+def _normalize_time_labels(raw_times: list[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_times:
+        text = str(raw or "").strip()
+        match = re.fullmatch(r"(\d{1,2})[:.](\d{2})", text)
+        if match is None:
+            raise ValueError("Time values must use HH:MM")
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+            raise ValueError("Time values must use HH:MM")
+        value = f"{hour:02d}:{minute:02d}"
+        if value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return normalized
+
+
+def _normalize_day_labels(raw_days: list[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_days:
+        text = str(raw or "").strip()
+        match = re.fullmatch(r"(\d{2})\.(\d{2})\.(\d{4})", text)
+        if match is None:
+            raise ValueError("Day values must use TT.MM.JJJJ")
+        day = int(match.group(1))
+        month = int(match.group(2))
+        year = int(match.group(3))
+        try:
+            parsed = date(year, month, day)
+        except ValueError as exc:
+            raise ValueError("Day values must use TT.MM.JJJJ") from exc
+        value = f"{parsed.day:02d}.{parsed.month:02d}.{parsed.year:04d}"
+        if value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return normalized
+
+
 def build_raid_plan_defaults(
     repo: InMemoryRepository,
     *,
@@ -105,8 +149,8 @@ def create_raid_from_modal(
     if min_players < 0:
         raise ValueError("Min players must be a number >= 0")
 
-    days = normalize_list(days_input)
-    times = normalize_list(times_input)
+    days = _normalize_day_labels(normalize_list(days_input))
+    times = _normalize_time_labels(normalize_list(times_input))
     if not days or not times:
         raise ValueError("At least one day and one time are required")
 

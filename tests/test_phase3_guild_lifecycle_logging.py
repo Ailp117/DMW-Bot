@@ -21,7 +21,7 @@ async def test_on_guild_remove_purges_data_and_timers(app, repo):
         planner_channel_id=11,
         creator_id=100,
         dungeon_name="Nanos",
-        days_input="Mon",
+        days_input="14.02.2026",
         times_input="20:00",
         min_players_input="1",
         message_id=5800,

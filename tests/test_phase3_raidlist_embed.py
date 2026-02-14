@@ -22,12 +22,12 @@ def test_build_raidlist_embed_contains_structured_raid_data(repo):
         planner_channel_id=11,
         creator_id=100,
         dungeon_name="Nanos",
-        days_input="2026-02-13 (Fr)",
+        days_input="13.02.2026",
         times_input="20:00",
         min_players_input="1",
         message_id=5151,
     ).raid
-    toggle_vote(repo, raid_id=raid.id, kind="day", option_label="2026-02-13 (Fr)", user_id=200)
+    toggle_vote(repo, raid_id=raid.id, kind="day", option_label="13.02.2026", user_id=200)
     toggle_vote(repo, raid_id=raid.id, kind="time", option_label="20:00", user_id=200)
 
     bot = object.__new__(RewriteDiscordBot)
@@ -65,7 +65,7 @@ async def test_refresh_raidlist_for_guild_posts_embed(repo):
         planner_channel_id=11,
         creator_id=100,
         dungeon_name="Nanos",
-        days_input="2026-02-13 (Fr)",
+        days_input="13.02.2026",
         times_input="20:00",
         min_players_input="1",
         message_id=5151,

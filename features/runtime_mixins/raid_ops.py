@@ -182,6 +182,62 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             f"{int(bot_user_id)}:{int(message_id)}"
         )
 
+    @staticmethod
+    def _planner_message_cache_key(guild_id: int, channel_id: int, raid_id: int) -> str:
+        return f"{PLANNER_MESSAGE_CACHE_PREFIX}:{int(guild_id)}:{int(channel_id)}:{int(raid_id)}"
+
+    @staticmethod
+    def _planner_channel_id_from_cache_key(cache_key: str) -> int | None:
+        parts = str(cache_key or "").split(":")
+        if len(parts) != 4 or parts[0] != PLANNER_MESSAGE_CACHE_PREFIX:
+            return None
+        try:
+            channel_id = int(parts[2])
+        except (TypeError, ValueError):
+            return None
+        return channel_id if channel_id > 0 else None
+
+    def _planner_cache_row_for_raid(self, raid: RaidRecord):
+        rows = list(self.repo.list_debug_cache(kind=PLANNER_MESSAGE_KIND, guild_id=raid.guild_id, raid_id=raid.id))
+        if not rows:
+            return None
+        preferred_channel_id = int(getattr(raid, "channel_id", 0) or 0)
+        ordered_rows = sorted(rows, key=lambda row: int(row.message_id or 0), reverse=True)
+        for row in ordered_rows:
+            channel_id = self._planner_channel_id_from_cache_key(row.cache_key)
+            if channel_id is not None and channel_id == preferred_channel_id:
+                return row
+        return ordered_rows[0]
+
+    def _upsert_planner_message_cache(self, *, raid: RaidRecord, channel_id: int, message_id: int) -> None:
+        normalized_channel_id = int(channel_id or 0)
+        normalized_message_id = int(message_id or 0)
+        if normalized_channel_id <= 0 or normalized_message_id <= 0:
+            return
+
+        cache_key = self._planner_message_cache_key(
+            guild_id=raid.guild_id,
+            channel_id=normalized_channel_id,
+            raid_id=raid.id,
+        )
+        payload_hash = sha256_text(f"{int(raid.guild_id)}:{normalized_channel_id}:{normalized_message_id}")
+        self.repo.upsert_debug_cache(
+            cache_key=cache_key,
+            kind=PLANNER_MESSAGE_KIND,
+            guild_id=raid.guild_id,
+            raid_id=raid.id,
+            message_id=normalized_message_id,
+            payload_hash=payload_hash,
+        )
+        for stale_row in list(self.repo.list_debug_cache(kind=PLANNER_MESSAGE_KIND, guild_id=raid.guild_id, raid_id=raid.id)):
+            if stale_row.cache_key == cache_key:
+                continue
+            self.repo.delete_debug_cache(stale_row.cache_key)
+
+    def _clear_planner_message_cache_for_raid(self, raid: RaidRecord) -> None:
+        for row in list(self.repo.list_debug_cache(kind=PLANNER_MESSAGE_KIND, guild_id=raid.guild_id, raid_id=raid.id)):
+            self.repo.delete_debug_cache(row.cache_key)
+
     def _track_bot_message(self, message: Any) -> None:
         message_id = int(getattr(message, "id", 0) or 0)
         if message_id <= 0:
@@ -589,8 +645,25 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
         if raid is None or raid.status != "open":
             return None
 
-        channel = await self._get_text_channel(raid.channel_id)
+        cached_row = self._planner_cache_row_for_raid(raid)
+        channel_candidates: list[int] = []
+        primary_channel_id = int(raid.channel_id or 0)
+        if primary_channel_id > 0:
+            channel_candidates.append(primary_channel_id)
+        if cached_row is not None:
+            cached_channel_id = self._planner_channel_id_from_cache_key(cached_row.cache_key)
+            if cached_channel_id is not None and cached_channel_id not in channel_candidates:
+                channel_candidates.append(cached_channel_id)
+
+        channel = None
+        for candidate_channel_id in channel_candidates:
+            channel = await self._get_text_channel(candidate_channel_id)
+            if channel is not None:
+                break
         if channel is None:
+            return None
+        channel_id = int(getattr(channel, "id", 0) or 0)
+        if channel_id <= 0:
             return None
 
         days, times = self.repo.list_raid_options(raid.id)
@@ -600,17 +673,32 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
         embed = self._planner_embed(raid)
         view = RaidVoteView(cast("RewriteDiscordBot", self), raid.id, days, times)
 
-        if raid.message_id:
-            existing = await _runtime_mod()._safe_fetch_message(channel, raid.message_id)
+        message_candidates: list[int] = []
+        stored_message_id = int(raid.message_id or 0)
+        if stored_message_id > 0:
+            message_candidates.append(stored_message_id)
+        cached_message_id = int(getattr(cached_row, "message_id", 0) or 0)
+        if cached_message_id > 0 and cached_message_id not in message_candidates:
+            message_candidates.append(cached_message_id)
+
+        for candidate_message_id in message_candidates:
+            existing = await _runtime_mod()._safe_fetch_message(channel, candidate_message_id)
             if existing is not None:
                 edited = await _runtime_mod()._safe_edit_message(existing, embed=embed, view=view, content=None)
                 if edited:
+                    existing_id = int(getattr(existing, "id", 0) or 0)
+                    if existing_id > 0 and int(raid.message_id or 0) != existing_id:
+                        self.repo.set_raid_message_id(raid.id, existing_id)
+                    if existing_id > 0:
+                        self._upsert_planner_message_cache(raid=raid, channel_id=channel_id, message_id=existing_id)
+                        self.add_view(view, message_id=existing_id)
                     return existing
 
         posted = await self._send_channel_message(channel, embed=embed, view=view)
         if posted is None:
             return None
         self.repo.set_raid_message_id(raid.id, posted.id)
+        self._upsert_planner_message_cache(raid=raid, channel_id=channel_id, message_id=int(posted.id))
         self.add_view(view, message_id=posted.id)
         return posted
 
@@ -655,6 +743,12 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
         for raid in self.repo.list_open_raids(guild_id):
             if raid.channel_id == channel_id and raid.message_id:
                 message_ids.add(int(raid.message_id))
+        for row in self.repo.list_debug_cache(kind=PLANNER_MESSAGE_KIND, guild_id=guild_id):
+            cached_channel_id = self._planner_channel_id_from_cache_key(row.cache_key)
+            if cached_channel_id is None or cached_channel_id != int(channel_id):
+                continue
+            if int(row.message_id or 0) > 0:
+                message_ids.add(int(row.message_id))
 
         for row in self.repo.raid_posted_slots.values():
             if row.channel_id == channel_id and row.message_id:
@@ -801,6 +895,71 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                 getattr(channel, "id", None),
             )
         return min(limit, deleted)
+
+    @staticmethod
+    def _is_memberlist_message_for_raid(message: Any, *, raid_display_id: int) -> bool:
+        display_id = int(raid_display_id)
+        if display_id <= 0:
+            return False
+
+        markers = (
+            f"Raid: `{display_id}`",
+            f"Raid `{display_id}`",
+            f"🆔 Raid: `{display_id}`",
+        )
+        content = str(getattr(message, "content", "") or "")
+        if any(marker in content for marker in markers):
+            return True
+
+        for embed in list(getattr(message, "embeds", []) or []):
+            title = str(getattr(embed, "title", "") or "")
+            description = str(getattr(embed, "description", "") or "")
+            if not title.startswith("✅ Teilnehmerliste"):
+                continue
+            if any(marker in description for marker in markers):
+                return True
+        return False
+
+    async def _cleanup_orphan_memberlist_messages_for_raid(
+        self,
+        *,
+        raid: RaidRecord,
+        participants_channel: Any,
+        keep_message_ids: set[int],
+    ) -> int:
+        channel_id = int(getattr(participants_channel, "id", 0) or 0)
+        if channel_id <= 0:
+            return 0
+        display_id = int(raid.display_id or 0)
+        if display_id <= 0:
+            return 0
+
+        guild_id = int(raid.guild_id)
+        bot_user_id = self._current_bot_user_id()
+        deleted = 0
+        indexed_ids = self._indexed_bot_message_ids_for_channel(guild_id, channel_id)
+        for message_id in sorted(indexed_ids, reverse=True):
+            normalized_id = int(message_id)
+            if normalized_id in keep_message_ids:
+                continue
+
+            message = await _runtime_mod()._safe_fetch_message(participants_channel, normalized_id)
+            if message is None:
+                self._clear_bot_message_index_for_id(guild_id=guild_id, channel_id=channel_id, message_id=normalized_id)
+                self._clear_known_message_refs_for_id(guild_id=guild_id, channel_id=channel_id, message_id=normalized_id)
+                continue
+
+            author_id = int(getattr(getattr(message, "author", None), "id", 0) or 0)
+            if bot_user_id > 0 and author_id > 0 and author_id != bot_user_id:
+                continue
+            if not self._is_memberlist_message_for_raid(message, raid_display_id=display_id):
+                continue
+
+            if await _runtime_mod()._safe_delete_message(message):
+                deleted += 1
+            self._clear_bot_message_index_for_id(guild_id=guild_id, channel_id=channel_id, message_id=normalized_id)
+            self._clear_known_message_refs_for_id(guild_id=guild_id, channel_id=channel_id, message_id=normalized_id)
+        return deleted
 
     async def _rebuild_memberlists_for_guild(self, guild_id: int, *, participants_channel: Any) -> MemberlistRebuildStats:
         raids = list(self.repo.list_open_raids(guild_id))
@@ -1077,7 +1236,6 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
         created = 0
         updated = 0
         deleted = 0
-        debug_lines: list[str] = []
         roles_enabled = True
 
         for (day_label, time_label), users in qualified_slots.items():
@@ -1099,7 +1257,6 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                         content = f"🔔 Erinnerungsrolle aktiv: `{role_name}` (Ping erst beim Raid-Reminder)."
                     else:
                         content = "🔔 Erinnerungsrolle aktiv (Ping erst beim Raid-Reminder)."
-            debug_lines.append(f"- {day_label} {time_label}: {', '.join(f'<@{u}>' for u in users)}")
             row = existing_rows.get((day_label, time_label))
             old_msg_for_recreate = None
 
@@ -1164,34 +1321,17 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             self.repo.delete_posted_slot(row.id)
             deleted += 1
 
-        debug_body = self._format_debug_report(
-            topic="Memberlist Debug",
-            guild_id=raid.guild_id,
-            summary=[
-                f"Raid: {raid.display_id}",
-                f"Dungeon: {raid.dungeon}",
-                f"Qualified Slots: {len(debug_lines)}",
-            ],
-            lines=debug_lines,
-            empty_text="- Keine qualifizierten Slots.",
-        )
-        debug_embed = self._build_memberlist_debug_embed(
-            raid=raid,
-            qualified_slots=qualified_slots,
-            created=created,
-            updated=updated,
-            deleted=deleted,
-            debug_lines=debug_lines,
-        )
-        await self._mirror_debug_payload(
-            debug_channel_id=int(self.config.memberlist_debug_channel_id),
-            cache_key=f"memberlist:{raid.guild_id}:{raid.id}",
-            kind="memberlist",
-            guild_id=raid.guild_id,
-            raid_id=raid.id,
-            content=debug_body,
-            embed=debug_embed,
-        )
+        if recreate_existing:
+            keep_ids = {
+                int(row.message_id)
+                for row in self.repo.list_posted_slots(raid.id).values()
+                if row.message_id is not None and int(row.channel_id or 0) == int(participants_channel.id)
+            }
+            deleted += await self._cleanup_orphan_memberlist_messages_for_raid(
+                raid=raid,
+                participants_channel=participants_channel,
+                keep_message_ids=keep_ids,
+            )
 
         return (created, updated, deleted)
 
@@ -1330,39 +1470,13 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
         guild = self.get_guild(guild_id)
         guild_name = guild.name if guild is not None else (settings.guild_name or self._guild_display_name(guild_id))
         raids = self.repo.list_open_raids(guild_id)
-        embed, payload_hash, debug_lines = self._build_raidlist_embed(
+        embed, payload_hash, _debug_lines = self._build_raidlist_embed(
             guild_id=guild_id,
             guild_name=guild_name,
             raids=raids,
         )
-        debug_payload = self._format_debug_report(
-            topic="Raidlist Debug",
-            guild_id=guild_id,
-            summary=[
-                f"Title: Raidliste {guild_name}",
-                f"Open Raids: {len(raids)}",
-                f"Payload Hash: {payload_hash[:16]}",
-            ],
-            lines=debug_lines,
-            empty_text="- Keine Raidlist-Daten.",
-        )
-        debug_embed = self._build_raidlist_debug_embed(
-            base_embed=embed,
-            guild_id=guild_id,
-            payload_hash=payload_hash,
-            debug_lines=debug_lines,
-        )
 
         if not force and self._raidlist_hash_by_guild.get(guild_id) == payload_hash:
-            await self._mirror_debug_payload(
-                debug_channel_id=int(self.config.raidlist_debug_channel_id),
-                cache_key=f"raidlist:{guild_id}:0",
-                kind="raidlist",
-                guild_id=guild_id,
-                raid_id=None,
-                content=debug_payload,
-                embed=debug_embed,
-            )
             return False
 
         channel = await self._get_text_channel(settings.raidlist_channel_id)
@@ -1374,15 +1488,6 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             if message is not None:
                 if await _runtime_mod()._safe_edit_message(message, content=None, embed=embed):
                     self._raidlist_hash_by_guild[guild_id] = payload_hash
-                    await self._mirror_debug_payload(
-                        debug_channel_id=int(self.config.raidlist_debug_channel_id),
-                        cache_key=f"raidlist:{guild_id}:0",
-                        kind="raidlist",
-                        guild_id=guild_id,
-                        raid_id=None,
-                        content=debug_payload,
-                        embed=debug_embed,
-                    )
                     return True
 
         posted = await self._send_channel_message(channel, embed=embed)
@@ -1390,15 +1495,6 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             return False
         settings.raidlist_message_id = posted.id
         self._raidlist_hash_by_guild[guild_id] = payload_hash
-        await self._mirror_debug_payload(
-            debug_channel_id=int(self.config.raidlist_debug_channel_id),
-            cache_key=f"raidlist:{guild_id}:0",
-            kind="raidlist",
-            guild_id=guild_id,
-            raid_id=None,
-            content=debug_payload,
-            embed=debug_embed,
-        )
         return True
 
     async def _schedule_raidlist_refresh(self, guild_id: int) -> None:
@@ -1410,7 +1506,7 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
     async def _refresh_raidlist_for_guild_persisted(self, guild_id: int) -> None:
         async with self._state_lock:
             await self._refresh_raidlist_for_guild(guild_id)
-            persisted = await self._persist(dirty_tables={"settings", "debug_cache"})
+            persisted = await self._persist(dirty_tables={"settings", "debug_cache", "raids", "raid_posted_slots"})
         if not persisted:
             log.warning("Debounced raidlist refresh persisted failed for guild %s", guild_id)
 
@@ -1477,6 +1573,7 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                 reason="beendet",
                 attendance_rows=result.attendance_rows,
             )
+            self._clear_planner_message_cache_for_raid(raid)
             await self._force_raidlist_refresh(guild_id)
             await self._force_raid_calendar_refresh(guild_id)
             persisted = await self._persist()
@@ -1501,6 +1598,7 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                 reason=reason,
             )
             await self._cleanup_temp_role(raid)
+            self._clear_planner_message_cache_for_raid(raid)
             for row in slot_rows:
                 await self._delete_slot_message(row)
 

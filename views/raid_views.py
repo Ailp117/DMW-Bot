@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from typing import Any, TYPE_CHECKING
 
 from bot.discord_api import discord
@@ -208,46 +209,18 @@ class RaidDateSelectionView(discord.ui.View):
         self.add_item(day_select)
         self.add_item(RaidDateContinueButton(bot))
 
-    @staticmethod
-    def _weekday_alias_to_index(label: str) -> int | None:
-        aliases = {
-            "mo": 0,
-            "mon": 0,
-            "montag": 0,
-            "di": 1,
-            "tue": 1,
-            "dienstag": 1,
-            "mi": 2,
-            "wed": 2,
-            "mittwoch": 2,
-            "do": 3,
-            "thu": 3,
-            "donnerstag": 3,
-            "fr": 4,
-            "fri": 4,
-            "freitag": 4,
-            "sa": 5,
-            "sat": 5,
-            "samstag": 5,
-            "so": 6,
-            "sun": 6,
-            "sonntag": 6,
-        }
-        return aliases.get((label or "").strip().lower())
-
     def _resolve_default_days(self, default_days: list[str]) -> list[str]:
         if not self.available_days:
             return []
         resolved: list[str] = []
         available_map = {value.casefold(): value for value in self.available_days}
-        by_iso_date = {value[:10]: value for value in self.available_days if len(value) >= 10}
+        by_date: dict[date, str] = {}
 
-        by_weekday: dict[int, list[str]] = {}
         for value in self.available_days:
             parsed = _parse_raid_date_from_label(value)
             if parsed is None:
                 continue
-            by_weekday.setdefault(parsed.weekday(), []).append(value)
+            by_date.setdefault(parsed, value)
 
         for raw in default_days:
             text = str(raw or "").strip()
@@ -259,17 +232,10 @@ class RaidDateSelectionView(discord.ui.View):
                 continue
             parsed_date = _parse_raid_date_from_label(text)
             if parsed_date is not None:
-                mapped = by_iso_date.get(parsed_date.isoformat())
+                mapped = by_date.get(parsed_date)
                 if mapped and mapped not in resolved:
                     resolved.append(mapped)
                     continue
-            weekday = self._weekday_alias_to_index(text)
-            if weekday is None:
-                continue
-            for candidate in by_weekday.get(weekday, []):
-                if candidate not in resolved:
-                    resolved.append(candidate)
-                    break
 
         normalized = _normalize_raid_date_selection(resolved, allowed=self.available_days)
         if normalized:
