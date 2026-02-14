@@ -223,7 +223,7 @@ Task is NOT complete if:
 
 - Legacy moved before analysis
 - FEATURE_MATRIX incomplete
-- DB modified
+- No Refactoring
 - Tests not written
 - pytest not executed
 - pytest output missing
