@@ -94,6 +94,7 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
                 f"Nanomon Reply: `{_on_off(feature_settings.nanomon_reply_enabled)}`\n"
                 f"Approved Reply: `{_on_off(feature_settings.approved_reply_enabled)}`\n"
                 f"Raid Reminder: `{_on_off(feature_settings.raid_reminder_enabled)}`\n"
+                f"Auto Reminder: `{_on_off(feature_settings.auto_reminder_enabled)}`\n"
                 f"Message XP Interval (s): `{int(feature_settings.message_xp_interval_seconds)}`\n"
                 f"Levelup Cooldown (s): `{int(feature_settings.levelup_message_cooldown_seconds)}`\n"
                 f"Umfragen Channel: `{settings.planner_channel_id}`\n"

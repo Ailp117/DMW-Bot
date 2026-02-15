@@ -28,6 +28,7 @@ FEATURE_FLAG_LEVELUP_MESSAGES = 1 << 1
 FEATURE_FLAG_NANOMON_REPLY = 1 << 2
 FEATURE_FLAG_APPROVED_REPLY = 1 << 3
 FEATURE_FLAG_RAID_REMINDER = 1 << 4
+FEATURE_FLAG_AUTO_REMINDER = 1 << 5
 FEATURE_FLAG_MASK = 0xFF
 FEATURE_MESSAGE_XP_SHIFT = 8
 FEATURE_LEVELUP_COOLDOWN_SHIFT = 24
@@ -43,6 +44,10 @@ RAID_REMINDER_ADVANCE_SECONDS = 10 * 60
 RAID_START_KIND = "raid_start"
 RAID_START_CACHE_PREFIX = "raidstart"
 RAID_START_TOLERANCE_SECONDS = 60
+AUTO_REMINDER_ADVANCE_SECONDS = 2 * 60 * 60  # 2 hours
+AUTO_REMINDER_MIN_FILL_PERCENT = 50  # 50%
+AUTO_REMINDER_KIND = "auto_reminder"
+AUTO_REMINDER_CACHE_PREFIX = "autorem"
 RAID_REMINDER_WORKER_SLEEP_SECONDS = 30
 RAID_DATE_LOOKAHEAD_DAYS = 21
 RAID_CALENDAR_CONFIG_CACHE_PREFIX = "raidcal_cfg"
@@ -116,6 +121,7 @@ class GuildFeatureSettings:
     message_xp_interval_seconds: int
     levelup_message_cooldown_seconds: int
     raid_reminder_enabled: bool = False
+    auto_reminder_enabled: bool = False
 
 
 @dataclass(slots=True)

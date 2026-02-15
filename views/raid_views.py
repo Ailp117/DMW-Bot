@@ -212,8 +212,9 @@ class SettingsToggleButton(discord.ui.Button):
         guild_id: int,
         attr_name: str,
         label_prefix: str,
+        row: int = 3,
     ):
-        super().__init__(style=discord.ButtonStyle.secondary, label=label_prefix, row=3)
+        super().__init__(style=discord.ButtonStyle.secondary, label=label_prefix, row=row)
         self.bot = bot
         self.guild_id = guild_id
         self.attr_name = attr_name
@@ -271,112 +272,307 @@ class SettingsIntervalsButton(discord.ui.Button):
 
 
 class SettingsView(discord.ui.View):
+    """Überarbeitetes Settings-Menü mit intuitiver Struktur."""
+    
     def __init__(self, bot: "RewriteDiscordBot", *, guild_id: int):
         super().__init__(timeout=300)
         self.bot = bot
         self.guild_id = guild_id
         settings = bot.repo.ensure_settings(guild_id)
         feature_settings = bot._get_guild_feature_settings(guild_id)
+        
+        # Channel Settings
         self.planner_channel_id: int | None = settings.planner_channel_id
         self.participants_channel_id: int | None = settings.participants_channel_id
         self.raidlist_channel_id: int | None = settings.raidlist_channel_id
+        
+        # Feature toggles
         self.leveling_enabled: bool = feature_settings.leveling_enabled
         self.levelup_messages_enabled: bool = feature_settings.levelup_messages_enabled
         self.nanomon_reply_enabled: bool = feature_settings.nanomon_reply_enabled
         self.approved_reply_enabled: bool = feature_settings.approved_reply_enabled
         self.raid_reminder_enabled: bool = feature_settings.raid_reminder_enabled
+        self.auto_reminder_enabled: bool = feature_settings.auto_reminder_enabled
+        
+        # Intervals
         self.message_xp_interval_seconds: int = feature_settings.message_xp_interval_seconds
         self.levelup_message_cooldown_seconds: int = feature_settings.levelup_message_cooldown_seconds
 
-        planner_select = discord.ui.ChannelSelect(
-            placeholder="Umfragen Channel waehlen",
-            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
-            min_values=0,
-            max_values=1,
-            custom_id=f"settings:{guild_id}:planner",
-            row=0,
-        )
-        participants_select = discord.ui.ChannelSelect(
-            placeholder="Raid Teilnehmerlisten Channel waehlen",
-            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
-            min_values=0,
-            max_values=1,
-            custom_id=f"settings:{guild_id}:participants",
-            row=1,
-        )
-        raidlist_select = discord.ui.ChannelSelect(
-            placeholder="Raidlist Channel waehlen",
-            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
-            min_values=0,
-            max_values=1,
-            custom_id=f"settings:{guild_id}:raidlist",
-            row=2,
-        )
-
-        planner_select.callback = self._on_planner_select
-        participants_select.callback = self._on_participants_select
-        raidlist_select.callback = self._on_raidlist_select
-
-        self.add_item(planner_select)
-        self.add_item(participants_select)
-        self.add_item(raidlist_select)
-
-        toggle_items = [
-            SettingsToggleButton(
-                bot,
-                guild_id=guild_id,
-                attr_name="leveling_enabled",
-                label_prefix="Levelsystem",
-            ),
-            SettingsToggleButton(
-                bot,
-                guild_id=guild_id,
-                attr_name="levelup_messages_enabled",
-                label_prefix="Levelup Msg",
-            ),
-            SettingsToggleButton(
-                bot,
-                guild_id=guild_id,
-                attr_name="nanomon_reply_enabled",
-                label_prefix="Nanomon Reply",
-            ),
-            SettingsToggleButton(
-                bot,
-                guild_id=guild_id,
-                attr_name="approved_reply_enabled",
-                label_prefix="Approved Reply",
-            ),
-            SettingsToggleButton(
-                bot,
-                guild_id=guild_id,
-                attr_name="raid_reminder_enabled",
-                label_prefix="Raid Reminder",
-            ),
-        ]
-        for item in toggle_items:
-            item._refresh_appearance(self)
-            self.add_item(item)
-
+        # Channel Select Menu (Zeile 0)
+        self.add_item(SettingsChannelSelect(bot, guild_id))
+        
+        # Feature Toggle Menu (Zeile 1)
+        self.add_item(SettingsFeatureSelect(bot, guild_id))
+        
+        # Action Buttons (Zeile 2)
         self.add_item(SettingsIntervalsButton(bot, guild_id=guild_id))
         self.add_item(SettingsSaveButton(bot, guild_id))
+        self.add_item(SettingsResetButton(bot, guild_id))
 
-    async def _on_planner_select(self, interaction):
-        selected = ((interaction.data or {}).get("values") or [])
-        self.planner_channel_id = int(selected[0]) if selected else None
-        await self.bot._defer(interaction, ephemeral=True)
-        await _safe_followup(interaction, "Umfragen Channel vorgemerkt.", ephemeral=True)
+    def build_embed(self) -> discord.Embed:
+        """Erstellt Übersichts-Embed mit aktuellen Einstellungen."""
+        embed = discord.Embed(
+            title="⚙️ Bot Einstellungen",
+            description="Verwalte die Konfiguration des Raid Bots",
+            color=discord.Color.blue()
+        )
+        
+        # Channel Übersicht
+        channels_text = (
+            f"📋 **Umfragen:** {self._channel_mention(self.planner_channel_id)}\n"
+            f"👥 **Teilnehmerlisten:** {self._channel_mention(self.participants_channel_id)}\n"
+            f"📊 **Raidliste:** {self._channel_mention(self.raidlist_channel_id)}"
+        )
+        embed.add_field(name="📌 Channels", value=channels_text, inline=False)
+        
+        # Features Übersicht
+        features_text = (
+            f"📈 **Levelsystem:** {self._status_emoji(self.leveling_enabled)}\n"
+            f"🎉 **Levelup Msg:** {self._status_emoji(self.levelup_messages_enabled)}\n"
+            f"🤖 **Nanomon Reply:** {self._status_emoji(self.nanomon_reply_enabled)}\n"
+            f"✅ **Approved Reply:** {self._status_emoji(self.approved_reply_enabled)}\n"
+            f"⏰ **Raid Reminder:** {self._status_emoji(self.raid_reminder_enabled)}\n"
+            f"🔔 **Auto Reminder:** {self._status_emoji(self.auto_reminder_enabled)}"
+        )
+        embed.add_field(name="⚡ Features", value=features_text, inline=True)
+        
+        # Intervalle Übersicht
+        intervals_text = (
+            f"⏱️ **XP Interval:** {self.message_xp_interval_seconds}s\n"
+            f"⏳ **Levelup Cooldown:** {self.levelup_message_cooldown_seconds}s"
+        )
+        embed.add_field(name="⏲️ Intervalle", value=intervals_text, inline=True)
+        
+        embed.set_footer(text="Ändere Einstellungen über die Menüs unten")
+        return embed
+    
+    def _channel_mention(self, channel_id: int | None) -> str:
+        """Formatiert Channel-ID für Embed."""
+        if channel_id:
+            return f"<#{channel_id}>"
+        return "❌ *Nicht gesetzt*"
+    
+    def _status_emoji(self, enabled: bool) -> str:
+        """Gibt Status-Emoji zurück."""
+        return "🟢 AN" if enabled else "🔴 AUS"
 
-    async def _on_participants_select(self, interaction):
-        selected = ((interaction.data or {}).get("values") or [])
-        self.participants_channel_id = int(selected[0]) if selected else None
-        await self.bot._defer(interaction, ephemeral=True)
-        await _safe_followup(interaction, "Raid Teilnehmerlisten Channel vorgemerkt.", ephemeral=True)
 
-    async def _on_raidlist_select(self, interaction):
-        selected = ((interaction.data or {}).get("values") or [])
-        self.raidlist_channel_id = int(selected[0]) if selected else None
-        await self.bot._defer(interaction, ephemeral=True)
-        await _safe_followup(interaction, "Raidlist Channel vorgemerkt.", ephemeral=True)
+class SettingsChannelSelect(discord.ui.Select):
+    """Auswahl welcher Channel-Typ konfiguriert werden soll."""
+    
+    def __init__(self, bot: "RewriteDiscordBot", guild_id: int):
+        self.bot = bot
+        self.guild_id = guild_id
+        
+        options = [
+            discord.SelectOption(
+                label="Umfragen Channel",
+                value="planner",
+                description="Channel für Raid-Umfragen",
+                emoji="📋"
+            ),
+            discord.SelectOption(
+                label="Teilnehmerlisten Channel", 
+                value="participants",
+                description="Channel für automatische Teilnehmerlisten",
+                emoji="👥"
+            ),
+            discord.SelectOption(
+                label="Raidlist Channel",
+                value="raidlist", 
+                description="Channel für die Raid-Übersicht",
+                emoji="📊"
+            )
+        ]
+        
+        super().__init__(
+            placeholder="📌 Channel konfigurieren...",
+            options=options,
+            min_values=1,
+            max_values=1,
+            custom_id=f"settings:{guild_id}:channel_type",
+            row=0
+        )
+    
+    async def callback(self, interaction):
+        if not interaction.guild or interaction.guild.id != self.guild_id:
+            await self.bot._reply(interaction, "Ungültiger Guild-Kontext.", ephemeral=True)
+            return
+        
+        channel_type = self.values[0] if self.values else None
+        if not channel_type:
+            return
+        
+        view = self.view
+        if not isinstance(view, SettingsView):
+            return
+        
+        # Zeige Channel-Select für den gewählten Typ
+        channel_select = discord.ui.ChannelSelect(
+            placeholder=f"{channel_type.capitalize()} Channel wählen",
+            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
+            min_values=0,
+            max_values=1,
+            custom_id=f"settings:{self.guild_id}:{channel_type}_channel"
+        )
+        
+        temp_view = discord.ui.View(timeout=60)
+        temp_view.add_item(channel_select)
+        
+        async def on_channel_select(interaction2: discord.Interaction):
+            selected = interaction2.data.get("values", []) if interaction2.data else []
+            channel_id = int(selected[0]) if selected else None
+            
+            if channel_type == "planner":
+                view.planner_channel_id = channel_id
+                msg = "📋 Umfragen Channel gesetzt"
+            elif channel_type == "participants":
+                view.participants_channel_id = channel_id
+                msg = "👥 Teilnehmerlisten Channel gesetzt"
+            elif channel_type == "raidlist":
+                view.raidlist_channel_id = channel_id
+                msg = "📊 Raidlist Channel gesetzt"
+            
+            await interaction2.response.edit_message(
+                embed=view.build_embed(),
+                view=view
+            )
+            await interaction2.followup.send(msg, ephemeral=True)
+        
+        channel_select.callback = on_channel_select
+        
+        await interaction.response.send_message(
+            f"Wähle den Channel für **{channel_type}**:",
+            view=temp_view,
+            ephemeral=True
+        )
+
+
+class SettingsFeatureSelect(discord.ui.Select):
+    """Multi-Select für Features mit intuitiver Darstellung."""
+    
+    def __init__(self, bot: "RewriteDiscordBot", guild_id: int):
+        self.bot = bot
+        self.guild_id = guild_id
+        
+        options = [
+            discord.SelectOption(
+                label="Levelsystem",
+                value="leveling",
+                description="XP und Level-System aktivieren",
+                emoji="📈"
+            ),
+            discord.SelectOption(
+                label="Levelup Nachrichten",
+                value="levelup",
+                description="Gratulations-Nachrichten bei Level-Up",
+                emoji="🎉"
+            ),
+            discord.SelectOption(
+                label="Nanomon Reply",
+                value="nanomon",
+                description="Reagiere auf 'nanomon' Keyword",
+                emoji="🤖"
+            ),
+            discord.SelectOption(
+                label="Approved Reply",
+                value="approved",
+                description="Reagiere auf 'approved' Keyword",
+                emoji="✅"
+            ),
+            discord.SelectOption(
+                label="Raid Reminder",
+                value="raid_reminder",
+                description="Erinnerungen 10 Minuten vor Raid",
+                emoji="⏰"
+            ),
+            discord.SelectOption(
+                label="Auto Reminder",
+                value="auto_reminder",
+                description="Erinnerung bei schwacher Beteiligung (2h vorher)",
+                emoji="🔔"
+            )
+        ]
+        
+        super().__init__(
+            placeholder="⚡ Features aktivieren/deaktivieren...",
+            options=options,
+            min_values=0,
+            max_values=len(options),
+            custom_id=f"settings:{guild_id}:features",
+            row=1
+        )
+    
+    async def callback(self, interaction):
+        view = self.view
+        if not isinstance(view, SettingsView):
+            return
+        
+        selected = set(self.values) if self.values else set()
+        
+        # Setze alle Features basierend auf Auswahl
+        view.leveling_enabled = "leveling" in selected
+        view.levelup_messages_enabled = "levelup" in selected
+        view.nanomon_reply_enabled = "nanomon" in selected
+        view.approved_reply_enabled = "approved" in selected
+        view.raid_reminder_enabled = "raid_reminder" in selected
+        view.auto_reminder_enabled = "auto_reminder" in selected
+        
+        # Update Embed
+        await interaction.response.edit_message(
+            embed=view.build_embed(),
+            view=view
+        )
+        
+        # Zähle Änderungen
+        changed = len(selected)
+        await interaction.followup.send(
+            f"✅ {changed} Features aktualisiert",
+            ephemeral=True
+        )
+
+
+class SettingsResetButton(discord.ui.Button):
+    """Button zum Zurücksetzen auf Standardwerte."""
+    
+    def __init__(self, bot: "RewriteDiscordBot", guild_id: int):
+        super().__init__(
+            style=discord.ButtonStyle.danger,
+            label="Zurücksetzen",
+            emoji="🔄",
+            custom_id=f"settings:{guild_id}:reset",
+            row=2
+        )
+        self.bot = bot
+        self.guild_id = guild_id
+    
+    async def callback(self, interaction):
+        view = self.view
+        if not isinstance(view, SettingsView):
+            return
+        
+        # Reset auf Defaults
+        view.planner_channel_id = None
+        view.participants_channel_id = None
+        view.raidlist_channel_id = None
+        view.leveling_enabled = True
+        view.levelup_messages_enabled = True
+        view.nanomon_reply_enabled = True
+        view.approved_reply_enabled = True
+        view.raid_reminder_enabled = False
+        view.auto_reminder_enabled = False
+        view.message_xp_interval_seconds = 15
+        view.levelup_message_cooldown_seconds = 20
+        
+        await interaction.response.edit_message(
+            embed=view.build_embed(),
+            view=view
+        )
+        await interaction.followup.send(
+            "🔄 Alle Einstellungen auf Standard zurückgesetzt.\n"
+            "Klicke 'Speichern' um die Änderungen zu übernehmen.",
+            ephemeral=True
+        )
 
 class SettingsSaveButton(discord.ui.Button):
     def __init__(self, bot: "RewriteDiscordBot", guild_id: int):
@@ -417,6 +613,7 @@ class SettingsSaveButton(discord.ui.Button):
                     nanomon_reply_enabled=view.nanomon_reply_enabled,
                     approved_reply_enabled=view.approved_reply_enabled,
                     raid_reminder_enabled=view.raid_reminder_enabled,
+                    auto_reminder_enabled=view.auto_reminder_enabled,
                     message_xp_interval_seconds=view.message_xp_interval_seconds,
                     levelup_message_cooldown_seconds=view.levelup_message_cooldown_seconds,
                 ),
@@ -439,6 +636,7 @@ class SettingsSaveButton(discord.ui.Button):
                 f"Nanomon Reply: `{_on_off(feature_row.nanomon_reply_enabled)}`\n"
                 f"Approved Reply: `{_on_off(feature_row.approved_reply_enabled)}`\n"
                 f"Raid Reminder: `{_on_off(feature_row.raid_reminder_enabled)}`\n"
+                f"Auto Reminder: `{_on_off(feature_row.auto_reminder_enabled)}`\n"
                 f"Message XP Intervall: `{feature_row.message_xp_interval_seconds}`\n"
                 f"Levelup Cooldown: `{feature_row.levelup_message_cooldown_seconds}`"
             ),

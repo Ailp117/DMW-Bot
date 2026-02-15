@@ -18,6 +18,7 @@ from services.backup_service import export_rows_to_sql
 from services.raid_service import finish_raid, planner_counts
 from utils.hashing import sha256_text
 from utils.runtime_helpers import *  # noqa: F401,F403
+from utils.runtime_helpers import FEATURE_FLAG_AUTO_REMINDER
 from utils.slots import compute_qualified_slot_users, memberlist_target_label, memberlist_threshold
 from utils.text import contains_approved_keyword, contains_nanomon_keyword
 
@@ -109,6 +110,7 @@ class RuntimeStateCalendarMixin(RuntimeMixinBase):
             nanomon_reply_enabled=True,
             approved_reply_enabled=True,
             raid_reminder_enabled=False,
+            auto_reminder_enabled=False,
             message_xp_interval_seconds=max(1, int(self.config.message_xp_interval_seconds)),
             levelup_message_cooldown_seconds=max(1, int(self.config.levelup_message_cooldown_seconds)),
         )
@@ -130,6 +132,8 @@ class RuntimeStateCalendarMixin(RuntimeMixinBase):
             flags |= FEATURE_FLAG_APPROVED_REPLY
         if settings.raid_reminder_enabled:
             flags |= FEATURE_FLAG_RAID_REMINDER
+        if settings.auto_reminder_enabled:
+            flags |= FEATURE_FLAG_AUTO_REMINDER
 
         message_interval = max(1, min(FEATURE_INTERVAL_MASK, int(settings.message_xp_interval_seconds)))
         levelup_cooldown = max(1, min(FEATURE_INTERVAL_MASK, int(settings.levelup_message_cooldown_seconds)))
@@ -157,6 +161,7 @@ class RuntimeStateCalendarMixin(RuntimeMixinBase):
             nanomon_reply_enabled=bool(flags & FEATURE_FLAG_NANOMON_REPLY),
             approved_reply_enabled=bool(flags & FEATURE_FLAG_APPROVED_REPLY),
             raid_reminder_enabled=bool(flags & FEATURE_FLAG_RAID_REMINDER),
+            auto_reminder_enabled=bool(flags & FEATURE_FLAG_AUTO_REMINDER),
             message_xp_interval_seconds=max(1, int(message_interval)),
             levelup_message_cooldown_seconds=max(1, int(levelup_cooldown)),
         )
@@ -169,6 +174,7 @@ class RuntimeStateCalendarMixin(RuntimeMixinBase):
             f"nanomon={int(settings.nanomon_reply_enabled)}|"
             f"approved={int(settings.approved_reply_enabled)}|"
             f"raid_reminder={int(settings.raid_reminder_enabled)}|"
+            f"auto_reminder={int(settings.auto_reminder_enabled)}|"
             f"xp_interval={int(settings.message_xp_interval_seconds)}|"
             f"levelup_cooldown={int(settings.levelup_message_cooldown_seconds)}"
         )

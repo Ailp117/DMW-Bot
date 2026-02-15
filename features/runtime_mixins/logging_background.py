@@ -23,6 +23,10 @@ from utils.runtime_helpers import *  # noqa: F401,F403
 from utils.slots import compute_qualified_slot_users, memberlist_target_label, memberlist_threshold
 from utils.text import contains_approved_keyword, contains_nanomon_keyword
 from utils.runtime_helpers import (
+    AUTO_REMINDER_ADVANCE_SECONDS,
+    AUTO_REMINDER_CACHE_PREFIX,
+    AUTO_REMINDER_KIND,
+    AUTO_REMINDER_MIN_FILL_PERCENT,
     LOG_FORWARD_BATCH_INTERVAL_SECONDS,
     RAID_START_CACHE_PREFIX,
     RAID_START_KIND,
@@ -469,11 +473,102 @@ class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
             try:
                 async with self._state_lock:
                     sent = await self._run_raid_reminders_once()
-                    if sent > 0:
+                    auto_sent = await self._run_auto_reminders_once()
+                    if sent > 0 or auto_sent > 0:
                         await self._persist(dirty_tables={"debug_cache"})
             except Exception:
                 log.exception("Raid reminder worker failed")
             await asyncio.sleep(RAID_REMINDER_WORKER_SLEEP_SECONDS)
+
+    async def _run_auto_reminders_once(self, *, now_utc: datetime | None = None) -> int:
+        """Send auto-reminders 2h before raid if slots < 50% filled."""
+        berlin_tz = ZoneInfo("Europe/Berlin")
+        current_berlin = now_utc.astimezone(berlin_tz) if now_utc else datetime.now(berlin_tz)
+        sent = 0
+        participants_channel_by_id: dict[int, Any | None] = {}
+        
+        for raid in self.repo.list_open_raids():
+            feature_settings = self._get_guild_feature_settings(raid.guild_id)
+            if not feature_settings.auto_reminder_enabled:
+                continue
+
+            settings = self.repo.ensure_settings(raid.guild_id)
+            participants_channel_id = int(settings.participants_channel_id or 0)
+            if participants_channel_id <= 0:
+                continue
+            if participants_channel_id not in participants_channel_by_id:
+                participants_channel_by_id[participants_channel_id] = await self._get_text_channel(
+                    participants_channel_id
+                )
+            participants_channel = participants_channel_by_id[participants_channel_id]
+            if participants_channel is None:
+                continue
+
+            days, times = self.repo.list_raid_options(raid.id)
+            day_users, time_users = self.repo.vote_user_sets(raid.id)
+            threshold = memberlist_threshold(raid.min_players)
+            qualified_slots, _ = compute_qualified_slot_users(
+                days=days,
+                times=times,
+                day_users=day_users,
+                time_users=time_users,
+                threshold=threshold,
+            )
+            
+            for (day_label, time_label), users in qualified_slots.items():
+                start_at = self._parse_slot_start_at_berlin(day_label, time_label)
+                if start_at is None:
+                    continue
+                
+                delta_seconds = (start_at - current_berlin).total_seconds()
+                
+                # Auto Reminder: 2h before start if < 50% filled
+                if 0 <= delta_seconds <= AUTO_REMINDER_ADVANCE_SECONDS:
+                    # Check if already reminded
+                    reminder_cache_key = self._auto_reminder_cache_key(raid.id, day_label, time_label)
+                    if self.repo.get_debug_cache(reminder_cache_key) is not None:
+                        continue
+                    
+                    # Calculate fill percentage
+                    total_slots = len(days) * len(times)
+                    filled_slots = len(users)
+                    fill_percent = (filled_slots / total_slots * 100) if total_slots > 0 else 0
+                    
+                    if fill_percent < AUTO_REMINDER_MIN_FILL_PERCENT:
+                        # Build link to original raid message
+                        raid_link = ""
+                        if raid.message_id and raid.channel_id:
+                            raid_link = f"\n🔗 [Zur Abstimmung](https://discord.com/channels/{raid.guild_id}/{raid.channel_id}/{raid.message_id})"
+                        
+                        content = (
+                            f"📢 **Noch Plätze frei!**\n"
+                            f"🎮 **{raid.dungeon}** startet in 2 Stunden\n"
+                            f"🆔 Raid `{raid.display_id}`\n"
+                            f"📅 {day_label} um {time_label}\n"
+                            f"👥 Belegt: {filled_slots}/{total_slots} ({fill_percent:.0f}%)\n"
+                            f"➡️ Melde dich jetzt an!"
+                            f"{raid_link}"
+                        )
+                        posted = await self._send_channel_message(
+                            participants_channel,
+                            content=content,
+                        )
+                        if posted is None:
+                            continue
+                        self.repo.upsert_debug_cache(
+                            cache_key=reminder_cache_key,
+                            kind=AUTO_REMINDER_KIND,
+                            guild_id=raid.guild_id,
+                            raid_id=raid.id,
+                            message_id=posted.id,
+                            payload_hash=sha256_text(content),
+                        )
+                        sent += 1
+        return sent
+
+    @classmethod
+    def _auto_reminder_cache_key(cls, raid_id: int, day_label: str, time_label: str) -> str:
+        return f"{AUTO_REMINDER_CACHE_PREFIX}:{int(raid_id)}:{day_label}:{time_label}"
 
     async def _run_integrity_cleanup_once(self) -> int:
         open_raids_by_id = {int(raid.id): raid for raid in self.repo.list_open_raids()}
