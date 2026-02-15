@@ -68,8 +68,6 @@ class RewriteDiscordBot(
         self._guild_feature_settings: dict[int, GuildFeatureSettings] = {}
         self._acked_interactions: set[int] = set()
         self._raidlist_hash_by_guild: dict[int, str] = {}
-        self._raid_calendar_hash_by_guild: dict[int, str] = {}
-        self._raid_calendar_month_key_by_guild: dict[int, int] = {}
         self._username_sync_next_run_by_guild: dict[int, float] = {}
         self._level_state_dirty = False
         self._last_level_persist_monotonic = time.monotonic()

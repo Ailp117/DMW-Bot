@@ -40,20 +40,25 @@ SLOT_TEMP_ROLE_CACHE_PREFIX = "slotrole"
 RAID_REMINDER_KIND = "raid_reminder"
 RAID_REMINDER_CACHE_PREFIX = "raidrem"
 RAID_REMINDER_ADVANCE_SECONDS = 10 * 60
+RAID_START_KIND = "raid_start"
+RAID_START_CACHE_PREFIX = "raidstart"
+RAID_START_TOLERANCE_SECONDS = 60
 RAID_REMINDER_WORKER_SLEEP_SECONDS = 30
-RAID_CALENDAR_CONFIG_KIND = "raid_calendar_cfg"
-RAID_CALENDAR_CONFIG_CACHE_PREFIX = "raid_calendar_cfg"
-RAID_CALENDAR_MESSAGE_KIND = "raid_calendar_msg"
-RAID_CALENDAR_MESSAGE_CACHE_PREFIX = "raid_calendar_msg"
-RAID_CALENDAR_GRID_COLUMNS = 7
-RAID_CALENDAR_GRID_ROWS = 5
 RAID_DATE_LOOKAHEAD_DAYS = 21
+RAID_CALENDAR_CONFIG_CACHE_PREFIX = "raidcal_cfg"
+RAID_CALENDAR_MESSAGE_CACHE_PREFIX = "raidcal_msg"
+RAID_CALENDAR_CONFIG_KIND = "raid_calendar_config"
+RAID_CALENDAR_MESSAGE_KIND = "raid_calendar_message"
+RAID_CALENDAR_GRID_ROWS = 5
+RAID_CALENDAR_GRID_COLUMNS = 7
 RAID_DATE_CACHE_DAYS_MAX = 25
 INTEGRITY_CLEANUP_SLEEP_SECONDS = 15 * 60
 DEFAULT_TIMEZONE_NAME = "Europe/Berlin"
 USERNAME_SYNC_WORKER_SLEEP_SECONDS = 10 * 60
 USERNAME_SYNC_RESCAN_SECONDS = 12 * 60 * 60
 LOG_FORWARD_QUEUE_MAX_SIZE = 1000
+LOG_FORWARD_BATCH_INTERVAL_SECONDS = 5
+AUTO_DELETE_COMMAND_MESSAGES = False
 PERSIST_FLUSH_MAX_ATTEMPTS = 3
 PERSIST_FLUSH_RETRY_BASE_SECONDS = 0.1
 PRIVILEGED_ONLY_HELP_COMMANDS = frozenset(
@@ -438,7 +443,6 @@ def _settings_embed(
     settings,
     guild_name: str,
     feature_settings: GuildFeatureSettings | None = None,
-    raid_calendar_channel_id: int | None = None,
 ):
     embed = discord.Embed(title=f"Settings: {guild_name}", color=discord.Color.blurple())
     embed.add_field(
@@ -454,11 +458,6 @@ def _settings_embed(
     embed.add_field(
         name="Raidlist Channel",
         value=f"`{settings.raidlist_channel_id}`" if settings.raidlist_channel_id else "nicht gesetzt",
-        inline=False,
-    )
-    embed.add_field(
-        name="Raid Kalender Channel",
-        value=f"`{raid_calendar_channel_id}`" if raid_calendar_channel_id else "nicht gesetzt",
         inline=False,
     )
     embed.add_field(name="Default Min Players", value=str(settings.default_min_players), inline=True)
@@ -505,6 +504,7 @@ def _settings_embed(
 
 __all__ = [
     "APPROVED_GIF_URL",
+    "AUTO_DELETE_COMMAND_MESSAGES",
     "BOT_MESSAGE_CACHE_PREFIX",
     "BOT_MESSAGE_INDEX_MAX_PER_CHANNEL",
     "BOT_MESSAGE_KIND",
@@ -544,6 +544,9 @@ __all__ = [
     "RAID_REMINDER_CACHE_PREFIX",
     "RAID_REMINDER_KIND",
     "RAID_REMINDER_WORKER_SLEEP_SECONDS",
+    "RAID_START_CACHE_PREFIX",
+    "RAID_START_KIND",
+    "RAID_START_TOLERANCE_SECONDS",
     "SLOT_TEMP_ROLE_CACHE_PREFIX",
     "SLOT_TEMP_ROLE_KIND",
     "STALE_RAID_CHECK_SECONDS",

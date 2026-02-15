@@ -1,174 +1,282 @@
 # DMW Raid Bot
 
-Ein Discord-Bot zur Planung, Verwaltung und Nachverfolgung von Raids inkl. persistenter Listen, Attendance-Tracking, Levelsystem und DB-Backups.
+Ein Discord-Bot zur Planung, Verwaltung und Nachverfolgung von Raids mit persistenter Raidliste, automatischen Teilnehmerlisten, Attendance-Tracking, Levelsystem und mehr.
 
 ## Features
 
-- Slash-Command-basierte Raidplanung (`/raidplan`) mit persistenter Raidliste.
-- Teilnehmer-/Memberlisten mit Wiederherstellung nach Neustart.
-- Template- und Settings-Verwaltung direkt im Bot.
-- Attendance-Tracking per Commands.
-- Temporäre Rollen für Raid-Organisation.
-- Level-/XP-System inkl. Voice-XP-Intervallen.
-- Automatische Datenbank-Schema-Anpassung beim Start (fehlende Tabellen/Spalten aller Bot-Modelle werden ergänzt).
-- Self-Tests, Logging und Health-Checks für den Betrieb.
-- Boot-Smoke-Checks beim Start (DB erreichbar, Pflichttabellen, offene Raids).
-- Automatische und manuelle SQL-Backups.
+### Raid-Management
+- **Raid-Planung** (`/raidplan`): Erstelle Raids mit Datum, Uhrzeit und Mindestteilnehmern via Modal
+- **Automatische Raidliste**: Übersicht aller offenen Raids mit qualifizierten Slots
+- **Teilnehmerlisten**: Automatisch erstellte Listen für jeden Zeit-Slot
+- **Attendance-Tracking**: Automatische Speicherung bei Raid-Abschluss
+- **Temporäre Rollen**: Für Raid-Organisation und Reminder
 
-## Voraussetzungen
+### Level-System
+- Message-XP mit konfigurierbaren Intervallen
+- Voice-XP für Zeit in Voice-Channels
+- Level-Up Benachrichtigungen
+- Persistente Level-Speicherung
 
-- Python **3.11+**
-- PostgreSQL (asynchron über `asyncpg`)
-- Discord Bot Token mit passenden Berechtigungen
+### Administration
+- Template-System für wiederkehrende Raids
+- Remote-Commands für Multi-Server Management
+- Automatische Datenbank-Backups
+- Self-Tests und Health-Checks
+- Singleton-Lock für sicheren Betrieb
 
-## Installation
+## Schnellstart
 
-1. Repository klonen.
-2. Gepinnte Abhängigkeiten installieren:
+### Voraussetzungen
+- Python 3.12+
+- PostgreSQL (optional, siehe [In-Memory-Modus](#in-memory-modus-für-testing))
+- Discord Bot Token
+
+### Installation
 
 ```bash
+# Repository klonen
+git clone <repo-url>
+cd DMW-Bot
+
+# Virtuelle Umgebung erstellen
+python -m venv .venv
+source .venv/bin/activate  # Linux/Mac
+# oder: .venv\Scripts\activate  # Windows
+
+# Abhängigkeiten installieren
 pip install -r requirements.txt
+
+# Konfiguration kopieren
+cp .env.example .env
 ```
 
-3. Optional: neueste stabile Versionen neu auflösen (für lokale Updates):
+### Konfiguration
 
-```bash
-python scripts/resolve_second_latest_requirements.py --input requirements.in --output requirements.txt
-```
-
-Für zweitneueste stabile Versionen kannst du optional `--offset 1` setzen.
-
-4. Umgebungsvariablen setzen (siehe unten).
-5. Bot starten:
-
-```bash
-python main.py
-```
-
-## Konfiguration (.env / GitHub Secrets)
-
-Mindestens erforderlich:
+Bearbeite die `.env` Datei:
 
 ```env
+# Erforderlich
 DISCORD_TOKEN=dein_discord_bot_token
+
+# Für normalen Betrieb mit Datenbank
 DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/dbname
+
+# Für lokales Testing (keine Datenbank nötig)
+USE_IN_MEMORY_DB=true
 ```
 
-Wichtige optionale Variablen:
+### Bot starten
 
-```env
-DB_ECHO=0
-ENABLE_MESSAGE_CONTENT_INTENT=true
-LEVEL_PERSIST_INTERVAL_SECONDS=120
-MESSAGE_XP_INTERVAL_SECONDS=15
-LEVELUP_MESSAGE_COOLDOWN_SECONDS=20
+```bash
+# Normaler Betrieb
+python -m bot.runtime
 
-LOG_GUILD_ID=0
-LOG_CHANNEL_ID=0
-DISCORD_LOG_LEVEL=INFO
-
-SELF_TEST_INTERVAL_SECONDS=900
-BACKUP_INTERVAL_SECONDS=21600
-
-RAIDLIST_DEBUG_CHANNEL_ID=0
-MEMBERLIST_DEBUG_CHANNEL_ID=0
+# Mit In-Memory-DB (Testing)
+USE_IN_MEMORY_DB=true python -m bot.runtime
 ```
 
-Für GitHub Actions (`.github/workflows/bot.yml`) werden mindestens diese Secrets erwartet:
+## Commands
 
-- `DISCORD_TOKEN`
-- `DATABASE_URL`
+### Raid-Management
+| Command | Beschreibung |
+|---------|-------------|
+| `/raidplan <dungeon>` | Neuen Raid erstellen |
+| `/raid_finish <raid_id>` | Raid abschließen (nur Ersteller) |
+| `/raidlist` | Raidliste aktualisieren/anzeigen |
+| `/cancel_all_raids` | Alle offenen Raids abbrechen (Admin) |
 
-Zusätzlich unterstützt der Bot (optional) diese Secrets/ENVs aus `config.py`:
+### Einstellungen
+| Command | Beschreibung |
+|---------|-------------|
+| `/settings` | Bot-Konfiguration (Channels, Features) |
+| `/template_config` | Templates aktivieren/deaktivieren |
+| `/status` | Bot-Status und Gesundheit |
 
-- `DB_ECHO`
-- `ENABLE_MESSAGE_CONTENT_INTENT`
-- `LOG_GUILD_ID`
-- `LOG_CHANNEL_ID`
-- `DISCORD_LOG_LEVEL`
-- `SELF_TEST_INTERVAL_SECONDS`
-- `BACKUP_INTERVAL_SECONDS`
-- `RAIDLIST_DEBUG_CHANNEL_ID`
-- `MEMBERLIST_DEBUG_CHANNEL_ID`
+### Administration
+| Command | Beschreibung |
+|---------|-------------|
+| `/backup_db` | Manuelles Datenbank-Backup |
+| `/remote_guilds` | Liste verbundener Server |
+| `/remote_cancel_all_raids` | Raids auf anderem Server canceln |
+| `/remote_raidlist` | Raidlist auf anderem Server refreshen |
+| `/purge <n>` | Letzte n Nachrichten löschen |
+| `/restart` | Bot neustarten (privilegierter User) |
 
+### Hilfe
+| Command | Beschreibung |
+|---------|-------------|
+| `/help` | Verfügbare Commands |
+| `/help2` | Detaillierte Anleitung |
+| `/id` | Deine XP-ID Card |
 
-## Wichtige Commands (Auszug)
+## In-Memory-Modus für Testing
 
-- `/raidplan` – neuen Raid planen
-- `/raidlist` – aktuelle Raidliste anzeigen
-- `/dungeonlist` – aktive Dungeons anzeigen
-- `/settings` – Bot-Einstellungen verwalten
-- `/template_config` – Raid-Templates konfigurieren
-- `/cancel_all_raids` – alle offenen Raids abbrechen (Admin)
-- `/backup_db` – manuelles DB-Backup (privilegierter Nutzer)
-- `/status` – Bot-Status prüfen
-- `/help` / `/help2` – Hilfe anzeigen
+Für lokale Entwicklung kannst du den Bot ohne Datenbank starten:
 
-## Raid-Teilnahmezaehler (DB-only)
+```bash
+USE_IN_MEMORY_DB=true python -m bot.runtime
+```
 
-- Bei `raid_finish` wird pro teilnehmendem User ein Eintrag in `raid_attendance` gespeichert.
-- Der Teilnahmezaehler startet bei `0` und steigt pro abgeschlossenen Raid mit Teilnahme um `+1`.
-- Der aktuelle Wert ergibt sich aus der Anzahl der `present`-Eintraege in `raid_attendance` pro `guild_id + user_id`.
-- Es gibt dafuer aktuell bewusst keinen Slash-Command; Speicherung erfolgt nur in der Datenbank.
+**Vorteile:**
+- Keine PostgreSQL-Installation nötig
+- Alle Daten werden im RAM gehalten
+- Keine Persistenz (Daten gehen beim Beenden verloren)
+- Ideal für Tests ohne echte Daten zu verändern
+
+## VS Code Debugging
+
+Die `.vscode/launch.json` enthält vorkonfigurierte Debug-Profile:
+
+1. **Bot: In-Memory (Local)** - Testing ohne DB
+2. **Bot: Full Local** - Mit lokaler PostgreSQL
+
+Drücke `F5` in VS Code um den Debugger zu starten.
+
+## Konfiguration
+
+### Umgebungsvariablen
+
+| Variable | Beschreibung | Standard |
+|----------|-------------|----------|
+| `DISCORD_TOKEN` | Discord Bot Token (erforderlich) | - |
+| `DATABASE_URL` | PostgreSQL Verbindungs-URL | - |
+| `USE_IN_MEMORY_DB` | In-Memory-Modus aktivieren | false |
+| `PRIVILEGED_USER_ID` | Admin User ID | 403988960638009347 |
+| `LOG_GUILD_ID` | Guild für Log-Channel | 0 |
+| `LOG_CHANNEL_ID` | Channel für Logs | 0 |
+| `RAIDLIST_DEBUG_CHANNEL_ID` | Debug-Channel für Raidlist | 0 |
+| `MEMBERLIST_DEBUG_CHANNEL_ID` | Debug-Channel für Memberlist | 0 |
+| `SELF_TEST_INTERVAL_SECONDS` | Intervall für Self-Tests | 900 |
+| `BACKUP_INTERVAL_SECONDS` | Intervall für Backups | 21600 |
+
+### Feature-Einstellungen
+
+Über `/settings` konfigurierbar:
+
+- `leveling_enabled` - XP-System aktivieren
+- `levelup_messages_enabled` - Level-Up Benachrichtigungen
+- `nanomon_reply_enabled` - Nanomon-Keyword Reaktionen
+- `approved_reply_enabled` - Approved-Keyword Reaktionen
+- `raid_reminder_enabled` - Automatische Raid-Erinnerungen
+- `message_xp_interval_seconds` - XP-Interval für Messages
+- `levelup_message_cooldown_seconds` - Cooldown für Level-Up Nachrichten
+
+## Raid-Erstellung Workflow
+
+1. User gibt `/raidplan <Dungeon>` ein
+2. Bot öffnet Modal mit:
+   - Datum (Text, z.B. "20.02.2026, 21.02.2026")
+   - Uhrzeiten (Text, z.B. "20:00, 21:00")
+   - Min. Spieler (Zahl)
+3. Bot erstellt Raid und postet:
+   - Planner-Message im Umfragen-Channel
+   - Teilnehmerlisten für qualifizierte Slots
+   - Aktualisierte Raidliste
+
+## Datenbank-Schema
+
+Der Bot erstellt automatisch alle benötigten Tabellen:
+
+- `settings` - Guild-Konfigurationen
+- `dungeons` - Verfügbare Dungeons
+- `raids` - Offene/abgeschlossene Raids
+- `raid_options` - Tage/Zeiten pro Raid
+- `raid_votes` - User-Votes pro Option
+- `raid_posted_slots` - Gepostete Teilnehmerlisten
+- `raid_templates` - Auto-Templates
+- `raid_attendance` - Teilnahme-Tracking
+- `user_levels` - XP und Levels
+- `debug_cache` - Debug-Message Caching
 
 ## Backups
 
-- **Automatisch:** zyklisch über `BACKUP_INTERVAL_SECONDS` (Default: 21600s = 6h).
-- **Manuell:** per `/backup_db`.
-- **Speicherort:** `backups/db_backup.sql`.
+- **Automatisch**: Alle 6 Stunden (konfigurierbar)
+- **Manuell**: Via `/backup_db`
+- **Speicherort**: `backups/db_backup.sql`
 
-## Tests
+## Testing
 
 ```bash
+# Alle Tests ausführen
 pytest
+
+# Mit Coverage
+pytest --cov
+
+# Spezifischen Test
+pytest tests/test_phase3_raidlist_embed.py -v
 ```
 
-Die Tests decken u. a. Command-Registrierung, Berechtigungen, Konfigurationslogik, DB-Logging und View-/Raid-Regressionen ab.
+## Projektstruktur
 
-## Projektstruktur (Kurzüberblick)
+```
+DMW-Bot/
+├── bot/
+│   ├── runtime.py          # Haupt-Bot Klasse
+│   ├── config.py           # Konfiguration
+│   └── discord_api.py      # Discord.py Layer
+├── commands/
+│   └── runtime_commands.py # Slash-Commands
+├── features/
+│   └── runtime_mixins/     # Feature-Module
+│       ├── events.py       # Lifecycle
+│       ├── logging_background.py  # Logs & Worker
+│       ├── raid_ops.py     # Raid-Operationen
+│       └── state_calendar.py      # State-Management
+├── services/               # Business-Logik
+│   ├── raid_service.py
+│   ├── leveling_service.py
+│   └── persistence_service.py
+├── db/                     # Datenbank
+│   ├── models.py
+│   ├── repository.py
+│   └── session.py
+├── views/                  # Discord UI
+│   └── raid_views.py
+├── utils/                  # Hilfsfunktionen
+│   └── runtime_helpers.py
+└── tests/                  # Tests
+```
 
-- `bot/runtime.py` – Runtime-Bootstrap + Bot-Klasse + Event/Background-Orchestrierung
-- `bot/discord_api.py` – Discord.py-Import-Layer (`discord`, `app_commands`)
-- `features/runtime_mixins/*.py` – Runtime-Featuremodule (Lifecycle, Logging/Worker, State/Calendar, Raid-Operations)
-- `commands/runtime_commands.py` – Slash-Command-Registrierung (`register_runtime_commands(bot)`)
-- `views/raid_views.py` – Discord UI (Views, Buttons, Modals) für Raid/Settings/Kalender
-- `utils/runtime_helpers.py` – gemeinsame Runtime-Konstanten + Helper-Funktionen
-- `services/` – Business-Logik (Raid, Leveling, Persistenz, Settings, Backup, Templates)
-- `db/` – Repository, Models, Session/Schema-Guard
-- `utils/` – Hilfsfunktionen (Hashing, Text, Slots, Level-Math)
-- `tests/` – automatisierte Tests
-- `FEATURE_MATRIX.md` – Zuordnung Feature → Code → DB → Tests
+## Betriebshinweise
 
-## Runtime Bootstrap und Erweiterung
+### Singleton-Lock
+Der Bot nutzt einen Postgres Advisory Lock um Doppel-Instanzen zu vermeiden.
 
-Der Runtime-Startpfad ist jetzt klar getrennt:
+### Berechtigungen
+Der Bot benötigt:
+- Slash-Command Registrierung
+- Nachrichten lesen/schreiben
+- Reaktionen hinzufügen
+- Rollen verwalten (für Temp-Rollen)
+- Channel-Historie lesen
 
-1. `RewriteDiscordBot.setup_hook()` lädt DB-State und restauriert persistente Views.
-2. `RewriteDiscordBot._register_commands()` delegiert an `commands.runtime_commands.register_runtime_commands(self)`.
-3. Runtime-Featurelogik kommt über Mixins aus `features/runtime_mixins/*`.
-4. Discord-UI-Komponenten liegen in `views/raid_views.py`.
-5. Gemeinsame Runtime-Helfer liegen in `utils/runtime_helpers.py`.
-6. Geschäftslogik bleibt in `services/*` und wird aus Commands/Views genutzt.
+### Logging
+- Lokal: Console/Terminal
+- Discord: Terminal-ähnliches Embed im konfigurierten Log-Channel
+- Logs werden gebündelt alle 5 Sekunden gesendet und aktualisiert
 
-Neue Features hängst du so ein:
+## CI/CD
 
-1. Business-Logik in `services/<feature>_service.py`.
-2. Interaktive UI in `views/<feature>_views.py`.
-3. Slash-Commands in `commands/<feature>_commands.py` mit `register_*_commands(bot)`.
-4. Runtime-Methoden in `features/runtime_mixins/<feature>.py` als Mixin kapseln.
-5. In `runtime.py` den Mixin in der Vererbung von `RewriteDiscordBot` ergänzen und ggf. `register_*` aufrufen.
+### GitHub Actions
 
-## Hinweise für den Betrieb
+- **Bot-Workflow**: Startet alle 6 Stunden neu
+- **Tests**: Laufen bei jedem Push/PR
+- **Dependency Updates**: Monatlich automatisch
 
-- Der Bot nutzt einen Singleton-Lock in Postgres, um Doppel-Instanzen zu vermeiden.
-- Stelle sicher, dass der Bot die nötigen Channel- und Rollenrechte im Discord-Server besitzt.
-- Bei Produktionsbetrieb sollten Logs und Backups regelmäßig überwacht werden.
+### 24/7-Betrieb
 
-## CI / 24-7-Strategie
+- Periodischer Neustart alle 6h als Stabilitätsstrategie
+- Concurrency-Setting: Nur eine Instanz aktiv
+- Automatische Backups
 
-- Der Runtime-Workflow startet alle 6 Stunden neu (`schedule`) und zusätzlich manuell via `workflow_dispatch`.
-- Ein Monatsend-Job aktualisiert `requirements.txt` automatisch auf zweitneueste stabile Releases.
-- Wenn ein Direkt-Push auf den Ziel-Branch blockiert ist (z. B. Branch-Protection), erstellt der Monatsend-Job automatisch ein Fallback-PR.
-- Auf jedem Push/PR läuft `pytest -q`; bei Fehlern schlägt CI fehl.
-- Durch `concurrency` wird nur eine Runtime-Instanz aktiv gehalten.
-- Ein harter 24/7-Betrieb ist auf GitHub-Hosted-Runnern nur "24/7-ish" möglich, daher der periodische Neustart als Stabilitätsstrategie.
+## Support
+
+Bei Problemen oder Fragen:
+1. Prüfe die Logs (lokal oder im Log-Channel)
+2. Führe `/status` aus für Bot-Gesundheit
+3. Checke die Self-Test Ergebnisse
+
+## Lizenz
+
+[MIT License](LICENSE)

@@ -323,6 +323,36 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             details = [empty_text]
         return "\n".join([*header, "", *body, "", "Details:", *details])
 
+    def _build_debug_embed(
+        self,
+        *,
+        topic: str,
+        guild_id: int,
+        summary: list[str],
+        lines: list[str] | None = None,
+        empty_text: str = "- Keine Eintraege.",
+    ) -> Any:
+        guild_name = self._guild_display_name(guild_id)
+        embed = discord.Embed(
+            title=f"🐛 {topic}",
+            color=discord.Color.orange(),
+            timestamp=datetime.now(UTC),
+        )
+        embed.add_field(name="Server", value=f"**{guild_name}**", inline=False)
+        for item in summary:
+            if item:
+                if ":" in item:
+                    key, _, value = item.partition(":")
+                    embed.add_field(name=key.strip(), value=value.strip(), inline=True)
+        details = [item for item in (lines or []) if item]
+        if not details:
+            details = [empty_text]
+        details_text = "\n".join(details)
+        if len(details_text) > 1000:
+            details_text = details_text[:997] + "..."
+        embed.add_field(name="Details", value=f"```\n{details_text}\n```", inline=False)
+        return embed
+
     async def _mirror_debug_payload(
         self,
         *,
@@ -339,8 +369,7 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
         if channel is None:
             return
 
-        payload = content if len(content) <= 1900 else f"{content[:1897]}..."
-        payload_hash = sha256_text(payload)
+        payload_hash = sha256_text(content)
         cached = self.repo.get_debug_cache(cache_key)
 
         if cached is not None and cached.payload_hash == payload_hash and cached.message_id:
@@ -348,10 +377,23 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             if existing is not None:
                 return
 
+        topic = "Debug"
+        if "raidlist" in cache_key:
+            topic = "Raidlist Debug"
+        elif "memberlist" in cache_key:
+            topic = "Memberlist Debug"
+
+        embed = self._build_debug_embed(
+            topic=topic,
+            guild_id=guild_id,
+            summary=[],
+            lines=content.split("\n"),
+        )
+
         if cached is not None and cached.message_id:
             existing = await _runtime_mod()._safe_fetch_message(channel, cached.message_id)
             if existing is not None:
-                edited = await _runtime_mod()._safe_edit_message(existing, content=payload)
+                edited = await _runtime_mod()._safe_edit_message(existing, embed=embed)
                 if edited:
                     self.repo.upsert_debug_cache(
                         cache_key=cache_key,
@@ -363,7 +405,7 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                     )
                     return
 
-        posted = await self._send_channel_message(channel, content=payload)
+        posted = await self._send_channel_message(channel, embed=embed)
         if posted is None:
             return
         self.repo.upsert_debug_cache(
@@ -536,16 +578,6 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
         if settings and settings.raidlist_channel_id == channel_id and settings.raidlist_message_id:
             message_ids.add(int(settings.raidlist_message_id))
 
-        calendar_channel_id = self._get_raid_calendar_channel_id(guild_id)
-        calendar_row = self._get_raid_calendar_state_row(guild_id)
-        if (
-            calendar_channel_id is not None
-            and int(calendar_channel_id) == int(channel_id)
-            and calendar_row is not None
-            and int(calendar_row.message_id or 0) > 0
-        ):
-            message_ids.add(int(calendar_row.message_id))
-
         for row in self.repo.list_debug_cache(kind=BOT_MESSAGE_KIND, guild_id=guild_id, raid_id=channel_id):
             if row.message_id:
                 message_ids.add(int(row.message_id))
@@ -573,12 +605,6 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             and int(settings.raidlist_message_id or 0) == int(message_id)
         ):
             settings.raidlist_message_id = None
-
-        calendar_row = self._get_raid_calendar_state_row(guild_id)
-        if calendar_row is not None and int(calendar_row.message_id or 0) == int(message_id):
-            self.repo.delete_debug_cache(self._raid_calendar_message_cache_key(guild_id))
-            self._raid_calendar_hash_by_guild.pop(int(guild_id), None)
-            self._raid_calendar_month_key_by_guild.pop(int(guild_id), None)
 
     async def _delete_indexed_bot_messages_in_channel(self, channel: Any, *, history_limit: int = 5000) -> int:
         guild = getattr(channel, "guild", None)
@@ -966,7 +992,7 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                 slot_role = await self._ensure_slot_temp_role(raid, day_label=day_label, time_label=time_label)
                 if slot_role is not None:
                     await self._sync_slot_role_members(raid, role=slot_role, user_ids=users)
-                    content = f"🔔 {slot_role.mention}"
+                    # Role wird nicht mehr bei der Memberliste gepingt, sondern nur beim Raid Reminder
             debug_lines.append(f"- {day_label} {time_label}: {', '.join(f'<@{u}>' for u in users)}")
             row = existing_rows.get((day_label, time_label))
             old_msg_for_recreate = None
@@ -1135,7 +1161,6 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             field_name = f"#{raid.display_id} • {raid.dungeon}"
             field_value = "\n".join(
                 [
-                    f"👤 <@{raid.creator_id}>",
                     f"👥 Min `{required_label}` • ✅ Slots `{len(qualified_slots)}`",
                     f"🗳️ Vollständig abgestimmt `{complete_voters}`",
                     f"🕰️ Zeitzone `{timezone_name}`",
@@ -1329,7 +1354,6 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                 attendance_rows=result.attendance_rows,
             )
             await self._force_raidlist_refresh(guild_id)
-            await self._force_raid_calendar_refresh(guild_id)
             persisted = await self._persist()
 
         if not persisted:
@@ -1357,5 +1381,4 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
 
         count = cancel_all_open_raids(self.repo, guild_id=guild_id)
         await self._force_raidlist_refresh(guild_id)
-        await self._force_raid_calendar_refresh(guild_id)
         return count

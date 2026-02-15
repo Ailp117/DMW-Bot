@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, cast
 
 from sqlalchemy import and_, delete, select, tuple_, update
 
@@ -33,6 +34,8 @@ from db.repository import (
     UserLevelRecord,
 )
 from db.session import SessionManager
+
+log = logging.getLogger("dmw.persistence")
 
 
 @dataclass(frozen=True)
@@ -244,7 +247,11 @@ class RepositoryPersistence:
     async def load(self, repo: InMemoryRepository) -> None:
         async with self._lock:
             repo.reset()
+            if self.session_manager.is_disabled:
+                log.info("In-memory DB mode: skipping data load from database")
+                return
             async with self.session_manager.session_scope() as session:
+                session = cast(Any, session)
                 dungeons = (await session.execute(select(Dungeon))).scalars().all()
                 settings = (await session.execute(select(GuildSettings))).scalars().all()
                 raids = (await session.execute(select(Raid))).scalars().all()
@@ -367,6 +374,8 @@ class RepositoryPersistence:
             self._hinted_flushes_since_full_scan = 0
 
     async def flush(self, repo: InMemoryRepository, *, dirty_tables: Iterable[str] | None = None) -> None:
+        if self.session_manager.is_disabled:
+            return
         async with self._lock:
             if self._last_flush_rows is None:
                 previous_snapshot = {table_name: {} for table_name in self._TABLE_SPECS}

@@ -44,6 +44,10 @@ class _DummySessionManager:
         self.session_scope_calls = 0
         self.sessions: list[_DummySession] = []
 
+    @property
+    def is_disabled(self) -> bool:
+        return False
+
     @asynccontextmanager
     async def session_scope(self):
         self.session_scope_calls += 1

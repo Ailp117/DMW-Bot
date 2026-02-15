@@ -1,0 +1,26 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Bot: In-Memory (Local)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "bot.runtime",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "envFile": "${workspaceFolder}/.env"
+        },
+        {
+            "name": "Bot: Full Local",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "bot.runtime",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "envFile": "${workspaceFolder}/.env",
+            "env": {
+                "USE_IN_MEMORY_DB": "false"
+            }
+        }
+    ]
+}

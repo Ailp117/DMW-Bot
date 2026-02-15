@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 
 TRUTHY_VALUES = {"1", "true", "yes", "on"}
@@ -32,6 +37,7 @@ def env_int(name: str, *, default: int) -> int:
 class BotConfig:
     discord_token: str
     database_url: str
+    use_in_memory_db: bool
     privileged_user_id: int
     db_echo: bool
     enable_message_content_intent: bool
@@ -48,8 +54,8 @@ class BotConfig:
 
 
     def validate(self) -> None:
-        if not self.database_url:
-            raise ValueError("DATABASE_URL must be set")
+        if not self.use_in_memory_db and not self.database_url:
+            raise ValueError("DATABASE_URL must be set (or USE_IN_MEMORY_DB=true)")
         if self.privileged_user_id <= 0:
             raise ValueError("PRIVILEGED_USER_ID must be > 0")
         if self.level_persist_interval_seconds < 5:
@@ -72,9 +78,11 @@ class BotConfig:
 
 
 def load_config() -> BotConfig:
+    use_in_memory_db = os.getenv("USE_IN_MEMORY_DB", "").strip().lower() in ("1", "true", "yes")
     cfg = BotConfig(
         discord_token=os.getenv("DISCORD_TOKEN", ""),
         database_url=os.getenv("DATABASE_URL", ""),
+        use_in_memory_db=use_in_memory_db,
         privileged_user_id=env_int("PRIVILEGED_USER_ID", default=403988960638009347),
         db_echo=env_bool("DB_ECHO", default=False),
         enable_message_content_intent=env_bool("ENABLE_MESSAGE_CONTENT_INTENT", default=True),

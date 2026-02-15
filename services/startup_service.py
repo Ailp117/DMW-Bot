@@ -17,8 +17,6 @@ EXPECTED_SLASH_COMMANDS = {
     "raidplan",
     "raid_finish",
     "raidlist",
-    "raidcalendar_rebuild",
-    "dungeonlist",
     "cancel_all_raids",
     "purge",
     "purgebot",

@@ -17,7 +17,7 @@ from services.admin_service import list_active_dungeons
 from services.backup_service import export_rows_to_sql
 from services.raid_service import build_raid_plan_defaults
 from services.settings_service import set_templates_enabled
-from views.raid_views import RaidDateSelectionView, SettingsView
+from views.raid_views import RaidCreateModal, SettingsView
 
 if TYPE_CHECKING:
     from bot.runtime import RewriteDiscordBot
@@ -57,7 +57,6 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
         async with bot._state_lock:
             settings = bot.repo.ensure_settings(interaction.guild.id, interaction.guild.name)
             feature_settings = bot._get_guild_feature_settings(interaction.guild.id)
-            calendar_channel_id = bot._get_raid_calendar_channel_id(interaction.guild.id)
         view = SettingsView(bot, guild_id=interaction.guild.id)
         sent = await _safe_send_initial(
             interaction,
@@ -67,7 +66,6 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
                 settings,
                 interaction.guild.name,
                 feature_settings,
-                raid_calendar_channel_id=calendar_channel_id,
             ),
             view=view,
         )
@@ -82,8 +80,6 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
 
         settings = bot.repo.ensure_settings(interaction.guild.id, interaction.guild.name)
         feature_settings = bot._get_guild_feature_settings(interaction.guild.id)
-        calendar_channel_id = bot._get_raid_calendar_channel_id(interaction.guild.id)
-        calendar_message_row = bot._get_raid_calendar_state_row(interaction.guild.id)
         open_raids = bot.repo.list_open_raids(interaction.guild.id)
         self_test_ok = bot.last_self_test_ok_at.isoformat() if bot.last_self_test_ok_at else "-"
         self_test_err = bot.last_self_test_error or "-"
@@ -104,8 +100,6 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
                 f"Raid Teilnehmerlisten Channel: `{settings.participants_channel_id}`\n"
                 f"Raidlist Channel: `{settings.raidlist_channel_id}`\n"
                 f"Raidlist Message: `{settings.raidlist_message_id}`\n"
-                f"Raid Kalender Channel: `{calendar_channel_id}`\n"
-                f"Raid Kalender Message: `{int(getattr(calendar_message_row, 'message_id', 0) or 0)}`\n"
                 f"Open Raids: `{len(open_raids)}`\n"
                 f"Self-Test OK: `{self_test_ok}`\n"
                 f"Self-Test Error: `{self_test_err}`"
@@ -163,14 +157,6 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
         await bot._reply(interaction, "Neustart wird eingeleitet.", ephemeral=True)
         await bot.close()
 
-    @bot.tree.command(name="dungeonlist", description="Aktive Dungeons")
-    async def dungeonlist_cmd(interaction):
-        names = list_active_dungeons(bot.repo)
-        if not names:
-            await bot._reply(interaction, "Keine aktiven Dungeons.", ephemeral=True)
-            return
-        await bot._reply(interaction, "\n".join(f"- {name}" for name in names), ephemeral=True)
-
     @bot.tree.command(name="raidplan", description="Erstellt einen Raid Plan (Datumsauswahl + Modal)")
     @app_commands.describe(dungeon="Dungeon Name")
     async def raidplan_cmd(interaction, dungeon: str):
@@ -196,31 +182,24 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
                     dungeon_name=dungeon,
                 )
             except ValueError as exc:
-                await bot._reply(interaction, f"Fehler: {exc}", ephemeral=True)
+                await bot._reply(interaction, f"Fehler: {exc}\nVerfuegbare Dungeons: Nanos, Skull", ephemeral=True)
                 return
 
-        view = RaidDateSelectionView(
+        modal = RaidCreateModal(
             bot,
-            owner_user_id=interaction.user.id,
             guild_id=interaction.guild.id,
             guild_name=interaction.guild.name,
             channel_id=int(settings.planner_channel_id),
             dungeon_name=dungeon,
-            default_days=defaults.days,
             default_times=defaults.times,
             default_min_players=defaults.min_players,
         )
-        sent = await _safe_send_initial(
-            interaction,
-            (
-                "Waehle ein oder mehrere Daten aus und klicke dann auf "
-                "`Weiter (Uhrzeiten + Min Spieler)`."
-            ),
-            ephemeral=True,
-            view=view,
-        )
-        if not sent:
-            await bot._reply(interaction, "Datumsauswahl konnte nicht geoeffnet werden.", ephemeral=True)
+        try:
+            await interaction.response.send_modal(modal)
+        except Exception as exc:
+            import logging
+            logging.getLogger("dmw").exception("Failed to open raid modal")
+            await bot._reply(interaction, f"Raid-Modal konnte nicht geoeffnet werden: {exc}", ephemeral=True)
 
     @raidplan_cmd.autocomplete("dungeon")
     async def raidplan_dungeon_autocomplete(interaction, current: str):
@@ -254,54 +233,6 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
             await bot._reply(interaction, "Raidlist Refresh fehlgeschlagen (DB).", ephemeral=True)
             return
         await bot._reply(interaction, "Raidlist aktualisiert.", ephemeral=True)
-
-    @bot.tree.command(
-        name="raidcalendar_rebuild",
-        description="Loescht den alten Raid-Kalender und baut ihn im konfigurierten Channel neu auf.",
-    )
-    @_admin_or_privileged_check()
-    async def raidcalendar_rebuild_cmd(interaction):
-        if not interaction.guild:
-            await bot._reply(interaction, "Nur im Server nutzbar.", ephemeral=True)
-            return
-        await bot._defer(interaction, ephemeral=True)
-
-        guild_id = int(interaction.guild.id)
-        async with bot._state_lock:
-            configured_channel_id = bot._get_raid_calendar_channel_id(guild_id)
-            if configured_channel_id is None:
-                rebuilt = False
-                persisted = True
-            else:
-                rebuilt = await bot._rebuild_raid_calendar_message_for_guild(guild_id)
-                persisted = await bot._persist(dirty_tables={"debug_cache"})
-
-        if configured_channel_id is None:
-            await _safe_followup(
-                interaction,
-                "Raid Kalender Channel ist nicht gesetzt. Bitte zuerst in /settings konfigurieren.",
-                ephemeral=True,
-            )
-            return
-        if not persisted:
-            await _safe_followup(
-                interaction,
-                "Kalender neu aufgebaut, aber DB-Speicherung fehlgeschlagen.",
-                ephemeral=True,
-            )
-            return
-        if rebuilt:
-            await _safe_followup(
-                interaction,
-                f"Raid Kalender wurde neu aufgebaut (Channel `{configured_channel_id}`).",
-                ephemeral=True,
-            )
-            return
-        await _safe_followup(
-            interaction,
-            "Raid Kalender konnte nicht neu aufgebaut werden (Channel nicht erreichbar).",
-            ephemeral=True,
-        )
 
     @bot.tree.command(name="cancel_all_raids", description="Bricht alle offenen Raids ab")
     @_admin_or_privileged_check()
@@ -361,7 +292,7 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
             app_commands.Choice(name="server", value="server"),
         ]
     )
-    async def purgebot_cmd(interaction, scope: app_commands.Choice[str], limit: int = 500):
+    async def purgebot_cmd(interaction, scope: str, limit: int = 500):
         if interaction.guild is None:
             await bot._reply(interaction, "Nur im Server nutzbar.", ephemeral=True)
             return
@@ -374,7 +305,7 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
             return
 
         channels: list[Any]
-        if scope.value == "channel":
+        if scope == "channel":
             if not isinstance(interaction.channel, discord.TextChannel):
                 await _safe_followup(interaction, "Nur im Textchannel nutzbar.", ephemeral=True)
                 return
@@ -388,7 +319,7 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
 
         total_deleted = 0
         touched_channels = 0
-        scan_history = scope.value == "channel"
+        scan_history = scope == "channel"
         scan_limit = limit if scan_history else min(limit, 150)
         for channel in channels:
             try:
@@ -411,7 +342,7 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
                 )
                 continue
 
-        where = "aktueller Channel" if scope.value == "channel" else f"{touched_channels} Channel(s)"
+        where = "aktueller Channel" if scope == "channel" else f"{touched_channels} Channel(s)"
         await _safe_followup(
             interaction,
             (
@@ -481,7 +412,6 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
         await bot._defer(interaction, ephemeral=True)
         async with bot._state_lock:
             await bot._refresh_raidlist_for_guild(target, force=True)
-            await bot._refresh_raid_calendar_for_guild(target, force=True)
             persisted = await bot._persist(dirty_tables={"settings", "debug_cache"})
 
         if not persisted:

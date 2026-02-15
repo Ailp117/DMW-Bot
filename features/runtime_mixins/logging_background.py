@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 import time
 from typing import Any, AsyncIterable, Awaitable, cast
+from zoneinfo import ZoneInfo
 
 from bot.discord_api import app_commands, discord
 from db.repository import RaidPostedSlotRecord, RaidRecord, UserLevelRecord
@@ -21,6 +22,12 @@ from utils.hashing import sha256_text
 from utils.runtime_helpers import *  # noqa: F401,F403
 from utils.slots import compute_qualified_slot_users, memberlist_target_label, memberlist_threshold
 from utils.text import contains_approved_keyword, contains_nanomon_keyword
+from utils.runtime_helpers import (
+    LOG_FORWARD_BATCH_INTERVAL_SECONDS,
+    RAID_START_CACHE_PREFIX,
+    RAID_START_KIND,
+    RAID_START_TOLERANCE_SECONDS,
+)
 
 
 class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
@@ -171,20 +178,68 @@ class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
 
     async def _log_forwarder_worker(self) -> None:
         await self.wait_until_ready()
+        log_buffer: list[str] = []
+        last_send_time = time.monotonic()
+        self._log_embed_message_id: int | None = None
+
         while not self.is_closed():
-            message = await self.log_forward_queue.get()
-            channel = self.log_channel
-            if channel is None:
-                continue
             try:
-                embed = self._build_discord_log_embed(message)
-                if embed is not None:
-                    await self._send_channel_message(channel, embed=embed)
-                else:
-                    fallback = message if len(message) <= 1800 else f"{message[:1797]}..."
-                    await self._send_channel_message(channel, content=f"```text\n{fallback}\n```")
-            except Exception:
+                message = await asyncio.wait_for(
+                    self.log_forward_queue.get(),
+                    timeout=LOG_FORWARD_BATCH_INTERVAL_SECONDS,
+                )
+                log_buffer.append(message)
+                last_send_time = time.monotonic()
+            except asyncio.TimeoutError:
+                pass
+
+            if not log_buffer:
                 continue
+
+            time_since_last = time.monotonic() - last_send_time
+            should_flush = time_since_last >= LOG_FORWARD_BATCH_INTERVAL_SECONDS
+
+            if should_flush and log_buffer:
+                self._log_embed_message_id = await self._flush_log_to_embed(log_buffer, self._log_embed_message_id)
+                log_buffer = []
+                last_send_time = time.monotonic()
+
+        if log_buffer:
+            await self._flush_log_to_embed(log_buffer, self._log_embed_message_id)
+
+    async def _flush_log_to_embed(self, log_buffer: list[str], existing_message_id: int | None) -> int | None:
+        channel = self.log_channel
+        if channel is None:
+            return None
+        if not log_buffer:
+            return existing_message_id
+
+        combined = "\n".join(log_buffer)
+        if len(combined) > 3500:
+            combined = combined[:3497] + "..."
+
+        embed = discord.Embed(
+            title="📟 Terminal Log",
+            description=f"```ansi\n{combined}\n```",
+            color=0x1E1E1E,
+        )
+        embed.set_footer(text=f"Lines: {len(log_buffer)} | DMW Bot")
+
+        try:
+            if existing_message_id is not None:
+                try:
+                    old_message = await channel.fetch_message(existing_message_id)
+                    await old_message.edit(embed=embed)
+                    return existing_message_id
+                except discord.NotFound:
+                    pass
+
+            new_message = await self._send_channel_message(channel, embed=embed)
+            if new_message:
+                return new_message.id
+        except Exception:
+            pass
+        return None
 
     async def _run_self_tests_once(self) -> None:
         registered = sorted(cmd.name for cmd in self.tree.get_commands())
@@ -252,6 +307,10 @@ class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
     def _raid_reminder_cache_key(cls, raid_id: int, day_label: str, time_label: str) -> str:
         return f"{RAID_REMINDER_CACHE_PREFIX}:{int(raid_id)}:{cls._slot_cache_suffix(day_label, time_label)}"
 
+    @classmethod
+    def _raid_start_cache_key(cls, raid_id: int, day_label: str, time_label: str) -> str:
+        return f"{RAID_START_CACHE_PREFIX}:{int(raid_id)}:{cls._slot_cache_suffix(day_label, time_label)}"
+
     @staticmethod
     def _parse_slot_start_at_utc(
         day_label: str,
@@ -277,8 +336,28 @@ class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
         except ValueError:
             return None
 
+    @staticmethod
+    def _parse_slot_start_at_berlin(day_label: str, time_label: str) -> datetime | None:
+        parsed_date = _parse_raid_date_from_label(day_label)
+        parsed_time = _parse_raid_time_label(time_label)
+        if parsed_date is None or parsed_time is None:
+            return None
+        berlin_tz = ZoneInfo("Europe/Berlin")
+        try:
+            return datetime(
+                parsed_date.year,
+                parsed_date.month,
+                parsed_date.day,
+                parsed_time[0],
+                parsed_time[1],
+                tzinfo=berlin_tz,
+            )
+        except ValueError:
+            return None
+
     async def _run_raid_reminders_once(self, *, now_utc: datetime | None = None) -> int:
-        current = now_utc or datetime.now(UTC)
+        berlin_tz = ZoneInfo("Europe/Berlin")
+        current_berlin = now_utc.astimezone(berlin_tz) if now_utc else datetime.now(berlin_tz)
         sent = 0
         participants_channel_by_id: dict[int, Any | None] = {}
         for raid in self.repo.list_open_raids():
@@ -309,49 +388,79 @@ class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
                 threshold=threshold,
             )
             for (day_label, time_label), users in qualified_slots.items():
-                start_at = self._parse_slot_start_at_utc(
-                    day_label,
-                    time_label,
-                    timezone_name=DEFAULT_TIMEZONE_NAME,
-                )
+                start_at = self._parse_slot_start_at_berlin(day_label, time_label)
                 if start_at is None:
                     continue
-                delta_seconds = (start_at - current).total_seconds()
-                if delta_seconds < 0 or delta_seconds > RAID_REMINDER_ADVANCE_SECONDS:
-                    continue
+                delta_seconds = (start_at - current_berlin).total_seconds()
+                
+                # Raid Reminder (10 Minuten vor Start)
+                if 0 <= delta_seconds <= RAID_REMINDER_ADVANCE_SECONDS:
+                    reminder_cache_key = self._raid_reminder_cache_key(raid.id, day_label, time_label)
+                    if self.repo.get_debug_cache(reminder_cache_key) is not None:
+                        continue
 
-                reminder_cache_key = self._raid_reminder_cache_key(raid.id, day_label, time_label)
-                if self.repo.get_debug_cache(reminder_cache_key) is not None:
-                    continue
+                    role = await self._ensure_slot_temp_role(raid, day_label=day_label, time_label=time_label)
+                    if role is None:
+                        continue
+                    await self._sync_slot_role_members(raid, role=role, user_ids=users)
 
-                role = await self._ensure_slot_temp_role(raid, day_label=day_label, time_label=time_label)
-                if role is None:
-                    continue
-                await self._sync_slot_role_members(raid, role=role, user_ids=users)
+                    content = (
+                        f"⏰ Raid-Erinnerung: **{raid.dungeon}** startet in ca. 10 Minuten.\n"
+                        f"🆔 Raid `{raid.display_id}`\n"
+                        f"📅 {day_label}\n"
+                        f"🕒 {time_label} ({DEFAULT_TIMEZONE_NAME})\n"
+                        f"{role.mention}"
+                    )
+                    posted = await self._send_channel_message(
+                        participants_channel,
+                        content=content,
+                        allowed_mentions=discord.AllowedMentions(roles=True, users=True),
+                    )
+                    if posted is None:
+                        continue
+                    self.repo.upsert_debug_cache(
+                        cache_key=reminder_cache_key,
+                        kind=RAID_REMINDER_KIND,
+                        guild_id=raid.guild_id,
+                        raid_id=raid.id,
+                        message_id=posted.id,
+                        payload_hash=sha256_text(content),
+                    )
+                    sent += 1
+                
+                # Raid Start Nachricht (zum Startzeitpunkt)
+                elif -RAID_START_TOLERANCE_SECONDS <= delta_seconds < 0:
+                    start_cache_key = self._raid_start_cache_key(raid.id, day_label, time_label)
+                    if self.repo.get_debug_cache(start_cache_key) is not None:
+                        continue
 
-                content = (
-                    f"⏰ Raid-Erinnerung: **{raid.dungeon}** startet in ca. 10 Minuten.\n"
-                    f"🆔 Raid `{raid.display_id}`\n"
-                    f"📅 {day_label}\n"
-                    f"🕒 {time_label} ({DEFAULT_TIMEZONE_NAME})\n"
-                    f"{role.mention}"
-                )
-                posted = await self._send_channel_message(
-                    participants_channel,
-                    content=content,
-                    allowed_mentions=discord.AllowedMentions(roles=True, users=True),
-                )
-                if posted is None:
-                    continue
-                self.repo.upsert_debug_cache(
-                    cache_key=reminder_cache_key,
-                    kind=RAID_REMINDER_KIND,
-                    guild_id=raid.guild_id,
-                    raid_id=raid.id,
-                    message_id=posted.id,
-                    payload_hash=sha256_text(content),
-                )
-                sent += 1
+                    role = await self._ensure_slot_temp_role(raid, day_label=day_label, time_label=time_label)
+                    if role is None:
+                        continue
+
+                    content = (
+                        f"🚀 **{raid.dungeon}** startet JETZT!\n"
+                        f"🆔 Raid `{raid.display_id}`\n"
+                        f"📅 {day_label}\n"
+                        f"🕒 {time_label} ({DEFAULT_TIMEZONE_NAME})\n"
+                        f"{role.mention}"
+                    )
+                    posted = await self._send_channel_message(
+                        participants_channel,
+                        content=content,
+                        allowed_mentions=discord.AllowedMentions(roles=True, users=True),
+                    )
+                    if posted is None:
+                        continue
+                    self.repo.upsert_debug_cache(
+                        cache_key=start_cache_key,
+                        kind=RAID_START_KIND,
+                        guild_id=raid.guild_id,
+                        raid_id=raid.id,
+                        message_id=posted.id,
+                        payload_hash=sha256_text(content),
+                    )
+                    sent += 1
         return sent
 
     async def _raid_reminder_worker(self) -> None:
@@ -532,7 +641,6 @@ class RuntimeLoggingBackgroundMixin(RuntimeMixinBase):
                 await self._delete_slot_message(row)
             self.repo.delete_raid_cascade(raid.id)
             await self._refresh_raidlist_for_guild(raid.guild_id, force=True)
-            await self._refresh_raid_calendar_for_guild(raid.guild_id, force=True)
             removed += 1
 
         if removed:

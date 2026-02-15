@@ -1,0 +1,9 @@
+{
+    "python.defaultInterpreterPath": ".venv/bin/python",
+    "python.analysis.typeCheckingMode": "basic",
+    "python.analysis.autoImportCompletions": true,
+    "files.associations": {
+        "*.py": "python"
+    },
+    "debug.console": "integratedTerminal"
+}

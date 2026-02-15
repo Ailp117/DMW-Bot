@@ -8,7 +8,6 @@ from utils.runtime_helpers import (
     FEATURE_INTERVAL_MASK,
     GuildFeatureSettings,
     _member_name,
-    _month_label_de,
     _normalize_raid_date_selection,
     _on_off,
     _parse_raid_date_from_label,
@@ -26,8 +25,27 @@ if TYPE_CHECKING:
 
 
 class RaidCreateModal(discord.ui.Modal):
-    times = discord.ui.TextInput(label="Uhrzeiten (Komma/Zeilen)", required=True, max_length=400)
-    min_players = discord.ui.TextInput(label="Min Spieler pro Slot (0=ab 1)", required=True, max_length=3)
+    days = discord.ui.TextInput(
+        label="Datum (DD.MM.YYYY, comma-separiert)",
+        placeholder="z.B. 20.02.2026, 21.02.2026",
+        required=True,
+        max_length=200,
+        row=0,
+    )
+    times = discord.ui.TextInput(
+        label="Uhrzeiten (Komma/Zeilen getrennt)",
+        placeholder="z.B. 20:00, 21:00",
+        required=True,
+        max_length=400,
+        row=1,
+    )
+    min_players = discord.ui.TextInput(
+        label="Min Spieler pro Slot (0=ab 1)",
+        placeholder="z.B. 3",
+        required=True,
+        max_length=3,
+        row=2,
+    )
 
     def __init__(
         self,
@@ -37,20 +55,20 @@ class RaidCreateModal(discord.ui.Modal):
         guild_name: str,
         channel_id: int,
         dungeon_name: str,
-        selected_days: list[str] | None = None,
-        default_days: list[str] | None = None,
         default_times: list[str],
         default_min_players: int,
     ):
-        super().__init__(title="Raid erstellen")
+        super().__init__(title=f"Raid: {dungeon_name}")
         self.bot = bot
         self.guild_id = guild_id
         self.guild_name = guild_name
         self.channel_id = channel_id
         self.dungeon_name = dungeon_name
 
-        raw_days = selected_days if selected_days else (default_days or [])
-        self.selected_days = [str(value).strip() for value in raw_days if str(value).strip()]
+        available_days = _upcoming_raid_date_labels()
+        day_examples = ", ".join(available_days[:3])
+        self.days.placeholder = f"z.B. {day_examples}"
+
         if default_times:
             self.times.default = ", ".join(default_times)[:400]
         self.min_players.default = str(max(0, int(default_min_players)))
@@ -62,8 +80,18 @@ class RaidCreateModal(discord.ui.Modal):
 
         await self.bot._defer(interaction, ephemeral=True)
 
-        if not self.selected_days:
-            await _safe_followup(interaction, "Bitte mindestens ein Datum auswaehlen.", ephemeral=True)
+        selected_days = [d.strip() for d in str(self.days.value).split(",") if d.strip()]
+        if not selected_days:
+            await _safe_followup(interaction, "Bitte mindestens ein Datum eingeben.", ephemeral=True)
+            return
+            await self.bot._reply(interaction, "Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        await self.bot._defer(interaction, ephemeral=True)
+
+        selected_days = [d.strip() for d in str(self.days.value).split(",") if d.strip()]
+        if not selected_days:
+            await _safe_followup(interaction, "Bitte mindestens ein Datum eingeben.", ephemeral=True)
             return
 
         try:
@@ -83,7 +111,7 @@ class RaidCreateModal(discord.ui.Modal):
                     planner_channel_id=self.channel_id,
                     creator_id=interaction.user.id,
                     dungeon_name=self.dungeon_name,
-                    days_input="\n".join(self.selected_days),
+                    days_input="\n".join(selected_days),
                     times_input=str(self.times.value),
                     min_players_input=str(min_players_value),
                     message_id=0,
@@ -101,7 +129,6 @@ class RaidCreateModal(discord.ui.Modal):
 
             await self.bot._sync_memberlist_messages_for_raid(result.raid.id)
             await self.bot._refresh_raidlist_for_guild(self.guild_id, force=True)
-            await self.bot._refresh_raid_calendar_for_guild(self.guild_id, force=True)
             persisted = await self.bot._persist()
             counts = planner_counts(self.bot.repo, result.raid.id)
 
@@ -122,179 +149,6 @@ class RaidCreateModal(discord.ui.Modal):
                 f"Time Votes: {counts['time']}\n"
                 f"Planner Post: {jump_url}"
             ),
-            ephemeral=True,
-        )
-
-
-class RaidDateContinueButton(discord.ui.Button):
-    def __init__(self, bot: "RewriteDiscordBot"):
-        super().__init__(
-            style=discord.ButtonStyle.success,
-            label="Weiter (Uhrzeiten + Min Spieler)",
-            row=1,
-        )
-        self.bot = bot
-
-    async def callback(self, interaction):
-        view = self.view
-        if not isinstance(view, RaidDateSelectionView):
-            await self.bot._reply(interaction, "Date-View nicht verfuegbar.", ephemeral=True)
-            return
-        if not view.is_valid_interaction(interaction):
-            await self.bot._reply(interaction, "Nur der Ersteller kann diese Auswahl fortsetzen.", ephemeral=True)
-            return
-        if not view.selected_days:
-            await self.bot._reply(interaction, "Bitte zuerst mindestens ein Datum waehlen.", ephemeral=True)
-            return
-        modal = RaidCreateModal(
-            self.bot,
-            guild_id=view.guild_id,
-            guild_name=view.guild_name,
-            channel_id=view.channel_id,
-            dungeon_name=view.dungeon_name,
-            selected_days=view.selected_days,
-            default_times=view.default_times,
-            default_min_players=view.default_min_players,
-        )
-        try:
-            await interaction.response.send_modal(modal)
-        except Exception:
-            await self.bot._reply(interaction, "Raid-Modal konnte nicht geoeffnet werden.", ephemeral=True)
-
-
-class RaidDateSelectionView(discord.ui.View):
-    def __init__(
-        self,
-        bot: "RewriteDiscordBot",
-        *,
-        owner_user_id: int,
-        guild_id: int,
-        guild_name: str,
-        channel_id: int,
-        dungeon_name: str,
-        default_days: list[str],
-        default_times: list[str],
-        default_min_players: int,
-    ):
-        super().__init__(timeout=300)
-        self.bot = bot
-        self.owner_user_id = int(owner_user_id)
-        self.guild_id = int(guild_id)
-        self.guild_name = guild_name
-        self.channel_id = int(channel_id)
-        self.dungeon_name = dungeon_name
-        self.default_times = list(default_times)
-        self.default_min_players = int(default_min_players)
-
-        self.available_days = _upcoming_raid_date_labels()
-        self.selected_days = self._resolve_default_days(default_days)
-
-        options = [
-            discord.SelectOption(
-                label=label,
-                value=label,
-                default=label in self.selected_days,
-            )
-            for label in self.available_days
-        ]
-        day_select = discord.ui.Select(
-            placeholder="Daten waehlen/abwaehlen...",
-            min_values=1,
-            max_values=min(25, max(1, len(options))),
-            options=options,
-            row=0,
-        )
-        day_select.callback = self._on_day_select
-        self.add_item(day_select)
-        self.add_item(RaidDateContinueButton(bot))
-
-    @staticmethod
-    def _weekday_alias_to_index(label: str) -> int | None:
-        aliases = {
-            "mo": 0,
-            "mon": 0,
-            "montag": 0,
-            "di": 1,
-            "tue": 1,
-            "dienstag": 1,
-            "mi": 2,
-            "wed": 2,
-            "mittwoch": 2,
-            "do": 3,
-            "thu": 3,
-            "donnerstag": 3,
-            "fr": 4,
-            "fri": 4,
-            "freitag": 4,
-            "sa": 5,
-            "sat": 5,
-            "samstag": 5,
-            "so": 6,
-            "sun": 6,
-            "sonntag": 6,
-        }
-        return aliases.get((label or "").strip().lower())
-
-    def _resolve_default_days(self, default_days: list[str]) -> list[str]:
-        if not self.available_days:
-            return []
-        resolved: list[str] = []
-        available_map = {value.casefold(): value for value in self.available_days}
-        by_iso_date = {value[:10]: value for value in self.available_days if len(value) >= 10}
-
-        by_weekday: dict[int, list[str]] = {}
-        for value in self.available_days:
-            parsed = _parse_raid_date_from_label(value)
-            if parsed is None:
-                continue
-            by_weekday.setdefault(parsed.weekday(), []).append(value)
-
-        for raw in default_days:
-            text = str(raw or "").strip()
-            if not text:
-                continue
-            direct = available_map.get(text.casefold())
-            if direct and direct not in resolved:
-                resolved.append(direct)
-                continue
-            parsed_date = _parse_raid_date_from_label(text)
-            if parsed_date is not None:
-                mapped = by_iso_date.get(parsed_date.isoformat())
-                if mapped and mapped not in resolved:
-                    resolved.append(mapped)
-                    continue
-            weekday = self._weekday_alias_to_index(text)
-            if weekday is None:
-                continue
-            for candidate in by_weekday.get(weekday, []):
-                if candidate not in resolved:
-                    resolved.append(candidate)
-                    break
-
-        normalized = _normalize_raid_date_selection(resolved, allowed=self.available_days)
-        if normalized:
-            return normalized
-        return [self.available_days[0]]
-
-    def is_valid_interaction(self, interaction: Any) -> bool:
-        interaction_guild_id = int(getattr(getattr(interaction, "guild", None), "id", 0) or 0)
-        interaction_user_id = int(getattr(getattr(interaction, "user", None), "id", 0) or 0)
-        return interaction_guild_id == self.guild_id and interaction_user_id == self.owner_user_id
-
-    async def _on_day_select(self, interaction):
-        if not self.is_valid_interaction(interaction):
-            await self.bot._reply(interaction, "Nur der Ersteller darf die Datumswahl aendern.", ephemeral=True)
-            return
-        raw_values = [str(value) for value in ((interaction.data or {}).get("values") or [])]
-        normalized = _normalize_raid_date_selection(raw_values, allowed=self.available_days)
-        if not normalized:
-            await self.bot._reply(interaction, "Bitte mindestens ein Datum waehlen.", ephemeral=True)
-            return
-        self.selected_days = normalized
-        await self.bot._defer(interaction, ephemeral=True)
-        await _safe_followup(
-            interaction,
-            f"Datumsauswahl vorgemerkt ({len(self.selected_days)}): {', '.join(self.selected_days)}",
             ephemeral=True,
         )
 
@@ -348,59 +202,6 @@ class SettingsIntervalsModal(discord.ui.Modal):
         view.message_xp_interval_seconds = message_interval
         view.levelup_message_cooldown_seconds = levelup_cooldown
         await self.bot._reply(interaction, "Intervall-Einstellungen vorgemerkt.", ephemeral=True)
-
-
-class SettingsCalendarChannelModal(discord.ui.Modal):
-    calendar_channel = discord.ui.TextInput(
-        label="Raid Kalender Channel (ID/#, leer=aus)",
-        required=False,
-        max_length=64,
-    )
-
-    def __init__(self, bot: "RewriteDiscordBot", view: "SettingsView"):
-        super().__init__(title="Raid Kalender Channel")
-        self.bot = bot
-        self._view_ref = view
-        if view.raid_calendar_channel_id:
-            self.calendar_channel.default = str(int(view.raid_calendar_channel_id))
-
-    async def on_submit(self, interaction):
-        view = self._view_ref
-        if not isinstance(view, SettingsView):
-            await self.bot._reply(interaction, "Settings View nicht verfuegbar.", ephemeral=True)
-            return
-        if not interaction.guild or interaction.guild.id != view.guild_id:
-            await self.bot._reply(interaction, "Ungueltiger Guild-Kontext.", ephemeral=True)
-            return
-
-        raw = str(self.calendar_channel.value or "").strip()
-        if not raw:
-            view.raid_calendar_channel_id = None
-            await self.bot._reply(interaction, "Raid Kalender Channel deaktiviert.", ephemeral=True)
-            return
-
-        if raw.startswith("<#") and raw.endswith(">"):
-            raw = raw[2:-1].strip()
-        if raw.startswith("#"):
-            raw = raw[1:].strip()
-
-        try:
-            channel_id = int(raw)
-        except ValueError:
-            await self.bot._reply(interaction, "Bitte gueltige Channel-ID oder #mention angeben.", ephemeral=True)
-            return
-
-        channel = interaction.guild.get_channel(channel_id)
-        if not isinstance(channel, discord.TextChannel):
-            await self.bot._reply(
-                interaction,
-                "Channel nicht gefunden oder kein Text/News-Channel.",
-                ephemeral=True,
-            )
-            return
-
-        view.raid_calendar_channel_id = channel_id
-        await self.bot._reply(interaction, f"Raid Kalender Channel vorgemerkt: `{channel_id}`", ephemeral=True)
 
 
 class SettingsToggleButton(discord.ui.Button):
@@ -469,31 +270,6 @@ class SettingsIntervalsButton(discord.ui.Button):
             await self.bot._reply(interaction, "Modal konnte nicht geoeffnet werden.", ephemeral=True)
 
 
-class SettingsCalendarChannelButton(discord.ui.Button):
-    def __init__(self, bot: "RewriteDiscordBot", *, guild_id: int):
-        super().__init__(
-            style=discord.ButtonStyle.secondary,
-            label="Kalender Channel",
-            custom_id=f"settings:{guild_id}:calendar_modal",
-            row=4,
-        )
-        self.bot = bot
-        self.guild_id = guild_id
-
-    async def callback(self, interaction):
-        if not interaction.guild or interaction.guild.id != self.guild_id:
-            await self.bot._reply(interaction, "Ungueltiger Guild-Kontext.", ephemeral=True)
-            return
-        view = self.view
-        if not isinstance(view, SettingsView):
-            await self.bot._reply(interaction, "Settings View nicht verfuegbar.", ephemeral=True)
-            return
-        try:
-            await interaction.response.send_modal(SettingsCalendarChannelModal(self.bot, view))
-        except Exception:
-            await self.bot._reply(interaction, "Modal konnte nicht geoeffnet werden.", ephemeral=True)
-
-
 class SettingsView(discord.ui.View):
     def __init__(self, bot: "RewriteDiscordBot", *, guild_id: int):
         super().__init__(timeout=300)
@@ -504,7 +280,6 @@ class SettingsView(discord.ui.View):
         self.planner_channel_id: int | None = settings.planner_channel_id
         self.participants_channel_id: int | None = settings.participants_channel_id
         self.raidlist_channel_id: int | None = settings.raidlist_channel_id
-        self.raid_calendar_channel_id: int | None = bot._get_raid_calendar_channel_id(guild_id)
         self.leveling_enabled: bool = feature_settings.leveling_enabled
         self.levelup_messages_enabled: bool = feature_settings.levelup_messages_enabled
         self.nanomon_reply_enabled: bool = feature_settings.nanomon_reply_enabled
@@ -582,7 +357,6 @@ class SettingsView(discord.ui.View):
             item._refresh_appearance(self)
             self.add_item(item)
 
-        self.add_item(SettingsCalendarChannelButton(bot, guild_id=guild_id))
         self.add_item(SettingsIntervalsButton(bot, guild_id=guild_id))
         self.add_item(SettingsSaveButton(bot, guild_id))
 
@@ -627,10 +401,6 @@ class SettingsSaveButton(discord.ui.Button):
 
         await self.bot._defer(interaction, ephemeral=True)
         async with self.bot._state_lock:
-            previous_calendar_channel_id = self.bot._get_raid_calendar_channel_id(interaction.guild.id)
-            previous_calendar_state = self.bot._get_raid_calendar_state_row(interaction.guild.id)
-            previous_calendar_message_id = int(getattr(previous_calendar_state, "message_id", 0) or 0)
-
             row = save_channel_settings(
                 self.bot.repo,
                 guild_id=interaction.guild.id,
@@ -651,22 +421,7 @@ class SettingsSaveButton(discord.ui.Button):
                     levelup_message_cooldown_seconds=view.levelup_message_cooldown_seconds,
                 ),
             )
-            calendar_channel_id = self.bot._set_raid_calendar_channel_id(
-                interaction.guild.id,
-                view.raid_calendar_channel_id,
-            )
             await self.bot._refresh_raidlist_for_guild(interaction.guild.id, force=True)
-            if calendar_channel_id is None:
-                if previous_calendar_message_id > 0:
-                    await self.bot._delete_raid_calendar_message_by_id(
-                        interaction.guild.id,
-                        previous_calendar_message_id,
-                        preferred_channel_id=previous_calendar_channel_id,
-                    )
-            elif previous_calendar_channel_id != calendar_channel_id:
-                await self.bot._rebuild_raid_calendar_message_for_guild(interaction.guild.id)
-            else:
-                await self.bot._refresh_raid_calendar_for_guild(interaction.guild.id, force=True)
             persisted = await self.bot._persist(dirty_tables={"settings", "debug_cache"})
 
         if not persisted:
@@ -679,7 +434,6 @@ class SettingsSaveButton(discord.ui.Button):
                 f"Umfragen: `{row.planner_channel_id}`\n"
                 f"Teilnehmerlisten: `{row.participants_channel_id}`\n"
                 f"Raidlist: `{row.raidlist_channel_id}`\n"
-                f"Raid Kalender: `{calendar_channel_id}`\n"
                 f"Levelsystem: `{_on_off(feature_row.leveling_enabled)}`\n"
                 f"Levelup Msg: `{_on_off(feature_row.levelup_messages_enabled)}`\n"
                 f"Nanomon Reply: `{_on_off(feature_row.nanomon_reply_enabled)}`\n"
@@ -690,82 +444,6 @@ class SettingsSaveButton(discord.ui.Button):
             ),
             ephemeral=True,
         )
-
-
-class RaidCalendarShiftButton(discord.ui.Button):
-    def __init__(self, bot: "RewriteDiscordBot", *, guild_id: int, delta_months: int):
-        action = "prev" if int(delta_months) < 0 else "next"
-        label = "Monat zurueck" if int(delta_months) < 0 else "Monat vor"
-        super().__init__(
-            style=discord.ButtonStyle.secondary,
-            label=label,
-            custom_id=f"raidcalendar:{int(guild_id)}:{action}",
-            row=0,
-        )
-        self.bot = bot
-        self.guild_id = int(guild_id)
-        self.delta_months = -1 if int(delta_months) < 0 else 1
-
-    async def callback(self, interaction):
-        if not interaction.guild or int(interaction.guild.id) != self.guild_id:
-            await self.bot._reply(interaction, "Ungueltiger Guild-Kontext.", ephemeral=True)
-            return
-        await self.bot._defer(interaction, ephemeral=True)
-        async with self.bot._state_lock:
-            target_month = await self.bot._shift_raid_calendar_month(self.guild_id, delta_months=self.delta_months)
-            persisted = await self.bot._persist(dirty_tables={"debug_cache"})
-        if not persisted:
-            await _safe_followup(interaction, "Kalender aktualisiert, aber DB-Speicherung fehlgeschlagen.", ephemeral=True)
-            return
-        await _safe_followup(
-            interaction,
-            f"Kalender zeigt jetzt **{_month_label_de(target_month)}**.",
-            ephemeral=True,
-        )
-
-
-class RaidCalendarTodayButton(discord.ui.Button):
-    def __init__(self, bot: "RewriteDiscordBot", *, guild_id: int):
-        super().__init__(
-            style=discord.ButtonStyle.primary,
-            label="Aktueller Monat",
-            custom_id=f"raidcalendar:{int(guild_id)}:today",
-            row=0,
-        )
-        self.bot = bot
-        self.guild_id = int(guild_id)
-
-    async def callback(self, interaction):
-        if not interaction.guild or int(interaction.guild.id) != self.guild_id:
-            await self.bot._reply(interaction, "Ungueltiger Guild-Kontext.", ephemeral=True)
-            return
-        await self.bot._defer(interaction, ephemeral=True)
-        async with self.bot._state_lock:
-            target_month = self.bot._current_calendar_month_start()
-            await self.bot._refresh_raid_calendar_for_guild(
-                self.guild_id,
-                force=True,
-                month_start=target_month,
-            )
-            persisted = await self.bot._persist(dirty_tables={"debug_cache"})
-        if not persisted:
-            await _safe_followup(interaction, "Kalender aktualisiert, aber DB-Speicherung fehlgeschlagen.", ephemeral=True)
-            return
-        await _safe_followup(
-            interaction,
-            f"Kalender zeigt jetzt **{_month_label_de(target_month)}**.",
-            ephemeral=True,
-        )
-
-
-class RaidCalendarView(discord.ui.View):
-    def __init__(self, bot: "RewriteDiscordBot", *, guild_id: int):
-        super().__init__(timeout=None)
-        self.bot = bot
-        self.guild_id = int(guild_id)
-        self.add_item(RaidCalendarShiftButton(bot, guild_id=guild_id, delta_months=-1))
-        self.add_item(RaidCalendarTodayButton(bot, guild_id=guild_id))
-        self.add_item(RaidCalendarShiftButton(bot, guild_id=guild_id, delta_months=1))
 
 
 class FinishButton(discord.ui.Button):

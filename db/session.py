@@ -4,10 +4,10 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time as datetime_time
-from typing import Any, AsyncIterator, Protocol
+from typing import Any, AsyncIterator, Protocol, cast
 
 from sqlalchemy import event, text
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from bot.config import BotConfig
 
@@ -93,36 +93,51 @@ class AsyncConnectionContextFactory(Protocol):
 
 class SessionManager:
     def __init__(self, config: BotConfig):
-        self._engine = create_async_engine(
-            config.database_url,
-            echo=config.db_echo,
-            pool_pre_ping=True,
-        )
-        self._session_factory = async_sessionmaker(self._engine, expire_on_commit=False)
-        self._install_sql_logging()
+        self._config = config
+        if config.use_in_memory_db:
+            self._engine: AsyncEngine | None = None
+            self._session_factory: Any | None = None
+            self._disabled = True
+        else:
+            engine = create_async_engine(
+                config.database_url,
+                echo=config.db_echo,
+                pool_pre_ping=True,
+            )
+            self._engine = engine
+            self._session_factory = async_sessionmaker(engine, expire_on_commit=False)
+            self._disabled = False
+            self._install_sql_logging(engine)
 
     @property
-    def engine(self):
+    def engine(self) -> AsyncEngine | None:
         return self._engine
 
-    def _install_sql_logging(self) -> None:
-        @event.listens_for(self._engine.sync_engine, "before_cursor_execute")
+    @property
+    def is_disabled(self) -> bool:
+        return self._disabled
+
+    def _install_sql_logging(self, engine: AsyncEngine) -> None:
+        @event.listens_for(engine.sync_engine, "before_cursor_execute")
         def before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
             context._query_started_at = time.perf_counter()
             log.debug("[to-db] SQL=%s params=%s", statement, _redact_sql_parameters(parameters))
 
-        @event.listens_for(self._engine.sync_engine, "after_cursor_execute")
+        @event.listens_for(engine.sync_engine, "after_cursor_execute")
         def after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
             elapsed_ms = (time.perf_counter() - context._query_started_at) * 1000
             log.debug("[from-db] rows=%s took=%.2fms", cursor.rowcount, elapsed_ms)
 
-        @event.listens_for(self._engine.sync_engine, "handle_error")
+        @event.listens_for(engine.sync_engine, "handle_error")
         def on_sqlalchemy_error(exception_context):
             log.exception("[from-db] query failed", exc_info=exception_context.original_exception)
 
     @asynccontextmanager
-    async def session_scope(self) -> AsyncIterator[AsyncSession]:
-        session = self._session_factory()
+    async def session_scope(self) -> AsyncIterator[AsyncSession | None]:
+        if self._disabled:
+            yield None
+            return
+        session = cast(Any, self._session_factory)()
         try:
             yield session
             await session.commit()
@@ -133,7 +148,10 @@ class SessionManager:
             await session.close()
 
     async def try_acquire_singleton_lock(self) -> bool:
-        async with self._engine.begin() as conn:
+        if self._disabled:
+            return True
+        engine = cast(AsyncEngine, self._engine)
+        async with engine.begin() as conn:
             result = await conn.execute(text("SELECT pg_try_advisory_lock(:key)"), {"key": SINGLETON_LOCK_KEY})
             return bool(result.scalar())
 
