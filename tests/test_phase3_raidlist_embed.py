@@ -41,10 +41,13 @@ def test_build_raidlist_embed_contains_structured_raid_data(repo):
     )
 
     assert embed is not None
-    assert "Raidliste" in (embed.title or "")
-    assert len(embed.fields) == 1
-    assert "Zeitzone `Europe/Berlin`" in (embed.fields[0].value or "")
-    assert "https://discord.com/channels/1/11/5151" in (embed.fields[0].value or "")
+    assert "Raidlist" in (embed.title or "")
+    assert len(embed.fields) >= 3  # Overview + Raid + Statistics
+    # Find raid field
+    raid_field = next((f for f in embed.fields if "Raid #1" in f.name), None)
+    assert raid_field is not None
+    assert "Zeitzone `Europe/Berlin`" in (raid_field.value or "")
+    assert "https://discord.com/channels/1/11/5151" in (raid_field.value or "")
     assert payload_hash
     assert any("Raid 1" in line for line in debug_lines)
 

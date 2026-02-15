@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, TYPE_CHECKING
 
 from bot.discord_api import discord
+from utils.localization import Language, get_lang, get_string
 from utils.runtime_helpers import (
     DEFAULT_TIMEZONE_NAME,
     FEATURE_INTERVAL_MASK,
@@ -18,10 +19,12 @@ from utils.runtime_helpers import (
     _upcoming_raid_date_labels,
 )
 from services.raid_service import create_raid_from_modal, planner_counts, toggle_vote
-from services.settings_service import save_channel_settings
+from services.settings_service import save_channel_settings, save_language_setting
+from views.settings_language import SettingsLanguageSelect
 
 if TYPE_CHECKING:
     from bot.runtime import RewriteDiscordBot
+    import discord as discord_types
 
 
 class RaidCreateModal(discord.ui.Modal):
@@ -281,6 +284,9 @@ class SettingsView(discord.ui.View):
         settings = bot.repo.ensure_settings(guild_id)
         feature_settings = bot._get_guild_feature_settings(guild_id)
         
+        # Language
+        self.language: Language = get_lang(settings)
+        
         # Channel Settings
         self.planner_channel_id: int | None = settings.planner_channel_id
         self.participants_channel_id: int | None = settings.participants_channel_id
@@ -304,57 +310,65 @@ class SettingsView(discord.ui.View):
         # Feature Toggle Menu (Zeile 1)
         self.add_item(SettingsFeatureSelect(bot, guild_id))
         
-        # Action Buttons (Zeile 2)
+        # Language Select (Zeile 2)
+        self.add_item(SettingsLanguageSelect(bot, guild_id=guild_id))
+        
+        # Action Buttons (Zeile 3)
         self.add_item(SettingsIntervalsButton(bot, guild_id=guild_id))
         self.add_item(SettingsSaveButton(bot, guild_id))
         self.add_item(SettingsResetButton(bot, guild_id))
 
-    def build_embed(self) -> discord.Embed:
+    def build_embed(self) -> "discord.Embed":  # type: ignore[name-defined]
         """Erstellt Übersichts-Embed mit aktuellen Einstellungen."""
         embed = discord.Embed(
-            title="⚙️ Bot Einstellungen",
-            description="Verwalte die Konfiguration des Raid Bots",
+            title=get_string(self.language, "settings_title"),
+            description=get_string(self.language, "settings_desc"),
             color=discord.Color.blue()
         )
         
-        # Channel Übersicht
+        # Channels
         channels_text = (
-            f"📋 **Umfragen:** {self._channel_mention(self.planner_channel_id)}\n"
-            f"👥 **Teilnehmerlisten:** {self._channel_mention(self.participants_channel_id)}\n"
-            f"📊 **Raidliste:** {self._channel_mention(self.raidlist_channel_id)}"
+            f"{get_string(self.language, 'channel_planner')}: {self._channel_mention(self.planner_channel_id)}\n"
+            f"{get_string(self.language, 'channel_participants')}: {self._channel_mention(self.participants_channel_id)}\n"
+            f"{get_string(self.language, 'channel_raidlist')}: {self._channel_mention(self.raidlist_channel_id)}"
         )
-        embed.add_field(name="📌 Channels", value=channels_text, inline=False)
+        embed.add_field(name=get_string(self.language, "settings_channels"), value=channels_text, inline=False)
         
-        # Features Übersicht
+        # Features
         features_text = (
-            f"📈 **Levelsystem:** {self._status_emoji(self.leveling_enabled)}\n"
-            f"🎉 **Levelup Msg:** {self._status_emoji(self.levelup_messages_enabled)}\n"
-            f"🤖 **Nanomon Reply:** {self._status_emoji(self.nanomon_reply_enabled)}\n"
-            f"✅ **Approved Reply:** {self._status_emoji(self.approved_reply_enabled)}\n"
-            f"⏰ **Raid Reminder:** {self._status_emoji(self.raid_reminder_enabled)}\n"
-            f"🔔 **Auto Reminder:** {self._status_emoji(self.auto_reminder_enabled)}"
+            f"{get_string(self.language, 'feature_leveling')}: {self._status_emoji(self.leveling_enabled)}\n"
+            f"{get_string(self.language, 'feature_levelup_msg')}: {self._status_emoji(self.levelup_messages_enabled)}\n"
+            f"{get_string(self.language, 'feature_nanomon')}: {self._status_emoji(self.nanomon_reply_enabled)}\n"
+            f"{get_string(self.language, 'feature_approved')}: {self._status_emoji(self.approved_reply_enabled)}\n"
+            f"{get_string(self.language, 'feature_raid_reminder')}: {self._status_emoji(self.raid_reminder_enabled)}\n"
+            f"{get_string(self.language, 'feature_auto_reminder')}: {self._status_emoji(self.auto_reminder_enabled)}"
         )
-        embed.add_field(name="⚡ Features", value=features_text, inline=True)
+        embed.add_field(name=get_string(self.language, "settings_features"), value=features_text, inline=True)
         
-        # Intervalle Übersicht
+        # Intervals
         intervals_text = (
-            f"⏱️ **XP Interval:** {self.message_xp_interval_seconds}s\n"
-            f"⏳ **Levelup Cooldown:** {self.levelup_message_cooldown_seconds}s"
+            f"{get_string(self.language, 'interval_xp')}: {self.message_xp_interval_seconds}s\n"
+            f"{get_string(self.language, 'interval_cooldown')}: {self.levelup_message_cooldown_seconds}s"
         )
-        embed.add_field(name="⏲️ Intervalle", value=intervals_text, inline=True)
+        embed.add_field(name=get_string(self.language, "settings_intervals"), value=intervals_text, inline=True)
         
-        embed.set_footer(text="Ändere Einstellungen über die Menüs unten")
+        # Language
+        lang_label = "🇩🇪 Deutsch" if self.language == "de" else "🇬🇧 English"
+        embed.add_field(name=get_string(self.language, "settings_language"), value=f"**{lang_label}**", inline=True)
+        
+        embed.set_footer(text=get_string(self.language, "settings_footer"))
         return embed
     
     def _channel_mention(self, channel_id: int | None) -> str:
         """Formatiert Channel-ID für Embed."""
         if channel_id:
             return f"<#{channel_id}>"
-        return "❌ *Nicht gesetzt*"
+        return get_string(self.language, "channel_not_set")
     
     def _status_emoji(self, enabled: bool) -> str:
         """Gibt Status-Emoji zurück."""
-        return "🟢 AN" if enabled else "🔴 AUS"
+        key = "feature_enabled" if enabled else "feature_disabled"
+        return get_string(self.language, key)
 
 
 class SettingsChannelSelect(discord.ui.Select):
@@ -419,7 +433,7 @@ class SettingsChannelSelect(discord.ui.Select):
         temp_view = discord.ui.View(timeout=60)
         temp_view.add_item(channel_select)
         
-        async def on_channel_select(interaction2: discord.Interaction):
+        async def on_channel_select(interaction2: "discord.Interaction"):  # type: ignore[name-defined]
             selected = interaction2.data.get("values", []) if interaction2.data else []
             channel_id = int(selected[0]) if selected else None
             
@@ -605,6 +619,7 @@ class SettingsSaveButton(discord.ui.Button):
                 participants_channel_id=view.participants_channel_id,
                 raidlist_channel_id=view.raidlist_channel_id,
             )
+            save_language_setting(self.bot.repo, interaction.guild.id, view.language)
             feature_row = self.bot._set_guild_feature_settings(
                 interaction.guild.id,
                 GuildFeatureSettings(
@@ -622,23 +637,24 @@ class SettingsSaveButton(discord.ui.Button):
             persisted = await self.bot._persist(dirty_tables={"settings", "debug_cache"})
 
         if not persisted:
-            await _safe_followup(interaction, "Settings konnten nicht gespeichert werden.", ephemeral=True)
+            await _safe_followup(interaction, get_string(view.language, "settings_saved") + " (DB-Fehler)", ephemeral=True)
             return
         await _safe_followup(
             interaction,
             (
-                "Settings gespeichert:\n"
-                f"Umfragen: `{row.planner_channel_id}`\n"
-                f"Teilnehmerlisten: `{row.participants_channel_id}`\n"
-                f"Raidlist: `{row.raidlist_channel_id}`\n"
-                f"Levelsystem: `{_on_off(feature_row.leveling_enabled)}`\n"
-                f"Levelup Msg: `{_on_off(feature_row.levelup_messages_enabled)}`\n"
-                f"Nanomon Reply: `{_on_off(feature_row.nanomon_reply_enabled)}`\n"
-                f"Approved Reply: `{_on_off(feature_row.approved_reply_enabled)}`\n"
-                f"Raid Reminder: `{_on_off(feature_row.raid_reminder_enabled)}`\n"
-                f"Auto Reminder: `{_on_off(feature_row.auto_reminder_enabled)}`\n"
-                f"Message XP Intervall: `{feature_row.message_xp_interval_seconds}`\n"
-                f"Levelup Cooldown: `{feature_row.levelup_message_cooldown_seconds}`"
+                f"{get_string(view.language, 'settings_saved')}:\n"
+                f"📋 {get_string(view.language, 'channel_planner')}: `{row.planner_channel_id}`\n"
+                f"👥 {get_string(view.language, 'channel_participants')}: `{row.participants_channel_id}`\n"
+                f"📊 {get_string(view.language, 'channel_raidlist')}: `{row.raidlist_channel_id}`\n"
+                f"📈 {get_string(view.language, 'feature_leveling')}: `{_on_off(feature_row.leveling_enabled)}`\n"
+                f"🎉 {get_string(view.language, 'feature_levelup_msg')}: `{_on_off(feature_row.levelup_messages_enabled)}`\n"
+                f"🤖 {get_string(view.language, 'feature_nanomon')}: `{_on_off(feature_row.nanomon_reply_enabled)}`\n"
+                f"✅ {get_string(view.language, 'feature_approved')}: `{_on_off(feature_row.approved_reply_enabled)}`\n"
+                f"⏰ {get_string(view.language, 'feature_raid_reminder')}: `{_on_off(feature_row.raid_reminder_enabled)}`\n"
+                f"🔔 {get_string(view.language, 'feature_auto_reminder')}: `{_on_off(feature_row.auto_reminder_enabled)}`\n"
+                f"⏱️ {get_string(view.language, 'interval_xp')}: `{feature_row.message_xp_interval_seconds}`\n"
+                f"⏳ {get_string(view.language, 'interval_cooldown')}: `{feature_row.levelup_message_cooldown_seconds}`\n"
+                f"🌍 {get_string(view.language, 'settings_language')}: `{view.language.upper()}`"
             ),
             ephemeral=True,
         )

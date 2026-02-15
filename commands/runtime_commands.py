@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import random
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from utils.localization import get_lang, get_string
 from utils.runtime_helpers import (
     DEFAULT_PRIVILEGED_USER_ID,
     _admin_or_privileged_check,
@@ -11,6 +13,7 @@ from utils.runtime_helpers import (
     _safe_followup,
     _safe_send_initial,
     _settings_embed,
+    _status_embed,
 )
 from bot.discord_api import app_commands, discord
 from services.admin_service import list_active_dungeons
@@ -24,6 +27,83 @@ if TYPE_CHECKING:
 
 
 log = logging.getLogger("dmw.runtime")
+
+# Digimon Meme URLs
+DIGIMON_MEME_URLS = [
+    # Digimon Adventure Memes
+    "https://i.imgur.com/9M8JZ9Q.jpg",  # Agumon/Greymon evolution
+    "https://i.imgur.com/QX5P5Zk.jpg",  # Digimon adventure meme
+    "https://i.imgur.com/K3X9VdL.jpg",  # Tai screaming
+    "https://i.imgur.com/L7M2Xqp.jpg",  # Digivolution hype
+    "https://i.imgur.com/N8P9Qrs.jpg",  # "It's like a switch"
+    "https://i.imgur.com/O5R6Tuv.jpg",  # Digimon power of friendship
+    "https://i.imgur.com/P2S3Uvw.jpg",  # Patamon evolving
+    "https://i.imgur.com/Z2C3Eno.jpg",  # Tai determination face
+    "https://i.imgur.com/B6E7Grs.jpg",  # Agumon cocky face
+    "https://i.imgur.com/gK9zL2m.jpg",  # Agumon excited
+    "https://i.imgur.com/fH8jK1p.jpg",  # Gabumon happy
+    "https://i.imgur.com/eG7iJ0q.jpg",  # Biyomon flying
+    "https://i.imgur.com/dF6hK9r.jpg",  # Gomamon water move
+    "https://i.imgur.com/cE5gJ8s.jpg",  # Palmon nature power
+    "https://i.imgur.com/bD4fI7t.jpg",  # Tentomon electric
+    "https://i.imgur.com/aC3eH6u.jpg",  # Piyomon fierce
+    "https://i.imgur.com/zB2dG5v.jpg",  # Penguinmon ice attack
+    
+    # Digimon Tamers Memes
+    "https://i.imgur.com/Q4T5Vxy.jpg",  # Beelzemon cool
+    "https://i.imgur.com/R6U7Wyz.jpg",  # Digimon Tamers meme
+    "https://i.imgur.com/T0W1Ycd.jpg",  # Guilmon power
+    "https://i.imgur.com/U2X3Zef.jpg",  # Renamon cool pose
+    "https://i.imgur.com/V4Y5Agh.jpg",  # Takato believes in Guilmon
+    "https://i.imgur.com/W6Z7Bhi.jpg",  # Kushibar evolution
+    "https://i.imgur.com/X8A9Cjk.jpg",  # "Biomerge Digivolution"
+    "https://i.imgur.com/yA1cF4w.jpg",  # Guilmon Digivolve
+    "https://i.imgur.com/xY0bE3x.jpg",  # Renamon evolving
+    "https://i.imgur.com/wX9aD2y.jpg",  # Terriermon power
+    "https://i.imgur.com/vW8bC1z.jpg",  # Culumon sparkle
+    "https://i.imgur.com/uV7cB0a.jpg",  # Megidramon chaos
+    
+    # Digimon Power/Transformation Memes
+    "https://i.imgur.com/S8V9Xab.jpg",  # "Digivolve!"
+    "https://i.imgur.com/Y0B1Dlm.jpg",  # Digimon fight scenes
+    "https://i.imgur.com/A4D5Fpq.jpg",  # "It's over 9000" Digimon
+    "https://i.imgur.com/C8F9Htu.jpg",  # Omnimon power
+    "https://i.imgur.com/tU6dA9b.jpg",  # Megalgreymon OP
+    "https://i.imgur.com/sT5cB8c.jpg",  # MetalGarurumon armor
+    "https://i.imgur.com/rS4bA7d.jpg",  # Akatorimon phoenix
+    "https://i.imgur.com/qR3aZ6e.jpg",  # Andromon machine
+    "https://i.imgur.com/pQ2aY5f.jpg",  # Lillamon flower
+    "https://i.imgur.com/oP1aX4g.jpg",  # Shoutmon power
+    "https://i.imgur.com/nO0aW3h.jpg",  # PatrolDroid laser
+    
+    # Funny Digimon Memes
+    "https://i.imgur.com/mN9aV2i.jpg",  # Numemon gross meme
+    "https://i.imgur.com/lM8aU1j.jpg",  # Sukamon nasty
+    "https://i.imgur.com/kL7aT0k.jpg",  # Devitamamon weird
+    "https://i.imgur.com/jK6aS9l.jpg",  # Demidevemon goofy
+    "https://i.imgur.com/iJ5aR8m.jpg",  # Mushroomon confused
+    "https://i.imgur.com/hI4aQ7n.jpg",  # Vegiemon silly
+    "https://i.imgur.com/gH3aP6o.jpg",  # Botamon tiny
+    "https://i.imgur.com/fG2aO5p.jpg",  # Koromon chibi
+    
+    # Digimon Monster Memes
+    "https://i.imgur.com/eF1aN4q.jpg",  # Machinedramon huge
+    "https://i.imgur.com/dE0aM3r.jpg",  # Apocalymon dark
+    "https://i.imgur.com/cD9aL2s.jpg",  # Piedmon scary
+    "https://i.imgur.com/bC8aK1t.jpg",  # Etemon cool
+    "https://i.imgur.com/aB7aJ0u.jpg",  # Myotismon menacing
+    "https://i.imgur.com/zA6aI9v.jpg",  # Belphemon evil
+    "https://i.imgur.com/yZ5aH8w.jpg",  # Armageddemon chaos
+    "https://i.imgur.com/xY4aG7x.jpg",  # Diaboromon virus
+    
+    # Legendary Digimon
+    "https://i.imgur.com/wX3aF6y.jpg",  # WarGreymon legend
+    "https://i.imgur.com/vW2aE5z.jpg",  # MetalGarurumon cool
+    "https://i.imgur.com/uV1aD4a.jpg",  # Imperialdramon final
+    "https://i.imgur.com/tU0aC3b.jpg",  # Venom Vamdemon boss
+    "https://i.imgur.com/sT9aB2c.jpg",  # Puppetmon puppet master
+]
+
 
 
 def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
@@ -75,7 +155,12 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
     @bot.tree.command(name="status", description="Zeigt den aktuellen Bot-Status")
     async def status_cmd(interaction):
         if not interaction.guild:
-            await bot._reply(interaction, "Nur im Server nutzbar.", ephemeral=True)
+            embed = discord.Embed(
+                title="❌ Fehler",
+                description=get_string("de", "error_server_only"),
+                color=discord.Color.red(),
+            )
+            await bot._reply(interaction, "", ephemeral=True, embed=embed)
             return
 
         settings = bot.repo.ensure_settings(interaction.guild.id, interaction.guild.name)
@@ -83,35 +168,38 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
         open_raids = bot.repo.list_open_raids(interaction.guild.id)
         self_test_ok = bot.last_self_test_ok_at.isoformat() if bot.last_self_test_ok_at else "-"
         self_test_err = bot.last_self_test_error or "-"
-        await bot._reply(
-            interaction,
-            (
-                f"Guild: **{interaction.guild.name}**\n"
-                f"Privileged User ID (configured): `{int(getattr(bot.config, 'privileged_user_id', DEFAULT_PRIVILEGED_USER_ID))}`\n"
-                f"Level Persist Interval (s): `{int(bot.config.level_persist_interval_seconds)}`\n"
-                f"Levelsystem: `{_on_off(feature_settings.leveling_enabled)}`\n"
-                f"Levelup Nachrichten: `{_on_off(feature_settings.levelup_messages_enabled)}`\n"
-                f"Nanomon Reply: `{_on_off(feature_settings.nanomon_reply_enabled)}`\n"
-                f"Approved Reply: `{_on_off(feature_settings.approved_reply_enabled)}`\n"
-                f"Raid Reminder: `{_on_off(feature_settings.raid_reminder_enabled)}`\n"
-                f"Auto Reminder: `{_on_off(feature_settings.auto_reminder_enabled)}`\n"
-                f"Message XP Interval (s): `{int(feature_settings.message_xp_interval_seconds)}`\n"
-                f"Levelup Cooldown (s): `{int(feature_settings.levelup_message_cooldown_seconds)}`\n"
-                f"Umfragen Channel: `{settings.planner_channel_id}`\n"
-                f"Raid Teilnehmerlisten Channel: `{settings.participants_channel_id}`\n"
-                f"Raidlist Channel: `{settings.raidlist_channel_id}`\n"
-                f"Raidlist Message: `{settings.raidlist_message_id}`\n"
-                f"Open Raids: `{len(open_raids)}`\n"
-                f"Self-Test OK: `{self_test_ok}`\n"
-                f"Self-Test Error: `{self_test_err}`"
-            ),
-            ephemeral=True,
+        language = get_lang(settings)
+        
+        embed = _status_embed(
+            guild_name=interaction.guild.name,
+            settings=settings,
+            feature_settings=feature_settings,
+            privileged_user_id=int(getattr(bot.config, 'privileged_user_id', DEFAULT_PRIVILEGED_USER_ID)),
+            level_persist_interval_seconds=bot.config.level_persist_interval_seconds,
+            open_raids_count=len(open_raids),
+            self_test_ok=self_test_ok,
+            self_test_err=self_test_err,
+            language=language,
         )
+        
+        sent = await _safe_send_initial(interaction, None, ephemeral=True, embed=embed)
+        if not sent:
+            error_embed = discord.Embed(
+                title="❌ Fehler",
+                description=get_string(language, "error_settings_failed"),
+                color=discord.Color.red(),
+            )
+            await bot._reply(interaction, "", ephemeral=True, embed=error_embed)
 
     @bot.tree.command(name="id", description="Postet einen XP-Ausweis als Embed im aktuellen Channel")
     async def id_cmd(interaction):
         if not interaction.guild:
-            await bot._reply(interaction, "Nur im Server nutzbar.", ephemeral=True)
+            embed = discord.Embed(
+                title="❌ Fehler",
+                description=get_string("de", "error_server_only"),
+                color=discord.Color.red(),
+            )
+            await bot._reply(interaction, "", ephemeral=True, embed=embed)
             return
 
         target_user = interaction.user
@@ -122,7 +210,12 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
         )
         posted = await _safe_send_initial(interaction, None, ephemeral=False, embed=embed)
         if not posted:
-            await bot._reply(interaction, "Ausweis konnte nicht gepostet werden.", ephemeral=True)
+            error_embed = discord.Embed(
+                title="❌ Fehler",
+                description=get_string("de", "error_settings_failed"),
+                color=discord.Color.red(),
+            )
+            await bot._reply(interaction, "", ephemeral=True, embed=error_embed)
 
     @bot.tree.command(name="help", description="Zeigt verfuegbare Commands")
     async def help_cmd(interaction):
@@ -136,7 +229,12 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
     @bot.tree.command(name="help2", description="Postet eine kurze Anleitung")
     async def help2_cmd(interaction):
         if not isinstance(interaction.channel, discord.TextChannel):
-            await bot._reply(interaction, "Nur im Textchannel nutzbar.", ephemeral=True)
+            embed = discord.Embed(
+                title="❌ Fehler",
+                description=get_string("de", "error_text_channel_only"),
+                color=discord.Color.red(),
+            )
+            await bot._reply(interaction, "", ephemeral=True, embed=embed)
             return
         await bot._send_channel_message(
             interaction.channel,
@@ -492,6 +590,20 @@ def register_runtime_commands(bot: "RewriteDiscordBot") -> None:
         if not _can_use_privileged(interaction):
             return []
         return bot._remote_guild_autocomplete_choices(current)
+
+    @bot.tree.command(name="meme", description="Zeigt ein zufälliges Digimon Meme 🦖")
+    async def meme_cmd(interaction):
+        """Postet ein zufälliges Digimon Meme."""
+        meme_url = random.choice(DIGIMON_MEME_URLS)
+        embed = discord.Embed(
+            title="🦖 Digimon Meme",
+            color=discord.Color.random(),
+            url=meme_url,
+        )
+        embed.set_image(url=meme_url)
+        embed.set_footer(text="Digimon Memepedia • DMW Bot")
+        
+        await bot._reply(interaction, "", ephemeral=False, embed=embed)
 
     @bot.tree.command(name="backup_db", description="Schreibt ein SQL Backup")
     async def backup_db_cmd(interaction):

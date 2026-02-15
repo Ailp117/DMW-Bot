@@ -18,6 +18,7 @@ from services.admin_service import cancel_all_open_raids
 from services.backup_service import export_rows_to_sql
 from services.raid_service import finish_raid, planner_counts
 from utils.hashing import sha256_text
+from utils.localization import get_string
 from utils.runtime_helpers import *  # noqa: F401,F403
 from utils.slots import compute_qualified_slot_users, memberlist_target_label, memberlist_threshold
 from utils.text import contains_approved_keyword, contains_nanomon_keyword
@@ -1092,25 +1093,35 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
         guild_id: int,
         guild_name: str,
         raids: list[RaidRecord],
+        language: str = "de",
     ) -> tuple[Any, str, list[str]]:
+        lang = "de" if language == "de" else "en"
         now_utc = datetime.now(UTC)
         embed = discord.Embed(
-            title=f"📌 Raidliste: {guild_name}",
-            color=discord.Color.blurple(),
+            title=get_string(lang, "raidlist_title"),
+            color=discord.Color.gold(),
             timestamp=now_utc,
         )
         debug_lines: list[str] = []
         payload_parts = [f"guild={guild_id}", f"name={guild_name}"]
 
         if not raids:
-            embed.description = "Keine offenen Raids."
-            embed.set_footer(text="Automatisch aktualisiert durch DMW Bot")
+            embed.description = get_string(lang, "raidlist_no_raids", server=guild_name)
+            embed.set_footer(text=get_string(lang, "footer_auto_updated"))
             payload = "\n".join(payload_parts + ["empty=1"])
-            return embed, sha256_text(payload), ["- Keine offenen Raids."]
+            return embed, sha256_text(payload), ["- " + get_string(lang, "raidlist_no_raids_short")]
 
         total_qualified_slots = 0
         global_next_start: datetime | None = None
         global_next_label: str = "—"
+
+        # Summary Section
+        summary_content = get_string(lang, "raidlist_server", server=guild_name)
+        embed.add_field(
+            name=get_string(lang, "raidlist_overview"),
+            value=summary_content,
+            inline=False,
+        )
 
         for raid in raids[:25]:
             days, times = self.repo.list_raid_options(raid.id)
@@ -1146,28 +1157,29 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                 chosen = upcoming[0] if upcoming else slot_starts[0]
                 next_slot_start, next_day, next_time = chosen
                 unix_ts = int(next_slot_start.timestamp())
-                next_slot_text = f"`{next_day} {next_time}` • <t:{unix_ts}:f> (<t:{unix_ts}:R>)"
+                next_slot_text = f"\n**{next_day} {next_time}** • <t:{unix_ts}:f> (<t:{unix_ts}:R>)"
 
                 if global_next_start is None or (
                     next_slot_start >= now_utc
                     and (global_next_start < now_utc or next_slot_start < global_next_start)
                 ):
                     global_next_start = next_slot_start
-                    global_next_label = f"Raid `{raid.display_id}` {next_day} {next_time}"
+                    global_next_label = get_string(lang, "raidlist_next_raid", display_id=raid.display_id, day=next_day, time=next_time)
 
             total_qualified_slots += len(qualified_slots)
             jump_url = self._raid_jump_url(guild_id, raid.channel_id, raid.message_id)
             required_label = memberlist_target_label(raid.min_players)
-            field_name = f"#{raid.display_id} • {raid.dungeon}"
-            field_value = "\n".join(
-                [
-                    f"👥 Min `{required_label}` • ✅ Slots `{len(qualified_slots)}`",
-                    f"🗳️ Vollständig abgestimmt `{complete_voters}`",
-                    f"🕰️ Zeitzone `{timezone_name}`",
-                    f"⏭️ Nächster Slot: {next_slot_text}",
-                    f"🔗 {jump_url}",
-                ]
+            
+            field_name = get_string(lang, "raidlist_raid_field", display_id=raid.display_id, dungeon=raid.dungeon)
+            field_value = (
+                get_string(lang, "raidlist_minimum", players=required_label) + "\n"
+                + get_string(lang, "raidlist_qualified_slots", count=len(qualified_slots)) + "\n"
+                + get_string(lang, "raidlist_votes", count=complete_voters) + "\n"
+                + get_string(lang, "raidlist_timezone", tz=timezone_name) + "\n"
+                + get_string(lang, "raidlist_next_slot") + f": {next_slot_text}\n"
+                + f"[{get_string(lang, 'raidlist_view_raid')}]({jump_url})"
             )
+            
             if len(field_name) > 256:
                 field_name = f"{field_name[:253]}..."
             if len(field_value) > 1024:
@@ -1194,15 +1206,22 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                 )
             )
 
+        # Statistics Section
         summary_parts = [
-            f"Offene Raids: `{len(raids)}`",
-            f"Qualifizierte Slots: `{total_qualified_slots}`",
-            f"Zeitzone: `{DEFAULT_TIMEZONE_NAME}`",
+            get_string(lang, "raidlist_stats_raids", count=len(raids)),
+            get_string(lang, "raidlist_stats_slots", count=total_qualified_slots),
+            get_string(lang, "raidlist_stats_zone", tz=DEFAULT_TIMEZONE_NAME),
         ]
         if global_next_start is not None:
-            summary_parts.append(f"Nächster Start: `{global_next_label}`")
-        embed.description = " • ".join(summary_parts)
-        embed.set_footer(text="Automatisch aktualisiert durch DMW Bot")
+            summary_parts.append(f"🕐 {get_string(lang, 'raidlist_next_start')}: {global_next_label}")
+        
+        embed.add_field(
+            name=get_string(lang, "raidlist_statistics"),
+            value=" | ".join(summary_parts),
+            inline=False,
+        )
+        
+        embed.set_footer(text=get_string(lang, "footer_auto_updated"))
 
         payload_hash = sha256_text("\n".join(payload_parts))
         return embed, payload_hash, debug_lines
@@ -1215,10 +1234,12 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
         guild = self.get_guild(guild_id)
         guild_name = guild.name if guild is not None else (settings.guild_name or self._guild_display_name(guild_id))
         raids = self.repo.list_open_raids(guild_id)
+        language = settings.language if hasattr(settings, 'language') else "de"
         embed, payload_hash, debug_lines = self._build_raidlist_embed(
             guild_id=guild_id,
             guild_name=guild_name,
             raids=raids,
+            language=language,
         )
         debug_payload = self._format_debug_report(
             topic="Raidlist Debug",
