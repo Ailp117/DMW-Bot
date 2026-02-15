@@ -310,10 +310,10 @@ class SettingsView(discord.ui.View):
         # Feature Toggle Menu (Zeile 1)
         self.add_item(SettingsFeatureSelect(bot, guild_id))
         
-        # Language Select (Zeile 2)
+        # Language Select (Zeile 3)
         self.add_item(SettingsLanguageSelect(bot, guild_id=guild_id))
         
-        # Action Buttons (Zeile 3)
+        # Action Buttons (Zeile 4)
         self.add_item(SettingsIntervalsButton(bot, guild_id=guild_id))
         self.add_item(SettingsSaveButton(bot, guild_id))
         self.add_item(SettingsResetButton(bot, guild_id))
@@ -555,7 +555,7 @@ class SettingsResetButton(discord.ui.Button):
             label="Zurücksetzen",
             emoji="🔄",
             custom_id=f"settings:{guild_id}:reset",
-            row=2
+            row=4
         )
         self.bot = bot
         self.guild_id = guild_id

@@ -80,7 +80,7 @@ STRINGS: dict[Language, dict[str, str]] = {
         "raidlist_minimum": "**Minimum:** `{players}`",
         "raidlist_qualified_slots": "**Qualifizierte Slots:** `{count}`",
         "raidlist_votes": "**Abstimmungen:** `{count}` vollständig",
-        "raidlist_timezone": "**Zeitzone:** `{tz}`",
+        "raidlist_timezone": "Zeitzone `{tz}`",
         "raidlist_next_slot": "**Nächster Termin:**",
         "raidlist_next_raid": "Raid `{display_id}` {day} {time}",
         "raidlist_view_raid": "Raid ansehen",

@@ -13,6 +13,7 @@ EXPECTED_SLASH_COMMANDS = {
     "help",
     "help2",
     "id",
+    "meme",
     "restart",
     "raidplan",
     "raid_finish",

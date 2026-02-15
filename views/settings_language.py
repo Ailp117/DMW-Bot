@@ -38,7 +38,7 @@ class SettingsLanguageSelect(discord.ui.Select):
             min_values=1,
             max_values=1,
             custom_id=f"settings:{guild_id}:language",
-            row=2
+            row=3
         )
     
     async def callback(self, interaction: "discord.Interaction") -> None:  # type: ignore[name-defined]
