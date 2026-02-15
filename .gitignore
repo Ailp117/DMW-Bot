@@ -1,0 +1,209 @@
+# =============================================================================
+# DMW Bot - .gitignore
+# =============================================================================
+# Diese Datei definiert, was NICHT zu GitHub hochgeladen wird.
+# WICHTIG: Der .github/ Ordner wird BENÖTIGT und darf nicht ignoriert werden!
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1. PYTHON - Cache und kompilierte Dateien
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# -----------------------------------------------------------------------------
+# 2. VIRTUELLE UMGEBUNGEN
+# -----------------------------------------------------------------------------
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+pythonenv*
+
+# -----------------------------------------------------------------------------
+# 3. IDE UND EDITOR
+# -----------------------------------------------------------------------------
+# VS Code (lokal, nicht .github!)
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+
+# PyCharm / IntelliJ
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+
+# -----------------------------------------------------------------------------
+# 4. UMEBUNGS-VARIABLEN UND GEHEIME DATEIEN
+# -----------------------------------------------------------------------------
+# Niemals .env Dateien hochladen (enthalten Secrets!)
+.env
+.env.local
+.env.*.local
+.env.development
+.env.test
+.env.production
+!.env.example
+
+# Secrets
+secrets.json
+secrets.yml
+*.pem
+*.key
+
+# -----------------------------------------------------------------------------
+# 5. TESTS UND COVERAGE
+# -----------------------------------------------------------------------------
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# -----------------------------------------------------------------------------
+# 6. LOGS UND TEMPORÄRE DATEIEN
+# -----------------------------------------------------------------------------
+*.log
+logs/
+log/
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+
+# -----------------------------------------------------------------------------
+# 7. DATENBANK UND BACKUPS (lokal)
+# -----------------------------------------------------------------------------
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.sql~backups/*.sql
+
+# -----------------------------------------------------------------------------
+# 8. BETRIEBSSYSTEM
+# -----------------------------------------------------------------------------
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.nfs*
+
+# -----------------------------------------------------------------------------
+# 9. DOCKER (falls verwendet)
+# -----------------------------------------------------------------------------
+.dockerignore
+Dockerfile*
+docker-compose*.yml
+.docker/
+
+# -----------------------------------------------------------------------------
+# 10. SONSTIGES
+# -----------------------------------------------------------------------------
+# Node (falls JS/TS verwendet wird)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Distribution / packaging
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
+
+# -----------------------------------------------------------------------------
+# 11. PROJEKT-SPEZIFISCH
+# -----------------------------------------------------------------------------
+# Lokale Backup-Dateien
+backup/
+*.backup
+__BACKUP*/
+__FULL_BACKUP*/
+
+# Refactor Reports (alte Versionen)
+REFACTOR_REPORT.md.old
+ROLLBACK_REPORT.md
+
+# -----------------------------------------------------------------------------
+# WICHTIG: Was auf JEDEN FALL hochgeladen wird:
+# -----------------------------------------------------------------------------
+# ✅ Alle Python-Source-Dateien (*.py)
+# ✅ bot/, commands/, db/, features/, services/, utils/, views/
+# ✅ tests/ (Test-Suite)
+# ✅ .github/ (CI/CD Workflows) - WIRD BENÖTIGT!
+# ✅ DOCS/ (Dokumentation)
+# ✅ requirements.txt, requirements.in
+# ✅ README.md
+# ✅ pyrightconfig.json, pytest.ini
+# ✅ .env.example (als Vorlage, ohne echte Secrets)
+# =============================================================================
