@@ -32,3 +32,8 @@ def save_language_setting(repo: InMemoryRepository, guild_id: int, language: str
     return settings
 
 
+def set_templates_enabled(repo: InMemoryRepository, guild_id: int, guild_name: str | None, enabled: bool) -> GuildSettingsRecord:
+    """Enables or disables auto-templates for a guild."""
+    return repo.set_templates_enabled(guild_id, guild_name, enabled)
+
+
