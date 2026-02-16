@@ -22,6 +22,7 @@ class GuildSettingsRecord:
     raidlist_channel_id: int | None = None
     raidlist_message_id: int | None = None
     planner_channel_id: int | None = None
+    language: str = "de"
     default_min_players: int = 0
     templates_enabled: bool = True
     template_manager_role_id: int | None = None

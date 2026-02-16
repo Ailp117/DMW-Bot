@@ -527,6 +527,8 @@ def _status_embed(
         description=get_string(lang, "status_guild", guild=guild_name),  # type: ignore
         color=discord.Color.green(),
     )
+    # Add guild context to the embed for better readability
+    embed.set_author(name=guild_name)
     
     # Overview section
     overview_value = (

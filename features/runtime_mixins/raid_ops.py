@@ -957,8 +957,22 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             return (0, 0, 0)
 
         participants_channel = await self._get_text_channel(settings.participants_channel_id)
-        if participants_channel is None:
-            return (0, 0, 0)
+        # If the configured participants channel is not accessible or missing, try a fallback
+        target_channel = participants_channel
+        if target_channel is None:
+            # Fallback to planner channel if we cannot post to the participants channel
+            planner_id = getattr(settings, "planner_channel_id", None)
+            if not planner_id:
+                return (0, 0, 0)
+            target_channel = await self._get_text_channel(planner_id)
+            if target_channel is None:
+                return (0, 0, 0)
+            log.warning(
+                "Participants channel not accessible for raid_id=%s guild_id=%s; falling back to planner channel (id=%s)",
+                raid.id,
+                raid.guild_id,
+                planner_id,
+            )
 
         days, times = self.repo.list_raid_options(raid.id)
         day_users, time_users = self.repo.vote_user_sets(raid.id)
@@ -970,6 +984,19 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             time_users=time_users,
             threshold=threshold,
         )
+        # Debug: log when no qualified slots exist to help diagnose missing participant lists
+        if not qualified_slots:
+            log.info(
+                "No qualified memberlist slots for raid_id=%s guild_id=%s days=%s times=%s day_votes=%s time_votes=%s threshold=%s",
+                raid.id,
+                raid.guild_id,
+                days,
+                times,
+                {d: len(v) for d, v in day_users.items()},
+                {t: len(v) for t, v in time_users.items()},
+                threshold,
+            )
+        
 
         existing_rows = self.repo.list_posted_slots(raid.id)
         active_keys: set[tuple[str, str]] = set()
@@ -1000,7 +1027,7 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
 
             edited = False
             if row is not None and row.message_id is not None and not recreate_existing:
-                existing_channel = await self._get_text_channel(row.channel_id or participants_channel.id)
+                existing_channel = await self._get_text_channel(row.channel_id or target_channel.id)
                 if existing_channel is not None:
                     old_msg = await _runtime_mod()._safe_fetch_message(existing_channel, row.message_id)
                     if old_msg is not None:
@@ -1029,7 +1056,7 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                 continue
 
             new_msg = await self._send_channel_message(
-                participants_channel,
+                target_channel,
                 content=content,
                 embed=embed,
                 allowed_mentions=discord.AllowedMentions(users=True, roles=True),
@@ -1040,7 +1067,7 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                 raid_id=raid.id,
                 day_label=day_label,
                 time_label=time_label,
-                channel_id=participants_channel.id,
+                channel_id=target_channel.id,
                 message_id=new_msg.id,
             )
             if row is None:
