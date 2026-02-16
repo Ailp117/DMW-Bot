@@ -114,12 +114,14 @@ def create_raid_from_modal(
     if not settings.planner_channel_id or not settings.participants_channel_id:
         raise ValueError("Planner and participants channels must be configured")
 
+    planned_dates = ",".join(days)
     raid = repo.create_raid(
         guild_id=guild_id,
         planner_channel_id=planner_channel_id,
         creator_id=creator_id,
         dungeon=dungeon_name,
         min_players=min_players,
+        planned_dates=planned_dates,
     )
     repo.add_raid_options(raid.id, days=days, times=times)
     repo.set_raid_message_id(raid.id, message_id)

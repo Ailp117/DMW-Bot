@@ -18,6 +18,7 @@ from services.backup_service import export_rows_to_sql
 from services.raid_service import finish_raid, planner_counts
 from utils.hashing import sha256_text
 from utils.runtime_helpers import *  # noqa: F401,F403
+from utils.runtime_helpers import FEATURE_FLAG_AUTO_REMINDER
 from utils.slots import compute_qualified_slot_users, memberlist_target_label, memberlist_threshold
 from utils.text import contains_approved_keyword, contains_nanomon_keyword
 
@@ -47,6 +48,11 @@ class RuntimeStateCalendarMixin(RuntimeMixinBase):
     async def _reply(self, interaction: Any, content: str, *, ephemeral: bool = True) -> None:
         first = await self._mark_interaction_once(interaction)
         if first and await _safe_send_initial(interaction, content, ephemeral=ephemeral):
+            if AUTO_DELETE_COMMAND_MESSAGES and hasattr(interaction, "message") and interaction.message:
+                try:
+                    await interaction.message.delete()
+                except Exception:
+                    pass
             return
         await _safe_followup(interaction, content, ephemeral=ephemeral)
 
@@ -104,6 +110,7 @@ class RuntimeStateCalendarMixin(RuntimeMixinBase):
             nanomon_reply_enabled=True,
             approved_reply_enabled=True,
             raid_reminder_enabled=False,
+            auto_reminder_enabled=False,
             message_xp_interval_seconds=max(1, int(self.config.message_xp_interval_seconds)),
             levelup_message_cooldown_seconds=max(1, int(self.config.levelup_message_cooldown_seconds)),
         )
@@ -125,6 +132,8 @@ class RuntimeStateCalendarMixin(RuntimeMixinBase):
             flags |= FEATURE_FLAG_APPROVED_REPLY
         if settings.raid_reminder_enabled:
             flags |= FEATURE_FLAG_RAID_REMINDER
+        if settings.auto_reminder_enabled:
+            flags |= FEATURE_FLAG_AUTO_REMINDER
 
         message_interval = max(1, min(FEATURE_INTERVAL_MASK, int(settings.message_xp_interval_seconds)))
         levelup_cooldown = max(1, min(FEATURE_INTERVAL_MASK, int(settings.levelup_message_cooldown_seconds)))
@@ -152,6 +161,7 @@ class RuntimeStateCalendarMixin(RuntimeMixinBase):
             nanomon_reply_enabled=bool(flags & FEATURE_FLAG_NANOMON_REPLY),
             approved_reply_enabled=bool(flags & FEATURE_FLAG_APPROVED_REPLY),
             raid_reminder_enabled=bool(flags & FEATURE_FLAG_RAID_REMINDER),
+            auto_reminder_enabled=bool(flags & FEATURE_FLAG_AUTO_REMINDER),
             message_xp_interval_seconds=max(1, int(message_interval)),
             levelup_message_cooldown_seconds=max(1, int(levelup_cooldown)),
         )
@@ -164,6 +174,7 @@ class RuntimeStateCalendarMixin(RuntimeMixinBase):
             f"nanomon={int(settings.nanomon_reply_enabled)}|"
             f"approved={int(settings.approved_reply_enabled)}|"
             f"raid_reminder={int(settings.raid_reminder_enabled)}|"
+            f"auto_reminder={int(settings.auto_reminder_enabled)}|"
             f"xp_interval={int(settings.message_xp_interval_seconds)}|"
             f"levelup_cooldown={int(settings.levelup_message_cooldown_seconds)}"
         )
@@ -413,34 +424,12 @@ class RuntimeStateCalendarMixin(RuntimeMixinBase):
         force: bool = False,
         month_start: date | None = None,
     ) -> bool:
-        from views.raid_views import RaidCalendarView
-
         channel_id = self._get_raid_calendar_channel_id(guild_id)
         if channel_id is None:
             return False
 
-        target_month = self._resolve_raid_calendar_month_start(guild_id, month_start)
-        month_key = _month_key(target_month)
-        guild_name = self._guild_display_name(guild_id)
-        embed, payload_hash, _debug_lines = self._build_raid_calendar_embed(
-            guild_id=guild_id,
-            guild_name=guild_name,
-            month_start=target_month,
-        )
-
-        if (
-            not force
-            and self._raid_calendar_hash_by_guild.get(int(guild_id)) == payload_hash
-            and self._raid_calendar_month_key_by_guild.get(int(guild_id)) == month_key
-        ):
-            return False
-
-        channel = await self._get_text_channel(channel_id)
-        if channel is None:
-            return False
-
-        view = RaidCalendarView(cast("RewriteDiscordBot", self), guild_id=int(guild_id))
-        state_row = self._get_raid_calendar_state_row(guild_id)
+        # Raid Calendar Feature deaktiviert
+        return False
         if state_row is not None and int(state_row.message_id or 0) > 0:
             existing = await _safe_fetch_message(channel, int(state_row.message_id))
             if existing is not None:
@@ -611,18 +600,8 @@ class RuntimeStateCalendarMixin(RuntimeMixinBase):
             await self._refresh_raid_calendar_for_guild(guild_id, force=force)
 
     def _restore_persistent_raid_calendar_views(self) -> None:
-        from views.raid_views import RaidCalendarView
-
-        restored = 0
-        for row in self.repo.list_debug_cache(kind=RAID_CALENDAR_CONFIG_KIND):
-            channel_id = int(row.message_id or 0)
-            guild_id = int(row.guild_id)
-            if guild_id <= 0 or channel_id <= 0:
-                continue
-            self.add_view(RaidCalendarView(cast("RewriteDiscordBot", self), guild_id=guild_id))
-            restored += 1
-        if restored > 0:
-            log.info("Restored %s persistent raid calendar views", restored)
+        # Raid Calendar Feature deaktiviert
+        pass
 
     async def _refresh_application_owner_ids(self) -> None:
         if self._application_owner_ids:

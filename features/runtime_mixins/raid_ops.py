@@ -18,6 +18,7 @@ from services.admin_service import cancel_all_open_raids
 from services.backup_service import export_rows_to_sql
 from services.raid_service import finish_raid, planner_counts
 from utils.hashing import sha256_text
+from utils.localization import get_string
 from utils.runtime_helpers import *  # noqa: F401,F403
 from utils.slots import compute_qualified_slot_users, memberlist_target_label, memberlist_threshold
 from utils.text import contains_approved_keyword, contains_nanomon_keyword
@@ -323,6 +324,36 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             details = [empty_text]
         return "\n".join([*header, "", *body, "", "Details:", *details])
 
+    def _build_debug_embed(
+        self,
+        *,
+        topic: str,
+        guild_id: int,
+        summary: list[str],
+        lines: list[str] | None = None,
+        empty_text: str = "- Keine Eintraege.",
+    ) -> Any:
+        guild_name = self._guild_display_name(guild_id)
+        embed = discord.Embed(
+            title=f"🐛 {topic}",
+            color=discord.Color.orange(),
+            timestamp=datetime.now(UTC),
+        )
+        embed.add_field(name="Server", value=f"**{guild_name}**", inline=False)
+        for item in summary:
+            if item:
+                if ":" in item:
+                    key, _, value = item.partition(":")
+                    embed.add_field(name=key.strip(), value=value.strip(), inline=True)
+        details = [item for item in (lines or []) if item]
+        if not details:
+            details = [empty_text]
+        details_text = "\n".join(details)
+        if len(details_text) > 1000:
+            details_text = details_text[:997] + "..."
+        embed.add_field(name="Details", value=f"```\n{details_text}\n```", inline=False)
+        return embed
+
     async def _mirror_debug_payload(
         self,
         *,
@@ -339,8 +370,7 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
         if channel is None:
             return
 
-        payload = content if len(content) <= 1900 else f"{content[:1897]}..."
-        payload_hash = sha256_text(payload)
+        payload_hash = sha256_text(content)
         cached = self.repo.get_debug_cache(cache_key)
 
         if cached is not None and cached.payload_hash == payload_hash and cached.message_id:
@@ -348,10 +378,23 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             if existing is not None:
                 return
 
+        topic = "Debug"
+        if "raidlist" in cache_key:
+            topic = "Raidlist Debug"
+        elif "memberlist" in cache_key:
+            topic = "Memberlist Debug"
+
+        embed = self._build_debug_embed(
+            topic=topic,
+            guild_id=guild_id,
+            summary=[],
+            lines=content.split("\n"),
+        )
+
         if cached is not None and cached.message_id:
             existing = await _runtime_mod()._safe_fetch_message(channel, cached.message_id)
             if existing is not None:
-                edited = await _runtime_mod()._safe_edit_message(existing, content=payload)
+                edited = await _runtime_mod()._safe_edit_message(existing, embed=embed)
                 if edited:
                     self.repo.upsert_debug_cache(
                         cache_key=cache_key,
@@ -363,7 +406,7 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                     )
                     return
 
-        posted = await self._send_channel_message(channel, content=payload)
+        posted = await self._send_channel_message(channel, embed=embed)
         if posted is None:
             return
         self.repo.upsert_debug_cache(
@@ -536,16 +579,6 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
         if settings and settings.raidlist_channel_id == channel_id and settings.raidlist_message_id:
             message_ids.add(int(settings.raidlist_message_id))
 
-        calendar_channel_id = self._get_raid_calendar_channel_id(guild_id)
-        calendar_row = self._get_raid_calendar_state_row(guild_id)
-        if (
-            calendar_channel_id is not None
-            and int(calendar_channel_id) == int(channel_id)
-            and calendar_row is not None
-            and int(calendar_row.message_id or 0) > 0
-        ):
-            message_ids.add(int(calendar_row.message_id))
-
         for row in self.repo.list_debug_cache(kind=BOT_MESSAGE_KIND, guild_id=guild_id, raid_id=channel_id):
             if row.message_id:
                 message_ids.add(int(row.message_id))
@@ -573,12 +606,6 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             and int(settings.raidlist_message_id or 0) == int(message_id)
         ):
             settings.raidlist_message_id = None
-
-        calendar_row = self._get_raid_calendar_state_row(guild_id)
-        if calendar_row is not None and int(calendar_row.message_id or 0) == int(message_id):
-            self.repo.delete_debug_cache(self._raid_calendar_message_cache_key(guild_id))
-            self._raid_calendar_hash_by_guild.pop(int(guild_id), None)
-            self._raid_calendar_month_key_by_guild.pop(int(guild_id), None)
 
     async def _delete_indexed_bot_messages_in_channel(self, channel: Any, *, history_limit: int = 5000) -> int:
         guild = getattr(channel, "guild", None)
@@ -930,8 +957,22 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             return (0, 0, 0)
 
         participants_channel = await self._get_text_channel(settings.participants_channel_id)
-        if participants_channel is None:
-            return (0, 0, 0)
+        # If the configured participants channel is not accessible or missing, try a fallback
+        target_channel = participants_channel
+        if target_channel is None:
+            # Fallback to planner channel if we cannot post to the participants channel
+            planner_id = getattr(settings, "planner_channel_id", None)
+            if not planner_id:
+                return (0, 0, 0)
+            target_channel = await self._get_text_channel(planner_id)
+            if target_channel is None:
+                return (0, 0, 0)
+            log.warning(
+                "Participants channel not accessible for raid_id=%s guild_id=%s; falling back to planner channel (id=%s)",
+                raid.id,
+                raid.guild_id,
+                planner_id,
+            )
 
         days, times = self.repo.list_raid_options(raid.id)
         day_users, time_users = self.repo.vote_user_sets(raid.id)
@@ -943,6 +984,19 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
             time_users=time_users,
             threshold=threshold,
         )
+        # Debug: log when no qualified slots exist to help diagnose missing participant lists
+        if not qualified_slots:
+            log.info(
+                "No qualified memberlist slots for raid_id=%s guild_id=%s days=%s times=%s day_votes=%s time_votes=%s threshold=%s",
+                raid.id,
+                raid.guild_id,
+                days,
+                times,
+                {d: len(v) for d, v in day_users.items()},
+                {t: len(v) for t, v in time_users.items()},
+                threshold,
+            )
+        
 
         existing_rows = self.repo.list_posted_slots(raid.id)
         active_keys: set[tuple[str, str]] = set()
@@ -966,14 +1020,14 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                 slot_role = await self._ensure_slot_temp_role(raid, day_label=day_label, time_label=time_label)
                 if slot_role is not None:
                     await self._sync_slot_role_members(raid, role=slot_role, user_ids=users)
-                    content = f"🔔 {slot_role.mention}"
+                    # Role wird nicht mehr bei der Memberliste gepingt, sondern nur beim Raid Reminder
             debug_lines.append(f"- {day_label} {time_label}: {', '.join(f'<@{u}>' for u in users)}")
             row = existing_rows.get((day_label, time_label))
             old_msg_for_recreate = None
 
             edited = False
             if row is not None and row.message_id is not None and not recreate_existing:
-                existing_channel = await self._get_text_channel(row.channel_id or participants_channel.id)
+                existing_channel = await self._get_text_channel(row.channel_id or target_channel.id)
                 if existing_channel is not None:
                     old_msg = await _runtime_mod()._safe_fetch_message(existing_channel, row.message_id)
                     if old_msg is not None:
@@ -1002,7 +1056,7 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                 continue
 
             new_msg = await self._send_channel_message(
-                participants_channel,
+                target_channel,
                 content=content,
                 embed=embed,
                 allowed_mentions=discord.AllowedMentions(users=True, roles=True),
@@ -1013,7 +1067,7 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                 raid_id=raid.id,
                 day_label=day_label,
                 time_label=time_label,
-                channel_id=participants_channel.id,
+                channel_id=target_channel.id,
                 message_id=new_msg.id,
             )
             if row is None:
@@ -1066,25 +1120,35 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
         guild_id: int,
         guild_name: str,
         raids: list[RaidRecord],
+        language: str = "de",
     ) -> tuple[Any, str, list[str]]:
+        lang = "de" if language == "de" else "en"
         now_utc = datetime.now(UTC)
         embed = discord.Embed(
-            title=f"📌 Raidliste: {guild_name}",
-            color=discord.Color.blurple(),
+            title=get_string(lang, "raidlist_title"),
+            color=discord.Color.gold(),
             timestamp=now_utc,
         )
         debug_lines: list[str] = []
         payload_parts = [f"guild={guild_id}", f"name={guild_name}"]
 
         if not raids:
-            embed.description = "Keine offenen Raids."
-            embed.set_footer(text="Automatisch aktualisiert durch DMW Bot")
+            embed.description = get_string(lang, "raidlist_no_raids", server=guild_name)
+            embed.set_footer(text=get_string(lang, "footer_auto_updated"))
             payload = "\n".join(payload_parts + ["empty=1"])
-            return embed, sha256_text(payload), ["- Keine offenen Raids."]
+            return embed, sha256_text(payload), ["- " + get_string(lang, "raidlist_no_raids_short")]
 
         total_qualified_slots = 0
         global_next_start: datetime | None = None
         global_next_label: str = "—"
+
+        # Summary Section
+        summary_content = get_string(lang, "raidlist_server", server=guild_name)
+        embed.add_field(
+            name=get_string(lang, "raidlist_overview"),
+            value=summary_content,
+            inline=False,
+        )
 
         for raid in raids[:25]:
             days, times = self.repo.list_raid_options(raid.id)
@@ -1120,29 +1184,29 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                 chosen = upcoming[0] if upcoming else slot_starts[0]
                 next_slot_start, next_day, next_time = chosen
                 unix_ts = int(next_slot_start.timestamp())
-                next_slot_text = f"`{next_day} {next_time}` • <t:{unix_ts}:f> (<t:{unix_ts}:R>)"
+                next_slot_text = f"\n**{next_day} {next_time}** • <t:{unix_ts}:f> (<t:{unix_ts}:R>)"
 
                 if global_next_start is None or (
                     next_slot_start >= now_utc
                     and (global_next_start < now_utc or next_slot_start < global_next_start)
                 ):
                     global_next_start = next_slot_start
-                    global_next_label = f"Raid `{raid.display_id}` {next_day} {next_time}"
+                    global_next_label = get_string(lang, "raidlist_next_raid", display_id=raid.display_id, day=next_day, time=next_time)
 
             total_qualified_slots += len(qualified_slots)
             jump_url = self._raid_jump_url(guild_id, raid.channel_id, raid.message_id)
             required_label = memberlist_target_label(raid.min_players)
-            field_name = f"#{raid.display_id} • {raid.dungeon}"
-            field_value = "\n".join(
-                [
-                    f"👤 <@{raid.creator_id}>",
-                    f"👥 Min `{required_label}` • ✅ Slots `{len(qualified_slots)}`",
-                    f"🗳️ Vollständig abgestimmt `{complete_voters}`",
-                    f"🕰️ Zeitzone `{timezone_name}`",
-                    f"⏭️ Nächster Slot: {next_slot_text}",
-                    f"🔗 {jump_url}",
-                ]
+            
+            field_name = get_string(lang, "raidlist_raid_field", display_id=raid.display_id, dungeon=raid.dungeon)
+            field_value = (
+                get_string(lang, "raidlist_minimum", players=required_label) + "\n"
+                + get_string(lang, "raidlist_qualified_slots", count=len(qualified_slots)) + "\n"
+                + get_string(lang, "raidlist_votes", count=complete_voters) + "\n"
+                + get_string(lang, "raidlist_timezone", tz=timezone_name) + "\n"
+                + get_string(lang, "raidlist_next_slot") + f": {next_slot_text}\n"
+                + f"[{get_string(lang, 'raidlist_view_raid')}]({jump_url})"
             )
+            
             if len(field_name) > 256:
                 field_name = f"{field_name[:253]}..."
             if len(field_value) > 1024:
@@ -1169,15 +1233,22 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                 )
             )
 
+        # Statistics Section
         summary_parts = [
-            f"Offene Raids: `{len(raids)}`",
-            f"Qualifizierte Slots: `{total_qualified_slots}`",
-            f"Zeitzone: `{DEFAULT_TIMEZONE_NAME}`",
+            get_string(lang, "raidlist_stats_raids", count=len(raids)),
+            get_string(lang, "raidlist_stats_slots", count=total_qualified_slots),
+            get_string(lang, "raidlist_stats_zone", tz=DEFAULT_TIMEZONE_NAME),
         ]
         if global_next_start is not None:
-            summary_parts.append(f"Nächster Start: `{global_next_label}`")
-        embed.description = " • ".join(summary_parts)
-        embed.set_footer(text="Automatisch aktualisiert durch DMW Bot")
+            summary_parts.append(f"🕐 {get_string(lang, 'raidlist_next_start')}: {global_next_label}")
+        
+        embed.add_field(
+            name=get_string(lang, "raidlist_statistics"),
+            value=" | ".join(summary_parts),
+            inline=False,
+        )
+        
+        embed.set_footer(text=get_string(lang, "footer_auto_updated"))
 
         payload_hash = sha256_text("\n".join(payload_parts))
         return embed, payload_hash, debug_lines
@@ -1190,10 +1261,12 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
         guild = self.get_guild(guild_id)
         guild_name = guild.name if guild is not None else (settings.guild_name or self._guild_display_name(guild_id))
         raids = self.repo.list_open_raids(guild_id)
+        language = settings.language if hasattr(settings, 'language') else "de"
         embed, payload_hash, debug_lines = self._build_raidlist_embed(
             guild_id=guild_id,
             guild_name=guild_name,
             raids=raids,
+            language=language,
         )
         debug_payload = self._format_debug_report(
             topic="Raidlist Debug",
@@ -1329,7 +1402,6 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
                 attendance_rows=result.attendance_rows,
             )
             await self._force_raidlist_refresh(guild_id)
-            await self._force_raid_calendar_refresh(guild_id)
             persisted = await self._persist()
 
         if not persisted:
@@ -1357,5 +1429,4 @@ class RuntimeRaidOpsMixin(RuntimeMixinBase):
 
         count = cancel_all_open_raids(self.repo, guild_id=guild_id)
         await self._force_raidlist_refresh(guild_id)
-        await self._force_raid_calendar_refresh(guild_id)
         return count

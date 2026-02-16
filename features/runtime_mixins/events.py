@@ -36,23 +36,24 @@ class RuntimeEventsMixin(RuntimeMixinBase):
             self._commands_registered = True
         if not self._views_restored:
             self._restore_persistent_vote_views()
-            self._restore_persistent_raid_calendar_views()
             self._views_restored = True
 
     async def _bootstrap_repository(self) -> None:
-        if not await self.persistence.session_manager.try_acquire_singleton_lock():
-            log.warning("Another instance holds singleton lock. Exiting.")
-            raise SystemExit(0)
+        if not self.persistence.session_manager.is_disabled:
+            if not await self.persistence.session_manager.try_acquire_singleton_lock():
+                log.warning("Another instance holds singleton lock. Exiting.")
+                raise SystemExit(0)
 
-        async with self.persistence.session_manager.engine.begin() as connection:
-            changes = await ensure_required_schema(connection)
-            await validate_required_tables(connection)
-            if changes:
-                log.info("Applied DB schema changes: %s", ", ".join(changes))
+            async with self.persistence.session_manager.engine.begin() as connection:
+                changes = await ensure_required_schema(connection)
+                await validate_required_tables(connection)
+                if changes:
+                    log.info("Applied DB schema changes: %s", ", ".join(changes))
 
         await self.persistence.load(self.repo)
         if not self.repo.dungeons:
             self._seed_default_dungeons()
+        if not self.persistence.session_manager.is_disabled:
             await self.persistence.flush(self.repo)
 
     def _restore_persistent_vote_views(self) -> None:
@@ -118,7 +119,6 @@ class RuntimeEventsMixin(RuntimeMixinBase):
             await self._refresh_planner_message(raid.id)
             await self._sync_memberlist_messages_for_raid(raid.id, recreate_existing=True)
         await self._refresh_raidlists_for_all_guilds(force=True)
-        await self._refresh_raid_calendars_for_all_guilds(force=True)
         await self._persist()
 
     def _sync_connected_guild_settings(self) -> bool:
@@ -148,7 +148,6 @@ class RuntimeEventsMixin(RuntimeMixinBase):
             self.repo.ensure_settings(guild.id, guild.name)
             self._username_sync_next_run_by_guild[int(guild.id)] = 0.0
             await self._force_raidlist_refresh(guild.id)
-            await self._force_raid_calendar_refresh(guild.id)
             await self._persist(dirty_tables={"settings", "debug_cache"})
 
         try:
@@ -165,10 +164,6 @@ class RuntimeEventsMixin(RuntimeMixinBase):
         async with self._state_lock:
             self._guild_feature_settings.pop(int(guild.id), None)
             self._username_sync_next_run_by_guild.pop(int(guild.id), None)
-            self._raid_calendar_hash_by_guild.pop(int(guild.id), None)
-            self._raid_calendar_month_key_by_guild.pop(int(guild.id), None)
-            self.repo.delete_debug_cache(self._raid_calendar_config_cache_key(int(guild.id)))
-            self.repo.delete_debug_cache(self._raid_calendar_message_cache_key(int(guild.id)))
             self.repo.purge_guild_data(guild.id)
             await self._persist()
 

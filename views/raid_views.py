@@ -3,12 +3,12 @@ from __future__ import annotations
 from typing import Any, TYPE_CHECKING
 
 from bot.discord_api import discord
+from utils.localization import Language, get_lang, get_string
 from utils.runtime_helpers import (
     DEFAULT_TIMEZONE_NAME,
     FEATURE_INTERVAL_MASK,
     GuildFeatureSettings,
     _member_name,
-    _month_label_de,
     _normalize_raid_date_selection,
     _on_off,
     _parse_raid_date_from_label,
@@ -19,15 +19,36 @@ from utils.runtime_helpers import (
     _upcoming_raid_date_labels,
 )
 from services.raid_service import create_raid_from_modal, planner_counts, toggle_vote
-from services.settings_service import save_channel_settings
+from services.settings_service import save_channel_settings, save_language_setting
+from views.settings_language import SettingsLanguageSelect
 
 if TYPE_CHECKING:
     from bot.runtime import RewriteDiscordBot
+    import discord as discord_types
 
 
 class RaidCreateModal(discord.ui.Modal):
-    times = discord.ui.TextInput(label="Uhrzeiten (Komma/Zeilen)", required=True, max_length=400)
-    min_players = discord.ui.TextInput(label="Min Spieler pro Slot (0=ab 1)", required=True, max_length=3)
+    days = discord.ui.TextInput(
+        label="Datum (DD.MM.YYYY, comma-separiert)",
+        placeholder="z.B. 20.02.2026, 21.02.2026",
+        required=True,
+        max_length=200,
+        row=0,
+    )
+    times = discord.ui.TextInput(
+        label="Uhrzeiten (Komma/Zeilen getrennt)",
+        placeholder="z.B. 20:00, 21:00",
+        required=True,
+        max_length=400,
+        row=1,
+    )
+    min_players = discord.ui.TextInput(
+        label="Min Spieler pro Slot (0=ab 1)",
+        placeholder="z.B. 3",
+        required=True,
+        max_length=3,
+        row=2,
+    )
 
     def __init__(
         self,
@@ -37,20 +58,20 @@ class RaidCreateModal(discord.ui.Modal):
         guild_name: str,
         channel_id: int,
         dungeon_name: str,
-        selected_days: list[str] | None = None,
-        default_days: list[str] | None = None,
         default_times: list[str],
         default_min_players: int,
     ):
-        super().__init__(title="Raid erstellen")
+        super().__init__(title=f"Raid: {dungeon_name}")
         self.bot = bot
         self.guild_id = guild_id
         self.guild_name = guild_name
         self.channel_id = channel_id
         self.dungeon_name = dungeon_name
 
-        raw_days = selected_days if selected_days else (default_days or [])
-        self.selected_days = [str(value).strip() for value in raw_days if str(value).strip()]
+        available_days = _upcoming_raid_date_labels()
+        day_examples = ", ".join(available_days[:3])
+        self.days.placeholder = f"z.B. {day_examples}"
+
         if default_times:
             self.times.default = ", ".join(default_times)[:400]
         self.min_players.default = str(max(0, int(default_min_players)))
@@ -62,8 +83,18 @@ class RaidCreateModal(discord.ui.Modal):
 
         await self.bot._defer(interaction, ephemeral=True)
 
-        if not self.selected_days:
-            await _safe_followup(interaction, "Bitte mindestens ein Datum auswaehlen.", ephemeral=True)
+        selected_days = [d.strip() for d in str(self.days.value).split(",") if d.strip()]
+        if not selected_days:
+            await _safe_followup(interaction, "Bitte mindestens ein Datum eingeben.", ephemeral=True)
+            return
+            await self.bot._reply(interaction, "Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        await self.bot._defer(interaction, ephemeral=True)
+
+        selected_days = [d.strip() for d in str(self.days.value).split(",") if d.strip()]
+        if not selected_days:
+            await _safe_followup(interaction, "Bitte mindestens ein Datum eingeben.", ephemeral=True)
             return
 
         try:
@@ -83,7 +114,7 @@ class RaidCreateModal(discord.ui.Modal):
                     planner_channel_id=self.channel_id,
                     creator_id=interaction.user.id,
                     dungeon_name=self.dungeon_name,
-                    days_input="\n".join(self.selected_days),
+                    days_input="\n".join(selected_days),
                     times_input=str(self.times.value),
                     min_players_input=str(min_players_value),
                     message_id=0,
@@ -101,7 +132,6 @@ class RaidCreateModal(discord.ui.Modal):
 
             await self.bot._sync_memberlist_messages_for_raid(result.raid.id)
             await self.bot._refresh_raidlist_for_guild(self.guild_id, force=True)
-            await self.bot._refresh_raid_calendar_for_guild(self.guild_id, force=True)
             persisted = await self.bot._persist()
             counts = planner_counts(self.bot.repo, result.raid.id)
 
@@ -122,179 +152,6 @@ class RaidCreateModal(discord.ui.Modal):
                 f"Time Votes: {counts['time']}\n"
                 f"Planner Post: {jump_url}"
             ),
-            ephemeral=True,
-        )
-
-
-class RaidDateContinueButton(discord.ui.Button):
-    def __init__(self, bot: "RewriteDiscordBot"):
-        super().__init__(
-            style=discord.ButtonStyle.success,
-            label="Weiter (Uhrzeiten + Min Spieler)",
-            row=1,
-        )
-        self.bot = bot
-
-    async def callback(self, interaction):
-        view = self.view
-        if not isinstance(view, RaidDateSelectionView):
-            await self.bot._reply(interaction, "Date-View nicht verfuegbar.", ephemeral=True)
-            return
-        if not view.is_valid_interaction(interaction):
-            await self.bot._reply(interaction, "Nur der Ersteller kann diese Auswahl fortsetzen.", ephemeral=True)
-            return
-        if not view.selected_days:
-            await self.bot._reply(interaction, "Bitte zuerst mindestens ein Datum waehlen.", ephemeral=True)
-            return
-        modal = RaidCreateModal(
-            self.bot,
-            guild_id=view.guild_id,
-            guild_name=view.guild_name,
-            channel_id=view.channel_id,
-            dungeon_name=view.dungeon_name,
-            selected_days=view.selected_days,
-            default_times=view.default_times,
-            default_min_players=view.default_min_players,
-        )
-        try:
-            await interaction.response.send_modal(modal)
-        except Exception:
-            await self.bot._reply(interaction, "Raid-Modal konnte nicht geoeffnet werden.", ephemeral=True)
-
-
-class RaidDateSelectionView(discord.ui.View):
-    def __init__(
-        self,
-        bot: "RewriteDiscordBot",
-        *,
-        owner_user_id: int,
-        guild_id: int,
-        guild_name: str,
-        channel_id: int,
-        dungeon_name: str,
-        default_days: list[str],
-        default_times: list[str],
-        default_min_players: int,
-    ):
-        super().__init__(timeout=300)
-        self.bot = bot
-        self.owner_user_id = int(owner_user_id)
-        self.guild_id = int(guild_id)
-        self.guild_name = guild_name
-        self.channel_id = int(channel_id)
-        self.dungeon_name = dungeon_name
-        self.default_times = list(default_times)
-        self.default_min_players = int(default_min_players)
-
-        self.available_days = _upcoming_raid_date_labels()
-        self.selected_days = self._resolve_default_days(default_days)
-
-        options = [
-            discord.SelectOption(
-                label=label,
-                value=label,
-                default=label in self.selected_days,
-            )
-            for label in self.available_days
-        ]
-        day_select = discord.ui.Select(
-            placeholder="Daten waehlen/abwaehlen...",
-            min_values=1,
-            max_values=min(25, max(1, len(options))),
-            options=options,
-            row=0,
-        )
-        day_select.callback = self._on_day_select
-        self.add_item(day_select)
-        self.add_item(RaidDateContinueButton(bot))
-
-    @staticmethod
-    def _weekday_alias_to_index(label: str) -> int | None:
-        aliases = {
-            "mo": 0,
-            "mon": 0,
-            "montag": 0,
-            "di": 1,
-            "tue": 1,
-            "dienstag": 1,
-            "mi": 2,
-            "wed": 2,
-            "mittwoch": 2,
-            "do": 3,
-            "thu": 3,
-            "donnerstag": 3,
-            "fr": 4,
-            "fri": 4,
-            "freitag": 4,
-            "sa": 5,
-            "sat": 5,
-            "samstag": 5,
-            "so": 6,
-            "sun": 6,
-            "sonntag": 6,
-        }
-        return aliases.get((label or "").strip().lower())
-
-    def _resolve_default_days(self, default_days: list[str]) -> list[str]:
-        if not self.available_days:
-            return []
-        resolved: list[str] = []
-        available_map = {value.casefold(): value for value in self.available_days}
-        by_iso_date = {value[:10]: value for value in self.available_days if len(value) >= 10}
-
-        by_weekday: dict[int, list[str]] = {}
-        for value in self.available_days:
-            parsed = _parse_raid_date_from_label(value)
-            if parsed is None:
-                continue
-            by_weekday.setdefault(parsed.weekday(), []).append(value)
-
-        for raw in default_days:
-            text = str(raw or "").strip()
-            if not text:
-                continue
-            direct = available_map.get(text.casefold())
-            if direct and direct not in resolved:
-                resolved.append(direct)
-                continue
-            parsed_date = _parse_raid_date_from_label(text)
-            if parsed_date is not None:
-                mapped = by_iso_date.get(parsed_date.isoformat())
-                if mapped and mapped not in resolved:
-                    resolved.append(mapped)
-                    continue
-            weekday = self._weekday_alias_to_index(text)
-            if weekday is None:
-                continue
-            for candidate in by_weekday.get(weekday, []):
-                if candidate not in resolved:
-                    resolved.append(candidate)
-                    break
-
-        normalized = _normalize_raid_date_selection(resolved, allowed=self.available_days)
-        if normalized:
-            return normalized
-        return [self.available_days[0]]
-
-    def is_valid_interaction(self, interaction: Any) -> bool:
-        interaction_guild_id = int(getattr(getattr(interaction, "guild", None), "id", 0) or 0)
-        interaction_user_id = int(getattr(getattr(interaction, "user", None), "id", 0) or 0)
-        return interaction_guild_id == self.guild_id and interaction_user_id == self.owner_user_id
-
-    async def _on_day_select(self, interaction):
-        if not self.is_valid_interaction(interaction):
-            await self.bot._reply(interaction, "Nur der Ersteller darf die Datumswahl aendern.", ephemeral=True)
-            return
-        raw_values = [str(value) for value in ((interaction.data or {}).get("values") or [])]
-        normalized = _normalize_raid_date_selection(raw_values, allowed=self.available_days)
-        if not normalized:
-            await self.bot._reply(interaction, "Bitte mindestens ein Datum waehlen.", ephemeral=True)
-            return
-        self.selected_days = normalized
-        await self.bot._defer(interaction, ephemeral=True)
-        await _safe_followup(
-            interaction,
-            f"Datumsauswahl vorgemerkt ({len(self.selected_days)}): {', '.join(self.selected_days)}",
             ephemeral=True,
         )
 
@@ -350,59 +207,6 @@ class SettingsIntervalsModal(discord.ui.Modal):
         await self.bot._reply(interaction, "Intervall-Einstellungen vorgemerkt.", ephemeral=True)
 
 
-class SettingsCalendarChannelModal(discord.ui.Modal):
-    calendar_channel = discord.ui.TextInput(
-        label="Raid Kalender Channel (ID/#, leer=aus)",
-        required=False,
-        max_length=64,
-    )
-
-    def __init__(self, bot: "RewriteDiscordBot", view: "SettingsView"):
-        super().__init__(title="Raid Kalender Channel")
-        self.bot = bot
-        self._view_ref = view
-        if view.raid_calendar_channel_id:
-            self.calendar_channel.default = str(int(view.raid_calendar_channel_id))
-
-    async def on_submit(self, interaction):
-        view = self._view_ref
-        if not isinstance(view, SettingsView):
-            await self.bot._reply(interaction, "Settings View nicht verfuegbar.", ephemeral=True)
-            return
-        if not interaction.guild or interaction.guild.id != view.guild_id:
-            await self.bot._reply(interaction, "Ungueltiger Guild-Kontext.", ephemeral=True)
-            return
-
-        raw = str(self.calendar_channel.value or "").strip()
-        if not raw:
-            view.raid_calendar_channel_id = None
-            await self.bot._reply(interaction, "Raid Kalender Channel deaktiviert.", ephemeral=True)
-            return
-
-        if raw.startswith("<#") and raw.endswith(">"):
-            raw = raw[2:-1].strip()
-        if raw.startswith("#"):
-            raw = raw[1:].strip()
-
-        try:
-            channel_id = int(raw)
-        except ValueError:
-            await self.bot._reply(interaction, "Bitte gueltige Channel-ID oder #mention angeben.", ephemeral=True)
-            return
-
-        channel = interaction.guild.get_channel(channel_id)
-        if not isinstance(channel, discord.TextChannel):
-            await self.bot._reply(
-                interaction,
-                "Channel nicht gefunden oder kein Text/News-Channel.",
-                ephemeral=True,
-            )
-            return
-
-        view.raid_calendar_channel_id = channel_id
-        await self.bot._reply(interaction, f"Raid Kalender Channel vorgemerkt: `{channel_id}`", ephemeral=True)
-
-
 class SettingsToggleButton(discord.ui.Button):
     def __init__(
         self,
@@ -411,8 +215,9 @@ class SettingsToggleButton(discord.ui.Button):
         guild_id: int,
         attr_name: str,
         label_prefix: str,
+        row: int = 3,
     ):
-        super().__init__(style=discord.ButtonStyle.secondary, label=label_prefix, row=3)
+        super().__init__(style=discord.ButtonStyle.secondary, label=label_prefix, row=row)
         self.bot = bot
         self.guild_id = guild_id
         self.attr_name = attr_name
@@ -469,140 +274,319 @@ class SettingsIntervalsButton(discord.ui.Button):
             await self.bot._reply(interaction, "Modal konnte nicht geoeffnet werden.", ephemeral=True)
 
 
-class SettingsCalendarChannelButton(discord.ui.Button):
-    def __init__(self, bot: "RewriteDiscordBot", *, guild_id: int):
-        super().__init__(
-            style=discord.ButtonStyle.secondary,
-            label="Kalender Channel",
-            custom_id=f"settings:{guild_id}:calendar_modal",
-            row=4,
-        )
-        self.bot = bot
-        self.guild_id = guild_id
-
-    async def callback(self, interaction):
-        if not interaction.guild or interaction.guild.id != self.guild_id:
-            await self.bot._reply(interaction, "Ungueltiger Guild-Kontext.", ephemeral=True)
-            return
-        view = self.view
-        if not isinstance(view, SettingsView):
-            await self.bot._reply(interaction, "Settings View nicht verfuegbar.", ephemeral=True)
-            return
-        try:
-            await interaction.response.send_modal(SettingsCalendarChannelModal(self.bot, view))
-        except Exception:
-            await self.bot._reply(interaction, "Modal konnte nicht geoeffnet werden.", ephemeral=True)
-
-
 class SettingsView(discord.ui.View):
+    """Überarbeitetes Settings-Menü mit intuitiver Struktur."""
+    
     def __init__(self, bot: "RewriteDiscordBot", *, guild_id: int):
         super().__init__(timeout=300)
         self.bot = bot
         self.guild_id = guild_id
         settings = bot.repo.ensure_settings(guild_id)
         feature_settings = bot._get_guild_feature_settings(guild_id)
+        
+        # Language
+        self.language: Language = get_lang(settings)
+        
+        # Channel Settings
         self.planner_channel_id: int | None = settings.planner_channel_id
         self.participants_channel_id: int | None = settings.participants_channel_id
         self.raidlist_channel_id: int | None = settings.raidlist_channel_id
-        self.raid_calendar_channel_id: int | None = bot._get_raid_calendar_channel_id(guild_id)
+        
+        # Feature toggles
         self.leveling_enabled: bool = feature_settings.leveling_enabled
         self.levelup_messages_enabled: bool = feature_settings.levelup_messages_enabled
         self.nanomon_reply_enabled: bool = feature_settings.nanomon_reply_enabled
         self.approved_reply_enabled: bool = feature_settings.approved_reply_enabled
         self.raid_reminder_enabled: bool = feature_settings.raid_reminder_enabled
+        self.auto_reminder_enabled: bool = feature_settings.auto_reminder_enabled
+        
+        # Intervals
         self.message_xp_interval_seconds: int = feature_settings.message_xp_interval_seconds
         self.levelup_message_cooldown_seconds: int = feature_settings.levelup_message_cooldown_seconds
 
-        planner_select = discord.ui.ChannelSelect(
-            placeholder="Umfragen Channel waehlen",
-            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
-            min_values=0,
-            max_values=1,
-            custom_id=f"settings:{guild_id}:planner",
-            row=0,
-        )
-        participants_select = discord.ui.ChannelSelect(
-            placeholder="Raid Teilnehmerlisten Channel waehlen",
-            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
-            min_values=0,
-            max_values=1,
-            custom_id=f"settings:{guild_id}:participants",
-            row=1,
-        )
-        raidlist_select = discord.ui.ChannelSelect(
-            placeholder="Raidlist Channel waehlen",
-            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
-            min_values=0,
-            max_values=1,
-            custom_id=f"settings:{guild_id}:raidlist",
-            row=2,
-        )
-
-        planner_select.callback = self._on_planner_select
-        participants_select.callback = self._on_participants_select
-        raidlist_select.callback = self._on_raidlist_select
-
-        self.add_item(planner_select)
-        self.add_item(participants_select)
-        self.add_item(raidlist_select)
-
-        toggle_items = [
-            SettingsToggleButton(
-                bot,
-                guild_id=guild_id,
-                attr_name="leveling_enabled",
-                label_prefix="Levelsystem",
-            ),
-            SettingsToggleButton(
-                bot,
-                guild_id=guild_id,
-                attr_name="levelup_messages_enabled",
-                label_prefix="Levelup Msg",
-            ),
-            SettingsToggleButton(
-                bot,
-                guild_id=guild_id,
-                attr_name="nanomon_reply_enabled",
-                label_prefix="Nanomon Reply",
-            ),
-            SettingsToggleButton(
-                bot,
-                guild_id=guild_id,
-                attr_name="approved_reply_enabled",
-                label_prefix="Approved Reply",
-            ),
-            SettingsToggleButton(
-                bot,
-                guild_id=guild_id,
-                attr_name="raid_reminder_enabled",
-                label_prefix="Raid Reminder",
-            ),
-        ]
-        for item in toggle_items:
-            item._refresh_appearance(self)
-            self.add_item(item)
-
-        self.add_item(SettingsCalendarChannelButton(bot, guild_id=guild_id))
+        # Channel Select Menu (Zeile 0)
+        self.add_item(SettingsChannelSelect(bot, guild_id))
+        
+        # Feature Toggle Menu (Zeile 1)
+        self.add_item(SettingsFeatureSelect(bot, guild_id))
+        
+        # Language Select (Zeile 3)
+        self.add_item(SettingsLanguageSelect(bot, guild_id=guild_id))
+        
+        # Action Buttons (Zeile 4)
         self.add_item(SettingsIntervalsButton(bot, guild_id=guild_id))
         self.add_item(SettingsSaveButton(bot, guild_id))
+        self.add_item(SettingsResetButton(bot, guild_id))
 
-    async def _on_planner_select(self, interaction):
-        selected = ((interaction.data or {}).get("values") or [])
-        self.planner_channel_id = int(selected[0]) if selected else None
-        await self.bot._defer(interaction, ephemeral=True)
-        await _safe_followup(interaction, "Umfragen Channel vorgemerkt.", ephemeral=True)
+    def build_embed(self) -> "discord.Embed":  # type: ignore[name-defined]
+        """Erstellt Übersichts-Embed mit aktuellen Einstellungen."""
+        embed = discord.Embed(
+            title=get_string(self.language, "settings_title"),
+            description=get_string(self.language, "settings_desc"),
+            color=discord.Color.blue()
+        )
+        
+        # Channels
+        channels_text = (
+            f"{get_string(self.language, 'channel_planner')}: {self._channel_mention(self.planner_channel_id)}\n"
+            f"{get_string(self.language, 'channel_participants')}: {self._channel_mention(self.participants_channel_id)}\n"
+            f"{get_string(self.language, 'channel_raidlist')}: {self._channel_mention(self.raidlist_channel_id)}"
+        )
+        embed.add_field(name=get_string(self.language, "settings_channels"), value=channels_text, inline=False)
+        
+        # Features
+        features_text = (
+            f"{get_string(self.language, 'feature_leveling')}: {self._status_emoji(self.leveling_enabled)}\n"
+            f"{get_string(self.language, 'feature_levelup_msg')}: {self._status_emoji(self.levelup_messages_enabled)}\n"
+            f"{get_string(self.language, 'feature_nanomon')}: {self._status_emoji(self.nanomon_reply_enabled)}\n"
+            f"{get_string(self.language, 'feature_approved')}: {self._status_emoji(self.approved_reply_enabled)}\n"
+            f"{get_string(self.language, 'feature_raid_reminder')}: {self._status_emoji(self.raid_reminder_enabled)}\n"
+            f"{get_string(self.language, 'feature_auto_reminder')}: {self._status_emoji(self.auto_reminder_enabled)}"
+        )
+        embed.add_field(name=get_string(self.language, "settings_features"), value=features_text, inline=True)
+        
+        # Intervals
+        intervals_text = (
+            f"{get_string(self.language, 'interval_xp')}: {self.message_xp_interval_seconds}s\n"
+            f"{get_string(self.language, 'interval_cooldown')}: {self.levelup_message_cooldown_seconds}s"
+        )
+        embed.add_field(name=get_string(self.language, "settings_intervals"), value=intervals_text, inline=True)
+        
+        # Language
+        lang_label = "🇩🇪 Deutsch" if self.language == "de" else "🇬🇧 English"
+        embed.add_field(name=get_string(self.language, "settings_language"), value=f"**{lang_label}**", inline=True)
+        
+        embed.set_footer(text=get_string(self.language, "settings_footer"))
+        return embed
+    
+    def _channel_mention(self, channel_id: int | None) -> str:
+        """Formatiert Channel-ID für Embed."""
+        if channel_id:
+            return f"<#{channel_id}>"
+        return get_string(self.language, "channel_not_set")
+    
+    def _status_emoji(self, enabled: bool) -> str:
+        """Gibt Status-Emoji zurück."""
+        key = "feature_enabled" if enabled else "feature_disabled"
+        return get_string(self.language, key)
 
-    async def _on_participants_select(self, interaction):
-        selected = ((interaction.data or {}).get("values") or [])
-        self.participants_channel_id = int(selected[0]) if selected else None
-        await self.bot._defer(interaction, ephemeral=True)
-        await _safe_followup(interaction, "Raid Teilnehmerlisten Channel vorgemerkt.", ephemeral=True)
 
-    async def _on_raidlist_select(self, interaction):
-        selected = ((interaction.data or {}).get("values") or [])
-        self.raidlist_channel_id = int(selected[0]) if selected else None
-        await self.bot._defer(interaction, ephemeral=True)
-        await _safe_followup(interaction, "Raidlist Channel vorgemerkt.", ephemeral=True)
+class SettingsChannelSelect(discord.ui.Select):
+    """Auswahl welcher Channel-Typ konfiguriert werden soll."""
+    
+    def __init__(self, bot: "RewriteDiscordBot", guild_id: int):
+        self.bot = bot
+        self.guild_id = guild_id
+        
+        options = [
+            discord.SelectOption(
+                label="Umfragen Channel",
+                value="planner",
+                description="Channel für Raid-Umfragen",
+                emoji="📋"
+            ),
+            discord.SelectOption(
+                label="Teilnehmerlisten Channel", 
+                value="participants",
+                description="Channel für automatische Teilnehmerlisten",
+                emoji="👥"
+            ),
+            discord.SelectOption(
+                label="Raidlist Channel",
+                value="raidlist", 
+                description="Channel für die Raid-Übersicht",
+                emoji="📊"
+            )
+        ]
+        
+        super().__init__(
+            placeholder="📌 Channel konfigurieren...",
+            options=options,
+            min_values=1,
+            max_values=1,
+            custom_id=f"settings:{guild_id}:channel_type",
+            row=0
+        )
+    
+    async def callback(self, interaction):
+        if not interaction.guild or interaction.guild.id != self.guild_id:
+            await self.bot._reply(interaction, "Ungültiger Guild-Kontext.", ephemeral=True)
+            return
+        
+        channel_type = self.values[0] if self.values else None
+        if not channel_type:
+            return
+        
+        view = self.view
+        if not isinstance(view, SettingsView):
+            return
+        
+        # Zeige Channel-Select für den gewählten Typ
+        channel_select = discord.ui.ChannelSelect(
+            placeholder=f"{channel_type.capitalize()} Channel wählen",
+            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
+            min_values=0,
+            max_values=1,
+            custom_id=f"settings:{self.guild_id}:{channel_type}_channel"
+        )
+        
+        temp_view = discord.ui.View(timeout=60)
+        temp_view.add_item(channel_select)
+        
+        async def on_channel_select(interaction2: "discord.Interaction"):  # type: ignore[name-defined]
+            selected = interaction2.data.get("values", []) if interaction2.data else []
+            channel_id = int(selected[0]) if selected else None
+            
+            if channel_type == "planner":
+                view.planner_channel_id = channel_id
+                msg = "📋 Umfragen Channel gesetzt"
+            elif channel_type == "participants":
+                view.participants_channel_id = channel_id
+                msg = "👥 Teilnehmerlisten Channel gesetzt"
+            elif channel_type == "raidlist":
+                view.raidlist_channel_id = channel_id
+                msg = "📊 Raidlist Channel gesetzt"
+            
+            await interaction2.response.edit_message(
+                embed=view.build_embed(),
+                view=view
+            )
+            await interaction2.followup.send(msg, ephemeral=True)
+        
+        channel_select.callback = on_channel_select
+        
+        await interaction.response.send_message(
+            f"Wähle den Channel für **{channel_type}**:",
+            view=temp_view,
+            ephemeral=True
+        )
+
+
+class SettingsFeatureSelect(discord.ui.Select):
+    """Multi-Select für Features mit intuitiver Darstellung."""
+    
+    def __init__(self, bot: "RewriteDiscordBot", guild_id: int):
+        self.bot = bot
+        self.guild_id = guild_id
+        
+        options = [
+            discord.SelectOption(
+                label="Levelsystem",
+                value="leveling",
+                description="XP und Level-System aktivieren",
+                emoji="📈"
+            ),
+            discord.SelectOption(
+                label="Levelup Nachrichten",
+                value="levelup",
+                description="Gratulations-Nachrichten bei Level-Up",
+                emoji="🎉"
+            ),
+            discord.SelectOption(
+                label="Nanomon Reply",
+                value="nanomon",
+                description="Reagiere auf 'nanomon' Keyword",
+                emoji="🤖"
+            ),
+            discord.SelectOption(
+                label="Approved Reply",
+                value="approved",
+                description="Reagiere auf 'approved' Keyword",
+                emoji="✅"
+            ),
+            discord.SelectOption(
+                label="Raid Reminder",
+                value="raid_reminder",
+                description="Erinnerungen 10 Minuten vor Raid",
+                emoji="⏰"
+            ),
+            discord.SelectOption(
+                label="Auto Reminder",
+                value="auto_reminder",
+                description="Erinnerung bei schwacher Beteiligung (2h vorher)",
+                emoji="🔔"
+            )
+        ]
+        
+        super().__init__(
+            placeholder="⚡ Features aktivieren/deaktivieren...",
+            options=options,
+            min_values=0,
+            max_values=len(options),
+            custom_id=f"settings:{guild_id}:features",
+            row=1
+        )
+    
+    async def callback(self, interaction):
+        view = self.view
+        if not isinstance(view, SettingsView):
+            return
+        
+        selected = set(self.values) if self.values else set()
+        
+        # Setze alle Features basierend auf Auswahl
+        view.leveling_enabled = "leveling" in selected
+        view.levelup_messages_enabled = "levelup" in selected
+        view.nanomon_reply_enabled = "nanomon" in selected
+        view.approved_reply_enabled = "approved" in selected
+        view.raid_reminder_enabled = "raid_reminder" in selected
+        view.auto_reminder_enabled = "auto_reminder" in selected
+        
+        # Update Embed
+        await interaction.response.edit_message(
+            embed=view.build_embed(),
+            view=view
+        )
+        
+        # Zähle Änderungen
+        changed = len(selected)
+        await interaction.followup.send(
+            f"✅ {changed} Features aktualisiert",
+            ephemeral=True
+        )
+
+
+class SettingsResetButton(discord.ui.Button):
+    """Button zum Zurücksetzen auf Standardwerte."""
+    
+    def __init__(self, bot: "RewriteDiscordBot", guild_id: int):
+        super().__init__(
+            style=discord.ButtonStyle.danger,
+            label="Zurücksetzen",
+            emoji="🔄",
+            custom_id=f"settings:{guild_id}:reset",
+            row=4
+        )
+        self.bot = bot
+        self.guild_id = guild_id
+    
+    async def callback(self, interaction):
+        view = self.view
+        if not isinstance(view, SettingsView):
+            return
+        
+        # Reset auf Defaults
+        view.planner_channel_id = None
+        view.participants_channel_id = None
+        view.raidlist_channel_id = None
+        view.leveling_enabled = True
+        view.levelup_messages_enabled = True
+        view.nanomon_reply_enabled = True
+        view.approved_reply_enabled = True
+        view.raid_reminder_enabled = False
+        view.auto_reminder_enabled = False
+        view.message_xp_interval_seconds = 15
+        view.levelup_message_cooldown_seconds = 20
+        
+        await interaction.response.edit_message(
+            embed=view.build_embed(),
+            view=view
+        )
+        await interaction.followup.send(
+            "🔄 Alle Einstellungen auf Standard zurückgesetzt.\n"
+            "Klicke 'Speichern' um die Änderungen zu übernehmen.",
+            ephemeral=True
+        )
 
 class SettingsSaveButton(discord.ui.Button):
     def __init__(self, bot: "RewriteDiscordBot", guild_id: int):
@@ -627,10 +611,6 @@ class SettingsSaveButton(discord.ui.Button):
 
         await self.bot._defer(interaction, ephemeral=True)
         async with self.bot._state_lock:
-            previous_calendar_channel_id = self.bot._get_raid_calendar_channel_id(interaction.guild.id)
-            previous_calendar_state = self.bot._get_raid_calendar_state_row(interaction.guild.id)
-            previous_calendar_message_id = int(getattr(previous_calendar_state, "message_id", 0) or 0)
-
             row = save_channel_settings(
                 self.bot.repo,
                 guild_id=interaction.guild.id,
@@ -639,6 +619,7 @@ class SettingsSaveButton(discord.ui.Button):
                 participants_channel_id=view.participants_channel_id,
                 raidlist_channel_id=view.raidlist_channel_id,
             )
+            save_language_setting(self.bot.repo, interaction.guild.id, view.language)
             feature_row = self.bot._set_guild_feature_settings(
                 interaction.guild.id,
                 GuildFeatureSettings(
@@ -647,125 +628,36 @@ class SettingsSaveButton(discord.ui.Button):
                     nanomon_reply_enabled=view.nanomon_reply_enabled,
                     approved_reply_enabled=view.approved_reply_enabled,
                     raid_reminder_enabled=view.raid_reminder_enabled,
+                    auto_reminder_enabled=view.auto_reminder_enabled,
                     message_xp_interval_seconds=view.message_xp_interval_seconds,
                     levelup_message_cooldown_seconds=view.levelup_message_cooldown_seconds,
                 ),
             )
-            calendar_channel_id = self.bot._set_raid_calendar_channel_id(
-                interaction.guild.id,
-                view.raid_calendar_channel_id,
-            )
             await self.bot._refresh_raidlist_for_guild(interaction.guild.id, force=True)
-            if calendar_channel_id is None:
-                if previous_calendar_message_id > 0:
-                    await self.bot._delete_raid_calendar_message_by_id(
-                        interaction.guild.id,
-                        previous_calendar_message_id,
-                        preferred_channel_id=previous_calendar_channel_id,
-                    )
-            elif previous_calendar_channel_id != calendar_channel_id:
-                await self.bot._rebuild_raid_calendar_message_for_guild(interaction.guild.id)
-            else:
-                await self.bot._refresh_raid_calendar_for_guild(interaction.guild.id, force=True)
             persisted = await self.bot._persist(dirty_tables={"settings", "debug_cache"})
 
         if not persisted:
-            await _safe_followup(interaction, "Settings konnten nicht gespeichert werden.", ephemeral=True)
+            await _safe_followup(interaction, get_string(view.language, "settings_saved") + " (DB-Fehler)", ephemeral=True)
             return
         await _safe_followup(
             interaction,
             (
-                "Settings gespeichert:\n"
-                f"Umfragen: `{row.planner_channel_id}`\n"
-                f"Teilnehmerlisten: `{row.participants_channel_id}`\n"
-                f"Raidlist: `{row.raidlist_channel_id}`\n"
-                f"Raid Kalender: `{calendar_channel_id}`\n"
-                f"Levelsystem: `{_on_off(feature_row.leveling_enabled)}`\n"
-                f"Levelup Msg: `{_on_off(feature_row.levelup_messages_enabled)}`\n"
-                f"Nanomon Reply: `{_on_off(feature_row.nanomon_reply_enabled)}`\n"
-                f"Approved Reply: `{_on_off(feature_row.approved_reply_enabled)}`\n"
-                f"Raid Reminder: `{_on_off(feature_row.raid_reminder_enabled)}`\n"
-                f"Message XP Intervall: `{feature_row.message_xp_interval_seconds}`\n"
-                f"Levelup Cooldown: `{feature_row.levelup_message_cooldown_seconds}`"
+                f"{get_string(view.language, 'settings_saved')}:\n"
+                f"📋 {get_string(view.language, 'channel_planner')}: `{row.planner_channel_id}`\n"
+                f"👥 {get_string(view.language, 'channel_participants')}: `{row.participants_channel_id}`\n"
+                f"📊 {get_string(view.language, 'channel_raidlist')}: `{row.raidlist_channel_id}`\n"
+                f"📈 {get_string(view.language, 'feature_leveling')}: `{_on_off(feature_row.leveling_enabled)}`\n"
+                f"🎉 {get_string(view.language, 'feature_levelup_msg')}: `{_on_off(feature_row.levelup_messages_enabled)}`\n"
+                f"🤖 {get_string(view.language, 'feature_nanomon')}: `{_on_off(feature_row.nanomon_reply_enabled)}`\n"
+                f"✅ {get_string(view.language, 'feature_approved')}: `{_on_off(feature_row.approved_reply_enabled)}`\n"
+                f"⏰ {get_string(view.language, 'feature_raid_reminder')}: `{_on_off(feature_row.raid_reminder_enabled)}`\n"
+                f"🔔 {get_string(view.language, 'feature_auto_reminder')}: `{_on_off(feature_row.auto_reminder_enabled)}`\n"
+                f"⏱️ {get_string(view.language, 'interval_xp')}: `{feature_row.message_xp_interval_seconds}`\n"
+                f"⏳ {get_string(view.language, 'interval_cooldown')}: `{feature_row.levelup_message_cooldown_seconds}`\n"
+                f"🌍 {get_string(view.language, 'settings_language')}: `{view.language.upper()}`"
             ),
             ephemeral=True,
         )
-
-
-class RaidCalendarShiftButton(discord.ui.Button):
-    def __init__(self, bot: "RewriteDiscordBot", *, guild_id: int, delta_months: int):
-        action = "prev" if int(delta_months) < 0 else "next"
-        label = "Monat zurueck" if int(delta_months) < 0 else "Monat vor"
-        super().__init__(
-            style=discord.ButtonStyle.secondary,
-            label=label,
-            custom_id=f"raidcalendar:{int(guild_id)}:{action}",
-            row=0,
-        )
-        self.bot = bot
-        self.guild_id = int(guild_id)
-        self.delta_months = -1 if int(delta_months) < 0 else 1
-
-    async def callback(self, interaction):
-        if not interaction.guild or int(interaction.guild.id) != self.guild_id:
-            await self.bot._reply(interaction, "Ungueltiger Guild-Kontext.", ephemeral=True)
-            return
-        await self.bot._defer(interaction, ephemeral=True)
-        async with self.bot._state_lock:
-            target_month = await self.bot._shift_raid_calendar_month(self.guild_id, delta_months=self.delta_months)
-            persisted = await self.bot._persist(dirty_tables={"debug_cache"})
-        if not persisted:
-            await _safe_followup(interaction, "Kalender aktualisiert, aber DB-Speicherung fehlgeschlagen.", ephemeral=True)
-            return
-        await _safe_followup(
-            interaction,
-            f"Kalender zeigt jetzt **{_month_label_de(target_month)}**.",
-            ephemeral=True,
-        )
-
-
-class RaidCalendarTodayButton(discord.ui.Button):
-    def __init__(self, bot: "RewriteDiscordBot", *, guild_id: int):
-        super().__init__(
-            style=discord.ButtonStyle.primary,
-            label="Aktueller Monat",
-            custom_id=f"raidcalendar:{int(guild_id)}:today",
-            row=0,
-        )
-        self.bot = bot
-        self.guild_id = int(guild_id)
-
-    async def callback(self, interaction):
-        if not interaction.guild or int(interaction.guild.id) != self.guild_id:
-            await self.bot._reply(interaction, "Ungueltiger Guild-Kontext.", ephemeral=True)
-            return
-        await self.bot._defer(interaction, ephemeral=True)
-        async with self.bot._state_lock:
-            target_month = self.bot._current_calendar_month_start()
-            await self.bot._refresh_raid_calendar_for_guild(
-                self.guild_id,
-                force=True,
-                month_start=target_month,
-            )
-            persisted = await self.bot._persist(dirty_tables={"debug_cache"})
-        if not persisted:
-            await _safe_followup(interaction, "Kalender aktualisiert, aber DB-Speicherung fehlgeschlagen.", ephemeral=True)
-            return
-        await _safe_followup(
-            interaction,
-            f"Kalender zeigt jetzt **{_month_label_de(target_month)}**.",
-            ephemeral=True,
-        )
-
-
-class RaidCalendarView(discord.ui.View):
-    def __init__(self, bot: "RewriteDiscordBot", *, guild_id: int):
-        super().__init__(timeout=None)
-        self.bot = bot
-        self.guild_id = int(guild_id)
-        self.add_item(RaidCalendarShiftButton(bot, guild_id=guild_id, delta_months=-1))
-        self.add_item(RaidCalendarTodayButton(bot, guild_id=guild_id))
-        self.add_item(RaidCalendarShiftButton(bot, guild_id=guild_id, delta_months=1))
 
 
 class FinishButton(discord.ui.Button):

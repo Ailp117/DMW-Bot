@@ -224,6 +224,7 @@ async def test_sync_memberlists_uses_unique_slot_roles_per_slot(repo):
     assert updated == 0
     assert deleted == 0
     assert set(ensured_slots) == {(day_one, time_label), (day_two, time_label)}
-    assert any(f"<@&{day_one}-{time_label}>" in payload for payload in sent_payloads)
-    assert any(f"<@&{day_two}-{time_label}>" in payload for payload in sent_payloads)
+    # Role wird nicht mehr bei der Memberliste gepingt (nur beim Raid Reminder)
+    assert all(f"<@&{day_one}-{time_label}>" not in (payload or "") for payload in sent_payloads)
+    assert all(f"<@&{day_two}-{time_label}>" not in (payload or "") for payload in sent_payloads)
     assert all(embed is not None for embed in sent_embeds)

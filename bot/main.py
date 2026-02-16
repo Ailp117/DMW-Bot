@@ -113,7 +113,12 @@ class BotApplication:
             self._initial_raidlist_refresh_done = True
 
         if not self._initial_memberlist_restore_done:
-            restore_memberlists(self.repo)
+            for guild_id in connected_guild_ids:
+                settings = self.repo.ensure_settings(guild_id)
+                if settings.participants_channel_id:
+                    channel = await self._get_text_channel(settings.participants_channel_id)
+                    if channel is not None:
+                        await self._rebuild_memberlists_for_guild(guild_id, participants_channel=channel)
             self._initial_memberlist_restore_done = True
 
         self.log_forwarder_active = True

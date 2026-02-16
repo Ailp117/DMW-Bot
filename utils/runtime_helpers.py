@@ -28,6 +28,7 @@ FEATURE_FLAG_LEVELUP_MESSAGES = 1 << 1
 FEATURE_FLAG_NANOMON_REPLY = 1 << 2
 FEATURE_FLAG_APPROVED_REPLY = 1 << 3
 FEATURE_FLAG_RAID_REMINDER = 1 << 4
+FEATURE_FLAG_AUTO_REMINDER = 1 << 5
 FEATURE_FLAG_MASK = 0xFF
 FEATURE_MESSAGE_XP_SHIFT = 8
 FEATURE_LEVELUP_COOLDOWN_SHIFT = 24
@@ -40,20 +41,29 @@ SLOT_TEMP_ROLE_CACHE_PREFIX = "slotrole"
 RAID_REMINDER_KIND = "raid_reminder"
 RAID_REMINDER_CACHE_PREFIX = "raidrem"
 RAID_REMINDER_ADVANCE_SECONDS = 10 * 60
+RAID_START_KIND = "raid_start"
+RAID_START_CACHE_PREFIX = "raidstart"
+RAID_START_TOLERANCE_SECONDS = 60
+AUTO_REMINDER_ADVANCE_SECONDS = 2 * 60 * 60  # 2 hours
+AUTO_REMINDER_MIN_FILL_PERCENT = 50  # 50%
+AUTO_REMINDER_KIND = "auto_reminder"
+AUTO_REMINDER_CACHE_PREFIX = "autorem"
 RAID_REMINDER_WORKER_SLEEP_SECONDS = 30
-RAID_CALENDAR_CONFIG_KIND = "raid_calendar_cfg"
-RAID_CALENDAR_CONFIG_CACHE_PREFIX = "raid_calendar_cfg"
-RAID_CALENDAR_MESSAGE_KIND = "raid_calendar_msg"
-RAID_CALENDAR_MESSAGE_CACHE_PREFIX = "raid_calendar_msg"
-RAID_CALENDAR_GRID_COLUMNS = 7
-RAID_CALENDAR_GRID_ROWS = 5
 RAID_DATE_LOOKAHEAD_DAYS = 21
+RAID_CALENDAR_CONFIG_CACHE_PREFIX = "raidcal_cfg"
+RAID_CALENDAR_MESSAGE_CACHE_PREFIX = "raidcal_msg"
+RAID_CALENDAR_CONFIG_KIND = "raid_calendar_config"
+RAID_CALENDAR_MESSAGE_KIND = "raid_calendar_message"
+RAID_CALENDAR_GRID_ROWS = 5
+RAID_CALENDAR_GRID_COLUMNS = 7
 RAID_DATE_CACHE_DAYS_MAX = 25
 INTEGRITY_CLEANUP_SLEEP_SECONDS = 15 * 60
 DEFAULT_TIMEZONE_NAME = "Europe/Berlin"
 USERNAME_SYNC_WORKER_SLEEP_SECONDS = 10 * 60
 USERNAME_SYNC_RESCAN_SECONDS = 12 * 60 * 60
 LOG_FORWARD_QUEUE_MAX_SIZE = 1000
+LOG_FORWARD_BATCH_INTERVAL_SECONDS = 5
+AUTO_DELETE_COMMAND_MESSAGES = False
 PERSIST_FLUSH_MAX_ATTEMPTS = 3
 PERSIST_FLUSH_RETRY_BASE_SECONDS = 0.1
 PRIVILEGED_ONLY_HELP_COMMANDS = frozenset(
@@ -111,6 +121,7 @@ class GuildFeatureSettings:
     message_xp_interval_seconds: int
     levelup_message_cooldown_seconds: int
     raid_reminder_enabled: bool = False
+    auto_reminder_enabled: bool = False
 
 
 @dataclass(slots=True)
@@ -438,7 +449,6 @@ def _settings_embed(
     settings,
     guild_name: str,
     feature_settings: GuildFeatureSettings | None = None,
-    raid_calendar_channel_id: int | None = None,
 ):
     embed = discord.Embed(title=f"Settings: {guild_name}", color=discord.Color.blurple())
     embed.add_field(
@@ -454,11 +464,6 @@ def _settings_embed(
     embed.add_field(
         name="Raidlist Channel",
         value=f"`{settings.raidlist_channel_id}`" if settings.raidlist_channel_id else "nicht gesetzt",
-        inline=False,
-    )
-    embed.add_field(
-        name="Raid Kalender Channel",
-        value=f"`{raid_calendar_channel_id}`" if raid_calendar_channel_id else "nicht gesetzt",
         inline=False,
     )
     embed.add_field(name="Default Min Players", value=str(settings.default_min_players), inline=True)
@@ -502,9 +507,108 @@ def _settings_embed(
     embed.set_footer(text="Settings unten konfigurieren und speichern.")
     return embed
 
+def _status_embed(
+    guild_name: str,
+    settings: Any,
+    feature_settings: Any,
+    privileged_user_id: int,
+    level_persist_interval_seconds: float,
+    open_raids_count: int,
+    self_test_ok: str,
+    self_test_err: str,
+    language: str = "de",
+) -> Any:
+    """Creates a localized status embed."""
+    from utils.localization import get_string
+    
+    lang = "de" if language == "de" else "en"
+    embed = discord.Embed(
+        title=get_string(lang, "status_title"),  # type: ignore
+        description=get_string(lang, "status_guild", guild=guild_name),  # type: ignore
+        color=discord.Color.green(),
+    )
+    # Add guild context to the embed for better readability
+    embed.set_author(name=guild_name)
+    
+    # Overview section
+    overview_value = (
+        f"{get_string(lang, 'status_privileged', user_id=privileged_user_id)}\n"  # type: ignore
+        f"{get_string(lang, 'status_level_interval', interval=int(level_persist_interval_seconds))}\n"  # type: ignore
+        f"{get_string(lang, 'status_open_raids', count=open_raids_count)}"  # type: ignore
+    )
+    embed.add_field(
+        name=get_string(lang, "status_section_overview"),  # type: ignore
+        value=overview_value,
+        inline=False,
+    )
+    
+    # Leveling section
+    leveling_value = get_string(
+        lang,  # type: ignore
+        "status_leveling",
+        value=_on_off(feature_settings.leveling_enabled),
+        levelup_msg=_on_off(feature_settings.levelup_messages_enabled),
+        cooldown=int(feature_settings.levelup_message_cooldown_seconds),
+        xp_interval=int(feature_settings.message_xp_interval_seconds),
+    )
+    embed.add_field(
+        name="⭐ " + ("Levelsystem" if lang == "de" else "Leveling System"),
+        value=leveling_value,
+        inline=False,
+    )
+    
+    # Features section
+    features_value = get_string(
+        lang,  # type: ignore
+        "status_features",
+        reminder=_on_off(feature_settings.raid_reminder_enabled),
+        auto_reminder=_on_off(feature_settings.auto_reminder_enabled),
+        nanomon=_on_off(feature_settings.nanomon_reply_enabled),
+        approved=_on_off(feature_settings.approved_reply_enabled),
+    )
+    embed.add_field(
+        name="⚙️ " + ("Bot-Features" if lang == "de" else "Bot Features"),
+        value=features_value,
+        inline=False,
+    )
+    
+    # Channels section
+    channels_value = get_string(
+        lang,  # type: ignore
+        "status_channels",
+        planner=f"<#{settings.planner_channel_id}>" if settings.planner_channel_id else get_string(lang, "channel_not_set"),  # type: ignore
+        participants=f"<#{settings.participants_channel_id}>" if settings.participants_channel_id else get_string(lang, "channel_not_set"),  # type: ignore
+        raidlist=f"<#{settings.raidlist_channel_id}>" if settings.raidlist_channel_id else get_string(lang, "channel_not_set"),  # type: ignore
+        raidlist_msg=settings.raidlist_message_id or get_string(lang, "not_set"),  # type: ignore
+    )
+    embed.add_field(
+        name="📢 " + ("Kanäle" if lang == "de" else "Channels"),
+        value=channels_value,
+        inline=False,
+    )
+    
+    # Health section
+    health_icon = "✅" if self_test_ok != "-" else "⚠️"
+    health_value = get_string(
+        lang,  # type: ignore
+        "status_health",
+        icon=health_icon,
+        ok=self_test_ok,
+        error=self_test_err,
+    )
+    embed.add_field(
+        name="🔍 " + ("System Status" if lang == "de" else "System Status"),
+        value=health_value,
+        inline=False,
+    )
+    
+    embed.set_footer(text=get_string(lang, "status_footer"))  # type: ignore
+    return embed
+
 
 __all__ = [
     "APPROVED_GIF_URL",
+    "AUTO_DELETE_COMMAND_MESSAGES",
     "BOT_MESSAGE_CACHE_PREFIX",
     "BOT_MESSAGE_INDEX_MAX_PER_CHANNEL",
     "BOT_MESSAGE_KIND",
@@ -544,6 +648,9 @@ __all__ = [
     "RAID_REMINDER_CACHE_PREFIX",
     "RAID_REMINDER_KIND",
     "RAID_REMINDER_WORKER_SLEEP_SECONDS",
+    "RAID_START_CACHE_PREFIX",
+    "RAID_START_KIND",
+    "RAID_START_TOLERANCE_SECONDS",
     "SLOT_TEMP_ROLE_CACHE_PREFIX",
     "SLOT_TEMP_ROLE_KIND",
     "STALE_RAID_CHECK_SECONDS",
@@ -579,6 +686,7 @@ __all__ = [
     "_safe_send_channel_message",
     "_safe_send_initial",
     "_settings_embed",
+    "_status_embed",
     "_shift_month",
     "_upcoming_raid_date_labels",
     "_xp_progress_stats",

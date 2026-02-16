@@ -22,6 +22,7 @@ class GuildSettingsRecord:
     raidlist_channel_id: int | None = None
     raidlist_message_id: int | None = None
     planner_channel_id: int | None = None
+    language: str = "de"
     default_min_players: int = 0
     templates_enabled: bool = True
     template_manager_role_id: int | None = None
@@ -35,6 +36,7 @@ class RaidRecord:
     channel_id: int
     creator_id: int
     dungeon: str
+    planned_dates: str = ""
     status: str = "open"
     created_at: datetime = field(default_factory=datetime.now)
     message_id: int | None = None
@@ -290,6 +292,7 @@ class InMemoryRepository:
         creator_id: int,
         dungeon: str,
         min_players: int,
+        planned_dates: str = "",
     ) -> RaidRecord:
         next_display = self._display_id_by_guild.get(guild_id, 0) + 1
         self._display_id_by_guild[guild_id] = next_display
@@ -301,6 +304,7 @@ class InMemoryRepository:
             creator_id=creator_id,
             dungeon=dungeon,
             min_players=min_players,
+            planned_dates=planned_dates,
         )
         self.raids[row.id] = row
         self._raid_id += 1

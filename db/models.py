@@ -36,6 +36,7 @@ class GuildSettings(Base):
     default_min_players: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     templates_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     template_manager_role_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    language: Mapped[str] = mapped_column(String(2), nullable=False, default="de")
 
 
 class Raid(Base):
