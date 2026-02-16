@@ -45,16 +45,16 @@ class RuntimeStateCalendarMixin(RuntimeMixinBase):
                 self._acked_interactions.clear()
             return True
 
-    async def _reply(self, interaction: Any, content: str, *, ephemeral: bool = True) -> None:
+    async def _reply(self, interaction: Any, content: str, *, ephemeral: bool = True, embed: Any | None = None) -> None:
         first = await self._mark_interaction_once(interaction)
-        if first and await _safe_send_initial(interaction, content, ephemeral=ephemeral):
+        if first and await _safe_send_initial(interaction, content, ephemeral=ephemeral, embed=embed):
             if AUTO_DELETE_COMMAND_MESSAGES and hasattr(interaction, "message") and interaction.message:
                 try:
                     await interaction.message.delete()
                 except Exception:
                     pass
             return
-        await _safe_followup(interaction, content, ephemeral=ephemeral)
+        await _safe_followup(interaction, content, ephemeral=ephemeral, embed=embed)
 
     async def _defer(self, interaction: Any, *, ephemeral: bool = True) -> bool:
         first = await self._mark_interaction_once(interaction)

@@ -28,80 +28,71 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("dmw.runtime")
 
-# Digimon Meme URLs
+# Digimon Meme URLs (from r/digimon)
 DIGIMON_MEME_URLS = [
-    # Digimon Adventure Memes
-    "https://i.imgur.com/9M8JZ9Q.jpg",  # Agumon/Greymon evolution
-    "https://i.imgur.com/QX5P5Zk.jpg",  # Digimon adventure meme
-    "https://i.imgur.com/K3X9VdL.jpg",  # Tai screaming
-    "https://i.imgur.com/L7M2Xqp.jpg",  # Digivolution hype
-    "https://i.imgur.com/N8P9Qrs.jpg",  # "It's like a switch"
-    "https://i.imgur.com/O5R6Tuv.jpg",  # Digimon power of friendship
-    "https://i.imgur.com/P2S3Uvw.jpg",  # Patamon evolving
-    "https://i.imgur.com/Z2C3Eno.jpg",  # Tai determination face
-    "https://i.imgur.com/B6E7Grs.jpg",  # Agumon cocky face
-    "https://i.imgur.com/gK9zL2m.jpg",  # Agumon excited
-    "https://i.imgur.com/fH8jK1p.jpg",  # Gabumon happy
-    "https://i.imgur.com/eG7iJ0q.jpg",  # Biyomon flying
-    "https://i.imgur.com/dF6hK9r.jpg",  # Gomamon water move
-    "https://i.imgur.com/cE5gJ8s.jpg",  # Palmon nature power
-    "https://i.imgur.com/bD4fI7t.jpg",  # Tentomon electric
-    "https://i.imgur.com/aC3eH6u.jpg",  # Piyomon fierce
-    "https://i.imgur.com/zB2dG5v.jpg",  # Penguinmon ice attack
-    
-    # Digimon Tamers Memes
-    "https://i.imgur.com/Q4T5Vxy.jpg",  # Beelzemon cool
-    "https://i.imgur.com/R6U7Wyz.jpg",  # Digimon Tamers meme
-    "https://i.imgur.com/T0W1Ycd.jpg",  # Guilmon power
-    "https://i.imgur.com/U2X3Zef.jpg",  # Renamon cool pose
-    "https://i.imgur.com/V4Y5Agh.jpg",  # Takato believes in Guilmon
-    "https://i.imgur.com/W6Z7Bhi.jpg",  # Kushibar evolution
-    "https://i.imgur.com/X8A9Cjk.jpg",  # "Biomerge Digivolution"
-    "https://i.imgur.com/yA1cF4w.jpg",  # Guilmon Digivolve
-    "https://i.imgur.com/xY0bE3x.jpg",  # Renamon evolving
-    "https://i.imgur.com/wX9aD2y.jpg",  # Terriermon power
-    "https://i.imgur.com/vW8bC1z.jpg",  # Culumon sparkle
-    "https://i.imgur.com/uV7cB0a.jpg",  # Megidramon chaos
-    
-    # Digimon Power/Transformation Memes
-    "https://i.imgur.com/S8V9Xab.jpg",  # "Digivolve!"
-    "https://i.imgur.com/Y0B1Dlm.jpg",  # Digimon fight scenes
-    "https://i.imgur.com/A4D5Fpq.jpg",  # "It's over 9000" Digimon
-    "https://i.imgur.com/C8F9Htu.jpg",  # Omnimon power
-    "https://i.imgur.com/tU6dA9b.jpg",  # Megalgreymon OP
-    "https://i.imgur.com/sT5cB8c.jpg",  # MetalGarurumon armor
-    "https://i.imgur.com/rS4bA7d.jpg",  # Akatorimon phoenix
-    "https://i.imgur.com/qR3aZ6e.jpg",  # Andromon machine
-    "https://i.imgur.com/pQ2aY5f.jpg",  # Lillamon flower
-    "https://i.imgur.com/oP1aX4g.jpg",  # Shoutmon power
-    "https://i.imgur.com/nO0aW3h.jpg",  # PatrolDroid laser
-    
-    # Funny Digimon Memes
-    "https://i.imgur.com/mN9aV2i.jpg",  # Numemon gross meme
-    "https://i.imgur.com/lM8aU1j.jpg",  # Sukamon nasty
-    "https://i.imgur.com/kL7aT0k.jpg",  # Devitamamon weird
-    "https://i.imgur.com/jK6aS9l.jpg",  # Demidevemon goofy
-    "https://i.imgur.com/iJ5aR8m.jpg",  # Mushroomon confused
-    "https://i.imgur.com/hI4aQ7n.jpg",  # Vegiemon silly
-    "https://i.imgur.com/gH3aP6o.jpg",  # Botamon tiny
-    "https://i.imgur.com/fG2aO5p.jpg",  # Koromon chibi
-    
-    # Digimon Monster Memes
-    "https://i.imgur.com/eF1aN4q.jpg",  # Machinedramon huge
-    "https://i.imgur.com/dE0aM3r.jpg",  # Apocalymon dark
-    "https://i.imgur.com/cD9aL2s.jpg",  # Piedmon scary
-    "https://i.imgur.com/bC8aK1t.jpg",  # Etemon cool
-    "https://i.imgur.com/aB7aJ0u.jpg",  # Myotismon menacing
-    "https://i.imgur.com/zA6aI9v.jpg",  # Belphemon evil
-    "https://i.imgur.com/yZ5aH8w.jpg",  # Armageddemon chaos
-    "https://i.imgur.com/xY4aG7x.jpg",  # Diaboromon virus
-    
-    # Legendary Digimon
-    "https://i.imgur.com/wX3aF6y.jpg",  # WarGreymon legend
-    "https://i.imgur.com/vW2aE5z.jpg",  # MetalGarurumon cool
-    "https://i.imgur.com/uV1aD4a.jpg",  # Imperialdramon final
-    "https://i.imgur.com/tU0aC3b.jpg",  # Venom Vamdemon boss
-    "https://i.imgur.com/sT9aB2c.jpg",  # Puppetmon puppet master
+    "https://i.redd.it/r7dfuxmrsvjg1.jpeg",
+    "https://i.redd.it/rw57dn69lvjg1.jpeg",
+    "https://i.redd.it/ub48m2kukqjg1.png",
+    "https://i.redd.it/skxq0c45jvjg1.jpeg",
+    "https://i.redd.it/6editqqk5vjg1.jpeg",
+    "https://i.redd.it/hpmwd8o8mpjg1.png",
+    "https://i.redd.it/tkt4cg5klvjg1.png",
+    "https://i.redd.it/is9r6yhexvjg1.jpeg",
+    "https://i.redd.it/79x1x49obvjg1.jpeg",
+    "https://i.redd.it/d0eb33d5rvjg1.jpeg",
+    "https://i.redd.it/3s4gwai4nujg1.jpeg",
+    "https://i.redd.it/fm6wkajxyojg1.png",
+    "https://i.redd.it/6p98s03nknjg1.jpeg",
+    "https://i.redd.it/mivveqgfyivf1.jpeg",
+    "https://i.redd.it/9komnzjpjqsf1.jpeg",
+    "https://i.redd.it/oo6a7pqoivvf1.jpeg",
+    "https://i.redd.it/hyo5x6k8swtf1.jpeg",
+    "https://i.redd.it/oehiuhhl8avf1.jpeg",
+    "https://i.redd.it/sl2cikxcdzeg1.png",
+    "https://i.redd.it/51ezv7xcxtsf1.png",
+    "https://i.redd.it/l6dvc6rm0qtf1.jpeg",
+    "https://i.redd.it/gi5y82cl8n0g1.jpeg",
+    "https://i.redd.it/5t7g14f0wgaf1.jpeg",
+    "https://i.redd.it/54bsu1t5ture1.png",
+    "https://i.redd.it/obwspmfr0iyf1.jpeg",
+    "https://i.redd.it/0rl4aamlr3vf1.jpeg",
+    "https://i.redd.it/vpc5yt9migxf1.png",
+    "https://i.redd.it/itmsack783yf1.jpeg",
+    "https://i.redd.it/bkf7yt9rw9pe1.png",
+    "https://i.redd.it/k07wujzdzybg1.png",
+    "https://i.redd.it/ffm476g4ao6g1.jpeg",
+    "https://i.redd.it/ufnyzvycn8lf1.jpeg",
+    "https://i.redd.it/qkvnp80s0i2g1.jpeg",
+    "https://i.redd.it/hoepk2dew2xf1.jpeg",
+    "https://i.redd.it/ng8ib50w8qke1.png",
+    "https://i.redd.it/sofg7oq8pd361.png",
+    "https://i.redd.it/8w4wi6aid2ag1.jpeg",
+    "https://i.redd.it/ou3a8tm29zwf1.jpeg",
+    "https://i.redd.it/dpb7jp92acge1.jpeg",
+    "https://i.redd.it/edjrzkue5il51.jpg",
+    "https://i.redd.it/you6nm4tarje1.jpeg",
+    "https://i.redd.it/m5dhbcq7fz4f1.jpeg",
+    "https://i.redd.it/xmouaoinppa51.jpg",
+    "https://i.redd.it/i2y7jp8cql5g1.png",
+    "https://i.redd.it/b50znkxud08g1.jpeg",
+    "https://i.redd.it/3194xr4ecxrf1.jpeg",
+    "https://i.redd.it/7vd6u8snqwsf1.png",
+    "https://i.redd.it/gyfh2myac3wf1.png",
+    "https://i.redd.it/25f54bvjn93g1.png",
+    "https://i.redd.it/u96br1vbwwpe1.jpeg",
+    "https://i.redd.it/otl9unb82ane1.png",
+    "https://i.redd.it/4hh1dvelvhdg1.jpeg",
+    "https://i.redd.it/8acvx0mk5emf1.jpeg",
+    "https://i.redd.it/oax9d6utbjzf1.jpeg",
+    "https://i.redd.it/84vpimvspz1g1.jpeg",
+    "https://i.redd.it/ec5mh3m57fhe1.jpeg",
+    "https://i.redd.it/07cyxs7wrdj61.jpg",
+    "https://i.redd.it/y50vzaiyz9xf1.png",
+    "https://i.redd.it/j38n7pclre671.jpg",
+    "https://i.redd.it/qiffvaaq9db61.jpg",
+    "https://i.redd.it/ejj0ofm4kz8f1.jpeg",
+    "https://i.redd.it/8lgtlafkkxsf1.jpeg",
+    "https://i.redd.it/2mjzdbvwl2ne1.jpeg",
 ]
 
 
