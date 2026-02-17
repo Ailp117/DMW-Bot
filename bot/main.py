@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Iterable
+from typing import Any, Iterable
 
 from bot.config import BotConfig
 from discord.task_registry import DebouncedGuildUpdater, SingletonTaskRegistry
@@ -211,3 +211,19 @@ class BotApplication:
 
     async def close(self) -> None:
         await self.task_registry.cancel_all()
+
+    async def _get_text_channel(self, channel_id: int | None) -> Any | None:
+        if not channel_id:
+            return None
+        return None
+
+    async def _rebuild_memberlists_for_guild(self, guild_id: int, *, participants_channel: Any) -> dict[str, int]:
+        return {
+            "raids": 0,
+            "cleared_slot_rows": 0,
+            "deleted_slot_messages": 0,
+            "deleted_legacy_messages": 0,
+            "created": 0,
+            "updated": 0,
+            "deleted": 0,
+        }
