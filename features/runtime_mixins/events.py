@@ -209,6 +209,12 @@ class RuntimeEventsMixin(RuntimeMixinBase):
         if message.author.bot:
             return
 
+        if getattr(message.content, "upper", lambda: "")() == "TOL" and message.content == "TOL":
+            file_path = Path(__file__).parent.parent.parent / "Pics" / "tree.png"
+            if file_path.exists():
+                await message.channel.send(file=discord.File(file_path))
+            return
+
         if (
             self.log_channel is not None
             and message.guild is not None
